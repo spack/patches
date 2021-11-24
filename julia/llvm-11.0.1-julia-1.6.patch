@@ -1,0 +1,3180 @@
+diff --git a/clang/cmake/modules/AddClang.cmake b/clang/cmake/modules/AddClang.cmake
+index 704278a0e93b..a455365cabf8 100644
+--- a/clang/cmake/modules/AddClang.cmake
++++ b/clang/cmake/modules/AddClang.cmake
+@@ -170,7 +170,7 @@ macro(add_clang_tool name)
+ 
+     install(TARGETS ${name}
+       ${export_to_clangtargets}
+-      RUNTIME DESTINATION bin
++      RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
+       COMPONENT ${name})
+ 
+     if(NOT LLVM_ENABLE_IDE)
+diff --git a/llvm/cmake/modules/HandleLLVMOptions.cmake b/llvm/cmake/modules/HandleLLVMOptions.cmake
+index 5ef22eb493ba..f0cd704d860b 100644
+--- a/llvm/cmake/modules/HandleLLVMOptions.cmake
++++ b/llvm/cmake/modules/HandleLLVMOptions.cmake
+@@ -632,7 +632,7 @@ if (LLVM_ENABLE_WARNINGS AND (LLVM_COMPILER_IS_GCC_COMPATIBLE OR CLANG_CL))
+ 
+   if (LLVM_ENABLE_PEDANTIC AND LLVM_COMPILER_IS_GCC_COMPATIBLE)
+     append("-pedantic" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+-    append("-Wno-long-long" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
++    append("-Wno-long-long -Wundef" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+   endif()
+ 
+   add_flag_if_supported("-Wimplicit-fallthrough" IMPLICIT_FALLTHROUGH_FLAG)
+diff --git a/llvm/include/llvm/ADT/FunctionExtras.h b/llvm/include/llvm/ADT/FunctionExtras.h
+index 4c75e4d2547b..9de17274612e 100644
+--- a/llvm/include/llvm/ADT/FunctionExtras.h
++++ b/llvm/include/llvm/ADT/FunctionExtras.h
+@@ -273,9 +273,11 @@ protected:
+     // Copy the callback and inline flag.
+     CallbackAndInlineFlag = RHS.CallbackAndInlineFlag;
+ 
++#ifndef __clang_analyzer__
+     // If the RHS is empty, just copying the above is sufficient.
+     if (!RHS)
+       return;
++#endif
+ 
+     if (!isInlineStorage()) {
+       // The out-of-line case is easiest to move.
+diff --git a/llvm/include/llvm/Analysis/ScalarEvolution.h b/llvm/include/llvm/Analysis/ScalarEvolution.h
+index 81c5fc932588..964f57e940eb 100644
+--- a/llvm/include/llvm/Analysis/ScalarEvolution.h
++++ b/llvm/include/llvm/Analysis/ScalarEvolution.h
+@@ -119,6 +119,19 @@ public:
+     NoWrapMask = (1 << 3) - 1
+   };
+ 
++  /// HasNonIntegralPointerFlag are bitfield indices into SubclassData.
++  ///
++  /// When constructing SCEV expressions for LLVM expressions with non-integral
++  /// pointer types, some additional processing is required to ensure that we
++  /// don't introduce any illegal transformations. However, non-integral pointer
++  /// types are a very rarely used feature, so we want to make sure to only do
++  /// such processing if they are actually used. To ensure minimal performance
++  /// impact, we memoize that fact in using these flags.
++  enum HasNonIntegralPointerFlag {
++    FlagNoNIPointers = 0,
++    FlagHasNIPointers = (1 << 3)
++  };
++
+   explicit SCEV(const FoldingSetNodeIDRef ID, unsigned SCEVTy,
+                 unsigned short ExpressionSize)
+       : FastID(ID), SCEVType(SCEVTy), ExpressionSize(ExpressionSize) {}
+@@ -155,6 +168,10 @@ public:
+     return ExpressionSize;
+   }
+ 
++  bool hasNonIntegralPointers() const {
++    return SubclassData & FlagHasNIPointers;
++  }
++
+   /// Print out the internal representation of this scalar to the specified
+   /// stream.  This should really only be used for debugging purposes.
+   void print(raw_ostream &OS) const;
+@@ -720,9 +737,8 @@ public:
+   unsigned getSmallConstantTripMultiple(const Loop *L,
+                                         BasicBlock *ExitingBlock);
+ 
+-
+   /// The terms "backedge taken count" and "exit count" are used
+-  /// interchangeably to refer to the number of times the backedge of a loop 
++  /// interchangeably to refer to the number of times the backedge of a loop
+   /// has executed before the loop is exited.
+   enum ExitCountKind {
+     /// An expression exactly describing the number of times the backedge has
+@@ -733,11 +749,11 @@ public:
+   };
+ 
+   /// Return the number of times the backedge executes before the given exit
+-  /// would be taken; if not exactly computable, return SCEVCouldNotCompute. 
++  /// would be taken; if not exactly computable, return SCEVCouldNotCompute.
+   /// For a single exit loop, this value is equivelent to the result of
+   /// getBackedgeTakenCount.  The loop is guaranteed to exit (via *some* exit)
+   /// before the backedge is executed (ExitCount + 1) times.  Note that there
+-  /// is no guarantee about *which* exit is taken on the exiting iteration.  
++  /// is no guarantee about *which* exit is taken on the exiting iteration.
+   const SCEV *getExitCount(const Loop *L, BasicBlock *ExitingBlock,
+                            ExitCountKind Kind = Exact);
+ 
+@@ -766,7 +782,7 @@ public:
+   /// SCEVCouldNotCompute object.
+   const SCEV *getConstantMaxBackedgeTakenCount(const Loop *L) {
+     return getBackedgeTakenCount(L, ConstantMaximum);
+-  } 
++  }
+ 
+   /// Return true if the backedge taken count is either the value returned by
+   /// getConstantMaxBackedgeTakenCount or zero.
+diff --git a/llvm/include/llvm/Analysis/ScalarEvolutionExpressions.h b/llvm/include/llvm/Analysis/ScalarEvolutionExpressions.h
+index 0076e02ae1bf..1d0a6d20b267 100644
+--- a/llvm/include/llvm/Analysis/ScalarEvolutionExpressions.h
++++ b/llvm/include/llvm/Analysis/ScalarEvolutionExpressions.h
+@@ -188,6 +188,13 @@ class Type;
+       return getNoWrapFlags(FlagNW) != FlagAnyWrap;
+     }
+ 
++    void setHasNIPtr(bool HasNIPtr) {
++      if (HasNIPtr)
++        SubclassData |= FlagHasNIPointers;
++      else
++        SubclassData &= ~FlagHasNIPointers;
++    }
++
+     /// Methods for support type inquiry through isa, cast, and dyn_cast:
+     static bool classof(const SCEV *S) {
+       return S->getSCEVType() == scAddExpr || S->getSCEVType() == scMulExpr ||
+@@ -224,19 +231,16 @@ class Type;
+ 
+     Type *Ty;
+ 
++  protected:
+     SCEVAddExpr(const FoldingSetNodeIDRef ID, const SCEV *const *O, size_t N)
+         : SCEVCommutativeExpr(ID, scAddExpr, O, N) {
+-      auto *FirstPointerTypedOp = find_if(operands(), [](const SCEV *Op) {
+-        return Op->getType()->isPointerTy();
+-      });
+-      if (FirstPointerTypedOp != operands().end())
+-        Ty = (*FirstPointerTypedOp)->getType();
+-      else
+-        Ty = getOperand(0)->getType();
++
+     }
+ 
+   public:
+-    Type *getType() const { return Ty; }
++    // Returns the type of the add expression, by looking either at the last operand
++    // or deferring to the SCEVAddNIExpr subclass.
++    Type *getType() const;
+ 
+     /// Methods for support type inquiry through isa, cast, and dyn_cast:
+     static bool classof(const SCEV *S) {
+@@ -244,6 +248,46 @@ class Type;
+     }
+   };
+ 
++  /// This node represents an addition of some number of SCEVs, one which
++  /// is a non-integral pointer type, requiring us to know the type exactly for
++  /// correctness.
++  class SCEVAddNIExpr : public SCEVAddExpr {
++    friend class ScalarEvolution;
++    PointerType *NIType;
++
++    SCEVAddNIExpr(const FoldingSetNodeIDRef ID, const SCEV *const *O, size_t N,
++                  PointerType *NIType)
++        : SCEVAddExpr(ID, O, N), NIType(NIType) {
++      SubclassData |= FlagHasNIPointers;
++    }
++
++  public:
++    Type *getType() const { return NIType; }
++
++    /// Methods for support type inquiry through isa, cast, and dyn_cast:
++    static bool classof(const SCEV *S) {
++      return S->getSCEVType() == scAddExpr && S->hasNonIntegralPointers();
++    }
++  };
++
++  inline Type *SCEVAddExpr::getType() const {
++    // In general, use the type of the last operand, which is likely to be a
++    // pointer type, if there is one. This doesn't usually matter, but it can
++    // help reduce casts when the expressions are expanded. In the (unusual)
++    // case that we're working with non-integral pointers, we have a subclass
++    // that stores that type explicitly.
++    if (hasNonIntegralPointers())
++      return cast<SCEVAddNIExpr>(this)->getType();
++
++    auto *FirstPointerTypedOp = find_if(operands(), [](const SCEV *Op) {
++      return Op->getType()->isPointerTy();
++    });
++    if (FirstPointerTypedOp != operands().end())
++      return (*FirstPointerTypedOp)->getType();
++    else
++      return  getOperand(0)->getType();
++  }
++
+   /// This node represents multiplication of some number of SCEVs.
+   class SCEVMulExpr : public SCEVCommutativeExpr {
+     friend class ScalarEvolution;
+@@ -253,6 +297,18 @@ class Type;
+       : SCEVCommutativeExpr(ID, scMulExpr, O, N) {}
+ 
+   public:
++    Type *getType() const {
++      // In general, we can't form SCEVMulExprs with non-integral pointer types,
++      // but for the moment we need to allow a special case: Multiplying by
++      // -1 to be able express the difference between two pointers. In order
++      // to maintain the invariant that SCEVs with the NI flag set should have
++      // a type corresponding to the contained NI ptr, we need to return the
++      // type of the pointer here.
++      if (hasNonIntegralPointers())
++        return getOperand(getNumOperands() - 1)->getType();
++      return SCEVCommutativeExpr::getType();
++    }
++
+     /// Methods for support type inquiry through isa, cast, and dyn_cast:
+     static bool classof(const SCEV *S) {
+       return S->getSCEVType() == scMulExpr;
+@@ -479,9 +535,12 @@ class Type;
+     /// instances owned by a ScalarEvolution.
+     SCEVUnknown *Next;
+ 
+-    SCEVUnknown(const FoldingSetNodeIDRef ID, Value *V,
+-                ScalarEvolution *se, SCEVUnknown *next) :
+-      SCEV(ID, scUnknown, 1), CallbackVH(V), SE(se), Next(next) {}
++    SCEVUnknown(const FoldingSetNodeIDRef ID, Value *V, ScalarEvolution *se,
++                SCEVUnknown *next, bool ValueIsNIPtr)
++        : SCEV(ID, scUnknown, 1), CallbackVH(V), SE(se), Next(next) {
++      if (ValueIsNIPtr)
++        SubclassData |= FlagHasNIPointers;
++    }
+ 
+     // Implement CallbackVH.
+     void deleted() override;
+diff --git a/llvm/include/llvm/CodeGen/TargetLowering.h b/llvm/include/llvm/CodeGen/TargetLowering.h
+index 06f2b3ca38ea..e453bf884676 100644
+--- a/llvm/include/llvm/CodeGen/TargetLowering.h
++++ b/llvm/include/llvm/CodeGen/TargetLowering.h
+@@ -2758,6 +2758,10 @@ public:
+     return false;
+   }
+ 
++  /// Does this target require the clearing of high-order bits in a register
++  /// passed to the fp16 to fp conversion library function.
++  virtual bool shouldKeepZExtForFP16Conv() const { return false; }
++
+   //===--------------------------------------------------------------------===//
+   // Runtime Library hooks
+   //
+diff --git a/llvm/include/llvm/Config/abi-breaking.h.cmake b/llvm/include/llvm/Config/abi-breaking.h.cmake
+index a1ffad660770..41a4a3982012 100644
+--- a/llvm/include/llvm/Config/abi-breaking.h.cmake
++++ b/llvm/include/llvm/Config/abi-breaking.h.cmake
+@@ -20,7 +20,7 @@
+ 
+ /* Allow selectively disabling link-time mismatch checking so that header-only
+    ADT content from LLVM can be used without linking libSupport. */
+-#if !LLVM_DISABLE_ABI_BREAKING_CHECKS_ENFORCING
++#ifndef LLVM_DISABLE_ABI_BREAKING_CHECKS_ENFORCING
+ 
+ // ABI_BREAKING_CHECKS protection: provides link-time failure when clients build
+ // mismatch with LLVM
+diff --git a/llvm/lib/Analysis/IVDescriptors.cpp b/llvm/lib/Analysis/IVDescriptors.cpp
+index 6686848d75c9..46c8e6c54c93 100644
+--- a/llvm/lib/Analysis/IVDescriptors.cpp
++++ b/llvm/lib/Analysis/IVDescriptors.cpp
+@@ -576,6 +576,7 @@ RecurrenceDescriptor::isRecurrenceInstr(Instruction *I, RecurrenceKind Kind,
+     return InstDesc(Kind == RK_IntegerOr, I);
+   case Instruction::Xor:
+     return InstDesc(Kind == RK_IntegerXor, I);
++  case Instruction::FDiv:
+   case Instruction::FMul:
+     return InstDesc(Kind == RK_FloatMult, I, UAI);
+   case Instruction::FSub:
+diff --git a/llvm/lib/Analysis/ScalarEvolution.cpp b/llvm/lib/Analysis/ScalarEvolution.cpp
+index 3c96b3f20461..8197d368b400 100644
+--- a/llvm/lib/Analysis/ScalarEvolution.cpp
++++ b/llvm/lib/Analysis/ScalarEvolution.cpp
+@@ -369,12 +369,13 @@ Type *SCEV::getType() const {
+   case scSignExtend:
+     return cast<SCEVCastExpr>(this)->getType();
+   case scAddRecExpr:
+-  case scMulExpr:
+   case scUMaxExpr:
+   case scSMaxExpr:
+   case scUMinExpr:
+   case scSMinExpr:
+     return cast<SCEVNAryExpr>(this)->getType();
++  case scMulExpr:
++    return cast<SCEVMulExpr>(this)->getType();
+   case scAddExpr:
+     return cast<SCEVAddExpr>(this)->getType();
+   case scUDivExpr:
+@@ -2193,8 +2194,9 @@ const SCEV *ScalarEvolution::getAddExpr(SmallVectorImpl<const SCEV *> &Ops,
+   }
+ 
+   // Limit recursion calls depth.
+-  if (Depth > MaxArithDepth || hasHugeExpression(Ops))
++  if (Depth > MaxArithDepth || hasHugeExpression(Ops)) {
+     return getOrCreateAddExpr(Ops, Flags);
++  }
+ 
+   if (SCEV *S = std::get<0>(findExistingSCEVInCache(scAddExpr, Ops))) {
+     static_cast<SCEVAddExpr *>(S)->setNoWrapFlags(Flags);
+@@ -2540,16 +2542,27 @@ ScalarEvolution::getOrCreateAddExpr(ArrayRef<const SCEV *> Ops,
+                                     SCEV::NoWrapFlags Flags) {
+   FoldingSetNodeID ID;
+   ID.AddInteger(scAddExpr);
+-  for (const SCEV *Op : Ops)
+-    ID.AddPointer(Op);
++  bool HasNIPtr = false;
++  PointerType *NIPtrType = nullptr;
++  for (unsigned i = 0, e = Ops.size(); i != e; ++i) {
++    ID.AddPointer(Ops[i]);
++    if (Ops[i]->hasNonIntegralPointers()) {
++      HasNIPtr = true;
++      NIPtrType = cast<PointerType>(Ops[i]->getType());
++    }
++  }
+   void *IP = nullptr;
+   SCEVAddExpr *S =
+       static_cast<SCEVAddExpr *>(UniqueSCEVs.FindNodeOrInsertPos(ID, IP));
+   if (!S) {
+     const SCEV **O = SCEVAllocator.Allocate<const SCEV *>(Ops.size());
+     std::uninitialized_copy(Ops.begin(), Ops.end(), O);
+-    S = new (SCEVAllocator)
+-        SCEVAddExpr(ID.Intern(SCEVAllocator), O, Ops.size());
++    if (HasNIPtr)
++      S = new (SCEVAllocator)
++          SCEVAddNIExpr(ID.Intern(SCEVAllocator), O, Ops.size(), NIPtrType);
++    else
++      S = new (SCEVAllocator)
++          SCEVAddExpr(ID.Intern(SCEVAllocator), O, Ops.size());
+     UniqueSCEVs.InsertNode(S, IP);
+     addToLoopUseLists(S);
+   }
+@@ -2562,8 +2575,10 @@ ScalarEvolution::getOrCreateAddRecExpr(ArrayRef<const SCEV *> Ops,
+                                        const Loop *L, SCEV::NoWrapFlags Flags) {
+   FoldingSetNodeID ID;
+   ID.AddInteger(scAddRecExpr);
+-  for (unsigned i = 0, e = Ops.size(); i != e; ++i)
++  for (unsigned i = 0, e = Ops.size(); i != e; ++i) {
++    assert(i == 0 || !Ops[i]->hasNonIntegralPointers());
+     ID.AddPointer(Ops[i]);
++  }
+   ID.AddPointer(L);
+   void *IP = nullptr;
+   SCEVAddRecExpr *S =
+@@ -2577,6 +2592,7 @@ ScalarEvolution::getOrCreateAddRecExpr(ArrayRef<const SCEV *> Ops,
+     addToLoopUseLists(S);
+   }
+   S->setNoWrapFlags(Flags);
++  S->setHasNIPtr(Ops[0]->hasNonIntegralPointers());
+   return S;
+ }
+ 
+@@ -2585,8 +2601,11 @@ ScalarEvolution::getOrCreateMulExpr(ArrayRef<const SCEV *> Ops,
+                                     SCEV::NoWrapFlags Flags) {
+   FoldingSetNodeID ID;
+   ID.AddInteger(scMulExpr);
+-  for (unsigned i = 0, e = Ops.size(); i != e; ++i)
++  bool HasNIPtr = false;
++  for (unsigned i = 0, e = Ops.size(); i != e; ++i) {
++    HasNIPtr |= Ops[i]->hasNonIntegralPointers();
+     ID.AddPointer(Ops[i]);
++  }
+   void *IP = nullptr;
+   SCEVMulExpr *S =
+     static_cast<SCEVMulExpr *>(UniqueSCEVs.FindNodeOrInsertPos(ID, IP));
+@@ -2599,6 +2618,7 @@ ScalarEvolution::getOrCreateMulExpr(ArrayRef<const SCEV *> Ops,
+     addToLoopUseLists(S);
+   }
+   S->setNoWrapFlags(Flags);
++  S->setHasNIPtr(HasNIPtr);
+   return S;
+ }
+ 
+@@ -3456,8 +3476,11 @@ const SCEV *ScalarEvolution::getMinMaxExpr(unsigned Kind,
+     return ExistingSCEV;
+   const SCEV **O = SCEVAllocator.Allocate<const SCEV *>(Ops.size());
+   std::uninitialized_copy(Ops.begin(), Ops.end(), O);
+-  SCEV *S = new (SCEVAllocator) SCEVMinMaxExpr(
++  SCEVMinMaxExpr *S = new (SCEVAllocator) SCEVMinMaxExpr(
+       ID.Intern(SCEVAllocator), static_cast<SCEVTypes>(Kind), O, Ops.size());
++  // For MinMaxExprs it's sufficient to see if the first Op has NI data, as the
++  // operands all need to be of the same type.
++  S->setHasNIPtr(Ops[0]->hasNonIntegralPointers());
+ 
+   UniqueSCEVs.InsertNode(S, IP);
+   addToLoopUseLists(S);
+@@ -3540,8 +3563,9 @@ const SCEV *ScalarEvolution::getUnknown(Value *V) {
+            "Stale SCEVUnknown in uniquing map!");
+     return S;
+   }
++  bool ValueIsNIPtr = getDataLayout().isNonIntegralPointerType(V->getType());
+   SCEV *S = new (SCEVAllocator) SCEVUnknown(ID.Intern(SCEVAllocator), V, this,
+-                                            FirstUnknown);
++                                            FirstUnknown, ValueIsNIPtr);
+   FirstUnknown = cast<SCEVUnknown>(S);
+   UniqueSCEVs.InsertNode(S, IP);
+   return S;
+diff --git a/llvm/lib/CodeGen/CodeGenPrepare.cpp b/llvm/lib/CodeGen/CodeGenPrepare.cpp
+index e8b8e6c93cf0..751dc72542ce 100644
+--- a/llvm/lib/CodeGen/CodeGenPrepare.cpp
++++ b/llvm/lib/CodeGen/CodeGenPrepare.cpp
+@@ -538,6 +538,7 @@ bool CodeGenPrepare::runOnFunction(Function &F) {
+     LargeOffsetGEPID.clear();
+   }
+ 
++  NewGEPBases.clear();
+   SunkAddrs.clear();
+ 
+   if (!DisableBranchOpts) {
+@@ -4998,18 +4999,29 @@ bool CodeGenPrepare::optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
+   WeakTrackingVH SunkAddrVH = SunkAddrs[Addr];
+ 
+   Value * SunkAddr = SunkAddrVH.pointsToAliveValue() ? SunkAddrVH : nullptr;
++  Type *IntPtrTy = DL->getIntPtrType(Addr->getType());
+   if (SunkAddr) {
+     LLVM_DEBUG(dbgs() << "CGP: Reusing nonlocal addrmode: " << AddrMode
+                       << " for " << *MemoryInst << "\n");
+-    if (SunkAddr->getType() != Addr->getType())
+-      SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++    if (SunkAddr->getType() != Addr->getType()) {
++      // Even though we only considered no-op addrspacecasts,
++      // semantically-meaningful conversions may still be present due to
++      // ptrtoint/inttoptr sequences.
++      if (SunkAddr->getType()->getPointerAddressSpace() !=
++              Addr->getType()->getPointerAddressSpace() &&
++          !DL->isNonIntegralPointerType(Addr->getType())) {
++        SunkAddr = Builder.CreatePtrToInt(SunkAddr, IntPtrTy, "sunkaddr");
++        SunkAddr =
++            Builder.CreateIntToPtr(SunkAddr, Addr->getType(), "sunkaddr");
++      } else
++        SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++    }
+   } else if (AddrSinkUsingGEPs || (!AddrSinkUsingGEPs.getNumOccurrences() &&
+                                    SubtargetInfo->addrSinkUsingGEPs())) {
+     // By default, we use the GEP-based method when AA is used later. This
+     // prevents new inttoptr/ptrtoint pairs from degrading AA capabilities.
+     LLVM_DEBUG(dbgs() << "CGP: SINKING nonlocal addrmode: " << AddrMode
+                       << " for " << *MemoryInst << "\n");
+-    Type *IntPtrTy = DL->getIntPtrType(Addr->getType());
+     Value *ResultPtr = nullptr, *ResultIndex = nullptr;
+ 
+     // First, find the pointer.
+@@ -5138,8 +5150,19 @@ bool CodeGenPrepare::optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
+                 : Builder.CreateGEP(I8Ty, ResultPtr, ResultIndex, "sunkaddr");
+       }
+ 
+-      if (SunkAddr->getType() != Addr->getType())
+-        SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++      if (SunkAddr->getType() != Addr->getType()) {
++        // Even though we only considered no-op addrspacecasts,
++        // semantically-meaningful conversions may still be present due to
++        // ptrtoint/inttoptr sequences.
++        if (SunkAddr->getType()->getPointerAddressSpace() !=
++                Addr->getType()->getPointerAddressSpace() &&
++            !DL->isNonIntegralPointerType(Addr->getType())) {
++          SunkAddr = Builder.CreatePtrToInt(SunkAddr, IntPtrTy, "sunkaddr");
++          SunkAddr =
++              Builder.CreateIntToPtr(SunkAddr, Addr->getType(), "sunkaddr");
++        } else
++          SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++      }
+     }
+   } else {
+     // We'd require a ptrtoint/inttoptr down the line, which we can't do for
+diff --git a/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp b/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp
+index 194961ae3b21..e65b9ce179c4 100644
+--- a/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp
++++ b/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp
+@@ -1157,7 +1157,6 @@ bool CombinerHelper::optimizeMemcpy(MachineInstr &MI, Register Dst,
+   // of that value loaded. This can result in a sequence of loads and stores
+   // mixed types, depending on what the target specifies as good types to use.
+   unsigned CurrOffset = 0;
+-  LLT PtrTy = MRI.getType(Src);
+   unsigned Size = KnownLen;
+   for (auto CopyTy : MemOps) {
+     // Issuing an unaligned load / store pair  that overlaps with the previous
+@@ -1175,15 +1174,20 @@ bool CombinerHelper::optimizeMemcpy(MachineInstr &MI, Register Dst,
+     Register LoadPtr = Src;
+     Register Offset;
+     if (CurrOffset != 0) {
+-      Offset = MIB.buildConstant(LLT::scalar(PtrTy.getSizeInBits()), CurrOffset)
+-                   .getReg(0);
+-      LoadPtr = MIB.buildPtrAdd(PtrTy, Src, Offset).getReg(0);
++      LLT LoadTy = MRI.getType(Src);
++      Offset =
++          MIB.buildConstant(LLT::scalar(LoadTy.getSizeInBits()), CurrOffset)
++              .getReg(0);
++      LoadPtr = MIB.buildPtrAdd(LoadTy, Src, Offset).getReg(0);
+     }
+     auto LdVal = MIB.buildLoad(CopyTy, LoadPtr, *LoadMMO);
+ 
+     // Create the store.
+-    Register StorePtr =
+-        CurrOffset == 0 ? Dst : MIB.buildPtrAdd(PtrTy, Dst, Offset).getReg(0);
++    Register StorePtr = Dst;
++    if (CurrOffset != 0) {
++      LLT StoreTy = MRI.getType(Dst);
++      StorePtr = MIB.buildPtrAdd(StoreTy, Dst, Offset).getReg(0);
++    }
+     MIB.buildStore(LdVal, StorePtr, *StoreMMO);
+     CurrOffset += CopyTy.getSizeInBytes();
+     Size -= CopyTy.getSizeInBytes();
+@@ -1260,7 +1264,6 @@ bool CombinerHelper::optimizeMemmove(MachineInstr &MI, Register Dst,
+   // Apart from that, this loop is pretty much doing the same thing as the
+   // memcpy codegen function.
+   unsigned CurrOffset = 0;
+-  LLT PtrTy = MRI.getType(Src);
+   SmallVector<Register, 16> LoadVals;
+   for (auto CopyTy : MemOps) {
+     // Construct MMO for the load.
+@@ -1270,9 +1273,10 @@ bool CombinerHelper::optimizeMemmove(MachineInstr &MI, Register Dst,
+     // Create the load.
+     Register LoadPtr = Src;
+     if (CurrOffset != 0) {
++      LLT LoadTy = MRI.getType(Src);
+       auto Offset =
+-          MIB.buildConstant(LLT::scalar(PtrTy.getSizeInBits()), CurrOffset);
+-      LoadPtr = MIB.buildPtrAdd(PtrTy, Src, Offset).getReg(0);
++          MIB.buildConstant(LLT::scalar(LoadTy.getSizeInBits()), CurrOffset);
++      LoadPtr = MIB.buildPtrAdd(LoadTy, Src, Offset).getReg(0);
+     }
+     LoadVals.push_back(MIB.buildLoad(CopyTy, LoadPtr, *LoadMMO).getReg(0));
+     CurrOffset += CopyTy.getSizeInBytes();
+@@ -1287,9 +1291,10 @@ bool CombinerHelper::optimizeMemmove(MachineInstr &MI, Register Dst,
+ 
+     Register StorePtr = Dst;
+     if (CurrOffset != 0) {
++      LLT StoreTy = MRI.getType(Dst);
+       auto Offset =
+-          MIB.buildConstant(LLT::scalar(PtrTy.getSizeInBits()), CurrOffset);
+-      StorePtr = MIB.buildPtrAdd(PtrTy, Dst, Offset).getReg(0);
++          MIB.buildConstant(LLT::scalar(StoreTy.getSizeInBits()), CurrOffset);
++      StorePtr = MIB.buildPtrAdd(StoreTy, Dst, Offset).getReg(0);
+     }
+     MIB.buildStore(LoadVals[I], StorePtr, *StoreMMO);
+     CurrOffset += CopyTy.getSizeInBytes();
+diff --git a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+index ec384d2a7c56..813bc01a5186 100644
+--- a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
++++ b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+@@ -20616,7 +20616,7 @@ SDValue DAGCombiner::visitFP16_TO_FP(SDNode *N) {
+   SDValue N0 = N->getOperand(0);
+ 
+   // fold fp16_to_fp(op & 0xffff) -> fp16_to_fp(op)
+-  if (N0->getOpcode() == ISD::AND) {
++  if (!TLI.shouldKeepZExtForFP16Conv() && N0->getOpcode() == ISD::AND) {
+     ConstantSDNode *AndConst = getAsNonOpaqueConstant(N0.getOperand(1));
+     if (AndConst && AndConst->getAPIntValue() == 0xffff) {
+       return DAG.getNode(ISD::FP16_TO_FP, SDLoc(N), N->getValueType(0),
+diff --git a/llvm/lib/CodeGen/StackColoring.cpp b/llvm/lib/CodeGen/StackColoring.cpp
+index d720d93c306d..cb96575bfaca 100644
+--- a/llvm/lib/CodeGen/StackColoring.cpp
++++ b/llvm/lib/CodeGen/StackColoring.cpp
+@@ -918,6 +918,8 @@ void StackColoring::remapInstructions(DenseMap<int, int> &SlotRemap) {
+     if (From->comesBefore(To))
+       const_cast<AllocaInst*>(To)->moveBefore(const_cast<AllocaInst*>(From));
+ 
++    const_cast<AllocaInst*>(To)->moveBefore(const_cast<Instruction*>(&*To->getParent()->getFirstInsertionPt()));
++
+     // AA might be used later for instruction scheduling, and we need it to be
+     // able to deduce the correct aliasing releationships between pointers
+     // derived from the alloca being remapped and the target of that remapping.
+diff --git a/llvm/lib/MC/WinCOFFObjectWriter.cpp b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+index 8e7bf1eb0169..f1beb2164ec9 100644
+--- a/llvm/lib/MC/WinCOFFObjectWriter.cpp
++++ b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+@@ -697,14 +697,12 @@ void WinCOFFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
+ bool WinCOFFObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
+     const MCAssembler &Asm, const MCSymbol &SymA, const MCFragment &FB,
+     bool InSet, bool IsPCRel) const {
+-  // Don't drop relocations between functions, even if they are in the same text
+-  // section. Multiple Visual C++ linker features depend on having the
+-  // relocations present. The /INCREMENTAL flag will cause these relocations to
+-  // point to thunks, and the /GUARD:CF flag assumes that it can use relocations
+-  // to approximate the set of all address taken functions. LLD's implementation
+-  // of /GUARD:CF also relies on the existance of these relocations.
++  // MS LINK expects to be able to replace all references to a function with a
++  // thunk to implement their /INCREMENTAL feature.  Make sure we don't optimize
++  // away any relocations to functions.
+   uint16_t Type = cast<MCSymbolCOFF>(SymA).getType();
+-  if ((Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
++  if (Asm.isIncrementalLinkerCompatible() &&
++      (Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
+     return false;
+   return MCObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(Asm, SymA, FB,
+                                                                 InSet, IsPCRel);
+diff --git a/llvm/lib/Target/AArch64/AArch64CollectLOH.cpp b/llvm/lib/Target/AArch64/AArch64CollectLOH.cpp
+index efdb1131abc9..ac243347b24d 100644
+--- a/llvm/lib/Target/AArch64/AArch64CollectLOH.cpp
++++ b/llvm/lib/Target/AArch64/AArch64CollectLOH.cpp
+@@ -419,13 +419,37 @@ static void handleADRP(const MachineInstr &MI, AArch64FunctionInfo &AFI,
+         ++NumADRPToLDR;
+       }
+       break;
+-    case MCLOH_AdrpAddLdr:
++    case MCLOH_AdrpAddLdr: {
++      // There is a possibility that the linker may try to rewrite:
++      // adrp x0, @sym@PAGE
++      // add x1, x0, @sym@PAGEOFF
++      // [x0 = some other def]
++      // ldr x2, [x1]
++      //    ...into...
++      // adrp x0, @sym
++      // nop
++      // [x0 = some other def]
++      // ldr x2, [x0]
++      // ...if the offset to the symbol won't fit within a literal load.
++      // This causes the load to use the result of the adrp, which in this
++      // case has already been clobbered.
++      // FIXME: Implement proper liveness tracking for all registers. For now,
++      // don't emit the LOH if there are any instructions between the add and
++      // the ldr.
++      MachineInstr *AddMI = const_cast<MachineInstr *>(Info.MI1);
++      const MachineInstr *LdrMI = Info.MI0;
++      auto AddIt = MachineBasicBlock::iterator(AddMI);
++      auto EndIt = AddMI->getParent()->end();
++      if (AddMI->getIterator() == EndIt || LdrMI != &*next_nodbg(AddIt, EndIt))
++        break;
++
+       LLVM_DEBUG(dbgs() << "Adding MCLOH_AdrpAddLdr:\n"
+                         << '\t' << MI << '\t' << *Info.MI1 << '\t'
+                         << *Info.MI0);
+       AFI.addLOHDirective(MCLOH_AdrpAddLdr, {&MI, Info.MI1, Info.MI0});
+       ++NumADDToLDR;
+       break;
++    }
+     case MCLOH_AdrpAddStr:
+       if (Info.MI1 != nullptr) {
+         LLVM_DEBUG(dbgs() << "Adding MCLOH_AdrpAddStr:\n"
+diff --git a/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp b/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp
+index 9e65ad2e18f9..3497a15a7574 100644
+--- a/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp
++++ b/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp
+@@ -844,6 +844,7 @@ bool AArch64ExpandPseudo::expandMI(MachineBasicBlock &MBB,
+   case AArch64::MOVaddrEXT: {
+     // Expand into ADRP + ADD.
+     Register DstReg = MI.getOperand(0).getReg();
++    assert(DstReg != AArch64::XZR);
+     MachineInstrBuilder MIB1 =
+         BuildMI(MBB, MBBI, MI.getDebugLoc(), TII->get(AArch64::ADRP), DstReg)
+             .add(MI.getOperand(1));
+diff --git a/llvm/lib/Target/AArch64/AArch64FastISel.cpp b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+index 0f63f4ca62e5..6908a51c47d6 100644
+--- a/llvm/lib/Target/AArch64/AArch64FastISel.cpp
++++ b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+@@ -526,10 +526,7 @@ unsigned AArch64FastISel::fastMaterializeConstant(const Constant *C) {
+   MVT VT = CEVT.getSimpleVT();
+   // arm64_32 has 32-bit pointers held in 64-bit registers. Because of that,
+   // 'null' pointers need to have a somewhat special treatment.
+-  if (const auto *CPN = dyn_cast<ConstantPointerNull>(C)) {
+-    (void)CPN;
+-    assert(CPN->getType()->getPointerAddressSpace() == 0 &&
+-           "Unexpected address space");
++  if (isa<ConstantPointerNull>(C)) {
+     assert(VT == MVT::i64 && "Expected 64-bit pointers");
+     return materializeInt(ConstantInt::get(Type::getInt64Ty(*Context), 0), VT);
+   }
+@@ -4603,30 +4600,6 @@ bool AArch64FastISel::selectIntExt(const Instruction *I) {
+ 
+   // Try to optimize already sign-/zero-extended values from function arguments.
+   bool IsZExt = isa<ZExtInst>(I);
+-  if (const auto *Arg = dyn_cast<Argument>(I->getOperand(0))) {
+-    if ((IsZExt && Arg->hasZExtAttr()) || (!IsZExt && Arg->hasSExtAttr())) {
+-      if (RetVT == MVT::i64 && SrcVT != MVT::i64) {
+-        unsigned ResultReg = createResultReg(&AArch64::GPR64RegClass);
+-        BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
+-                TII.get(AArch64::SUBREG_TO_REG), ResultReg)
+-            .addImm(0)
+-            .addReg(SrcReg, getKillRegState(SrcIsKill))
+-            .addImm(AArch64::sub_32);
+-        SrcReg = ResultReg;
+-      }
+-      // Conservatively clear all kill flags from all uses, because we are
+-      // replacing a sign-/zero-extend instruction at IR level with a nop at MI
+-      // level. The result of the instruction at IR level might have been
+-      // trivially dead, which is now not longer true.
+-      unsigned UseReg = lookUpRegForValue(I);
+-      if (UseReg)
+-        MRI.clearKillFlags(UseReg);
+-
+-      updateValueMap(I, SrcReg);
+-      return true;
+-    }
+-  }
+-
+   unsigned ResultReg = emitIntExt(SrcVT, SrcReg, RetVT, IsZExt);
+   if (!ResultReg)
+     return false;
+diff --git a/llvm/lib/Target/AArch64/AArch64InstrInfo.td b/llvm/lib/Target/AArch64/AArch64InstrInfo.td
+index f4a5f639e497..9e69934a97e2 100644
+--- a/llvm/lib/Target/AArch64/AArch64InstrInfo.td
++++ b/llvm/lib/Target/AArch64/AArch64InstrInfo.td
+@@ -630,40 +630,40 @@ let isReMaterializable = 1, isCodeGenOnly = 1 in {
+ // removed, along with the AArch64Wrapper node.
+ 
+ let AddedComplexity = 10 in
+-def LOADgot : Pseudo<(outs GPR64:$dst), (ins i64imm:$addr),
+-                     [(set GPR64:$dst, (AArch64LOADgot tglobaladdr:$addr))]>,
++def LOADgot : Pseudo<(outs GPR64common:$dst), (ins i64imm:$addr),
++                     [(set GPR64common:$dst, (AArch64LOADgot tglobaladdr:$addr))]>,
+               Sched<[WriteLDAdr]>;
+ 
+ // The MOVaddr instruction should match only when the add is not folded
+ // into a load or store address.
+ def MOVaddr
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tglobaladdr:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tglobaladdr:$hi),
+                                             tglobaladdr:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrJT
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tjumptable:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tjumptable:$hi),
+                                              tjumptable:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrCP
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tconstpool:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tconstpool:$hi),
+                                              tconstpool:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrBA
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tblockaddress:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tblockaddress:$hi),
+                                              tblockaddress:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrTLS
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tglobaltlsaddr:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tglobaltlsaddr:$hi),
+                                             tglobaltlsaddr:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrEXT
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp texternalsym:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp texternalsym:$hi),
+                                             texternalsym:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ // Normally AArch64addlow either gets folded into a following ldr/str,
+@@ -671,8 +671,8 @@ def MOVaddrEXT
+ // might appear without either of them, so allow lowering it into a plain
+ // add.
+ def ADDlowTLS
+-    : Pseudo<(outs GPR64:$dst), (ins GPR64:$src, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow GPR64:$src,
++    : Pseudo<(outs GPR64sp:$dst), (ins GPR64sp:$src, i64imm:$low),
++             [(set GPR64sp:$dst, (AArch64addlow GPR64sp:$src,
+                                             tglobaltlsaddr:$low))]>,
+       Sched<[WriteAdr]>;
+ 
+diff --git a/llvm/lib/Target/PowerPC/PPCFrameLowering.cpp b/llvm/lib/Target/PowerPC/PPCFrameLowering.cpp
+index 2ee394e9259d..80cbaa475184 100644
+--- a/llvm/lib/Target/PowerPC/PPCFrameLowering.cpp
++++ b/llvm/lib/Target/PowerPC/PPCFrameLowering.cpp
+@@ -531,9 +531,10 @@ bool PPCFrameLowering::needsFP(const MachineFunction &MF) const {
+     return false;
+ 
+   return MF.getTarget().Options.DisableFramePointerElim(MF) ||
+-    MFI.hasVarSizedObjects() || MFI.hasStackMap() || MFI.hasPatchPoint() ||
+-    (MF.getTarget().Options.GuaranteedTailCallOpt &&
+-     MF.getInfo<PPCFunctionInfo>()->hasFastCall());
++         MFI.hasVarSizedObjects() || MFI.hasStackMap() || MFI.hasPatchPoint() ||
++         MF.exposesReturnsTwice() ||
++         (MF.getTarget().Options.GuaranteedTailCallOpt &&
++          MF.getInfo<PPCFunctionInfo>()->hasFastCall());
+ }
+ 
+ void PPCFrameLowering::replaceFPWithRealFP(MachineFunction &MF) const {
+@@ -736,8 +737,8 @@ bool PPCFrameLowering::stackUpdateCanBeMoved(MachineFunction &MF) const {
+   // Frame pointers and base pointers complicate matters so don't do anything
+   // if we have them. For example having a frame pointer will sometimes require
+   // a copy of r1 into r31 and that makes keeping track of updates to r1 more
+-  // difficult.
+-  if (hasFP(MF) || RegInfo->hasBasePointer(MF))
++  // difficult. Similar situation exists with setjmp.
++  if (hasFP(MF) || RegInfo->hasBasePointer(MF) || MF.exposesReturnsTwice())
+     return false;
+ 
+   // Calls to fast_cc functions use different rules for passing parameters on
+@@ -1703,11 +1704,18 @@ void PPCFrameLowering::emitEpilogue(MachineFunction &MF,
+     // offset by the STDU/STDUX/STWU/STWUX instruction. For targets with red
+     // zone add this offset back now.
+ 
++    // If the function has a base pointer, the stack pointer has been copied
++    // to it so we can restore it by copying in the other direction.
++    if (HasRedZone && HasBP) {
++      BuildMI(MBB, MBBI, dl, OrInst, RBReg).
++        addReg(BPReg).
++        addReg(BPReg);
++    }
+     // If this function contained a fastcc call and GuaranteedTailCallOpt is
+     // enabled (=> hasFastCall()==true) the fastcc call might contain a tail
+     // call which invalidates the stack pointer value in SP(0). So we use the
+-    // value of R31 in this case.
+-    if (FI->hasFastCall()) {
++    // value of R31 in this case. Similar situation exists with setjmp.
++    else if (FI->hasFastCall() || MF.exposesReturnsTwice()) {
+       assert(HasFP && "Expecting a valid frame pointer.");
+       if (!HasRedZone)
+         RBReg = FPReg;
+diff --git a/llvm/lib/Target/PowerPC/PPCISelLowering.cpp b/llvm/lib/Target/PowerPC/PPCISelLowering.cpp
+index f54f1673526d..0e081ba73a6f 100644
+--- a/llvm/lib/Target/PowerPC/PPCISelLowering.cpp
++++ b/llvm/lib/Target/PowerPC/PPCISelLowering.cpp
+@@ -11444,17 +11444,88 @@ PPCTargetLowering::EmitAtomicBinary(MachineInstr &MI, MachineBasicBlock *BB,
+   return BB;
+ }
+ 
++static bool isSignExtended(MachineInstr &MI, const PPCInstrInfo *TII) {
++  switch(MI.getOpcode()) {
++  default:
++    return false;
++  case PPC::COPY:
++    return TII->isSignExtended(MI);
++  case PPC::LHA:
++  case PPC::LHA8:
++  case PPC::LHAU:
++  case PPC::LHAU8:
++  case PPC::LHAUX:
++  case PPC::LHAUX8:
++  case PPC::LHAX:
++  case PPC::LHAX8:
++  case PPC::LWA:
++  case PPC::LWAUX:
++  case PPC::LWAX:
++  case PPC::LWAX_32:
++  case PPC::LWA_32:
++  case PPC::PLHA:
++  case PPC::PLHA8:
++  case PPC::PLHA8pc:
++  case PPC::PLHApc:
++  case PPC::PLWA:
++  case PPC::PLWA8:
++  case PPC::PLWA8pc:
++  case PPC::PLWApc:
++  case PPC::EXTSB:
++  case PPC::EXTSB8:
++  case PPC::EXTSB8_32_64:
++  case PPC::EXTSB8_rec:
++  case PPC::EXTSB_rec:
++  case PPC::EXTSH:
++  case PPC::EXTSH8:
++  case PPC::EXTSH8_32_64:
++  case PPC::EXTSH8_rec:
++  case PPC::EXTSH_rec:
++  case PPC::EXTSW:
++  case PPC::EXTSWSLI:
++  case PPC::EXTSWSLI_32_64:
++  case PPC::EXTSWSLI_32_64_rec:
++  case PPC::EXTSWSLI_rec:
++  case PPC::EXTSW_32:
++  case PPC::EXTSW_32_64:
++  case PPC::EXTSW_32_64_rec:
++  case PPC::EXTSW_rec:
++  case PPC::SRAW:
++  case PPC::SRAWI:
++  case PPC::SRAWI_rec:
++  case PPC::SRAW_rec:
++    return true;
++  }
++  return false;
++}
++
+ MachineBasicBlock *PPCTargetLowering::EmitPartwordAtomicBinary(
+     MachineInstr &MI, MachineBasicBlock *BB,
+     bool is8bit, // operation
+     unsigned BinOpcode, unsigned CmpOpcode, unsigned CmpPred) const {
++  // This also handles ATOMIC_SWAP, indicated by BinOpcode==0.
++  const PPCInstrInfo *TII = Subtarget.getInstrInfo();
++
++  // If this is a signed comparison and the value being compared is not known
++  // to be sign extended, sign extend it here.
++  DebugLoc dl = MI.getDebugLoc();
++  MachineFunction *F = BB->getParent();
++  MachineRegisterInfo &RegInfo = F->getRegInfo();
++  Register incr = MI.getOperand(3).getReg();
++  bool IsSignExtended = Register::isVirtualRegister(incr) &&
++    isSignExtended(*RegInfo.getVRegDef(incr), TII);
++
++  if (CmpOpcode == PPC::CMPW && !IsSignExtended) {
++    Register ValueReg = RegInfo.createVirtualRegister(&PPC::GPRCRegClass);
++    BuildMI(*BB, MI, dl, TII->get(is8bit ? PPC::EXTSB : PPC::EXTSH), ValueReg)
++        .addReg(MI.getOperand(3).getReg());
++    MI.getOperand(3).setReg(ValueReg);
++  }
+   // If we support part-word atomic mnemonics, just use them
+   if (Subtarget.hasPartwordAtomics())
+     return EmitAtomicBinary(MI, BB, is8bit ? 1 : 2, BinOpcode, CmpOpcode,
+                             CmpPred);
+ 
+-  // This also handles ATOMIC_SWAP, indicated by BinOpcode==0.
+-  const TargetInstrInfo *TII = Subtarget.getInstrInfo();
+   // In 64 bit mode we have to use 64 bits for addresses, even though the
+   // lwarx/stwcx are 32 bits.  With the 32-bit atomics we can use address
+   // registers without caring whether they're 32 or 64, but here we're
+@@ -11464,14 +11535,11 @@ MachineBasicBlock *PPCTargetLowering::EmitPartwordAtomicBinary(
+   unsigned ZeroReg = is64bit ? PPC::ZERO8 : PPC::ZERO;
+ 
+   const BasicBlock *LLVM_BB = BB->getBasicBlock();
+-  MachineFunction *F = BB->getParent();
+   MachineFunction::iterator It = ++BB->getIterator();
+ 
+   Register dest = MI.getOperand(0).getReg();
+   Register ptrA = MI.getOperand(1).getReg();
+   Register ptrB = MI.getOperand(2).getReg();
+-  Register incr = MI.getOperand(3).getReg();
+-  DebugLoc dl = MI.getDebugLoc();
+ 
+   MachineBasicBlock *loopMBB = F->CreateMachineBasicBlock(LLVM_BB);
+   MachineBasicBlock *loop2MBB =
+@@ -11485,7 +11553,6 @@ MachineBasicBlock *PPCTargetLowering::EmitPartwordAtomicBinary(
+                   std::next(MachineBasicBlock::iterator(MI)), BB->end());
+   exitMBB->transferSuccessorsAndUpdatePHIs(BB);
+ 
+-  MachineRegisterInfo &RegInfo = F->getRegInfo();
+   const TargetRegisterClass *RC =
+       is64bit ? &PPC::G8RCRegClass : &PPC::GPRCRegClass;
+   const TargetRegisterClass *GPRC = &PPC::GPRCRegClass;
+@@ -13287,11 +13354,13 @@ SDValue PPCTargetLowering::DAGCombineTruncBoolExt(SDNode *N,
+       KnownBits Op2Known = DAG.computeKnownBits(N->getOperand(1));
+ 
+       // We don't really care about what is known about the first bit (if
+-      // anything), so clear it in all masks prior to comparing them.
+-      Op1Known.Zero.clearBit(0); Op1Known.One.clearBit(0);
+-      Op2Known.Zero.clearBit(0); Op2Known.One.clearBit(0);
++      // anything), so pretend that it is known zero for both to ensure they can
++      // be compared as constants.
++      Op1Known.Zero.setBit(0); Op1Known.One.clearBit(0);
++      Op2Known.Zero.setBit(0); Op2Known.One.clearBit(0);
+ 
+-      if (Op1Known.Zero != Op2Known.Zero || Op1Known.One != Op2Known.One)
++      if (!Op1Known.isConstant() || !Op2Known.isConstant() ||
++          Op1Known.getConstant() != Op2Known.getConstant())
+         return SDValue();
+     }
+   }
+diff --git a/llvm/lib/Target/PowerPC/PPCISelLowering.h b/llvm/lib/Target/PowerPC/PPCISelLowering.h
+index 768eaa43e013..90f1699ee772 100644
+--- a/llvm/lib/Target/PowerPC/PPCISelLowering.h
++++ b/llvm/lib/Target/PowerPC/PPCISelLowering.h
+@@ -951,6 +951,9 @@ namespace llvm {
+     shouldExpandBuildVectorWithShuffles(EVT VT,
+                                         unsigned DefinedValues) const override;
+ 
++    // Keep the zero-extensions for arguments to libcalls.
++    bool shouldKeepZExtForFP16Conv() const override { return true; }
++
+     /// createFastISel - This method returns a target-specific FastISel object,
+     /// or null if the target does not support "fast" instruction selection.
+     FastISel *createFastISel(FunctionLoweringInfo &FuncInfo,
+diff --git a/llvm/lib/Target/PowerPC/PPCTargetTransformInfo.cpp b/llvm/lib/Target/PowerPC/PPCTargetTransformInfo.cpp
+index 53556ffc267d..adf9f0df82f8 100644
+--- a/llvm/lib/Target/PowerPC/PPCTargetTransformInfo.cpp
++++ b/llvm/lib/Target/PowerPC/PPCTargetTransformInfo.cpp
+@@ -276,8 +276,33 @@ bool PPCTTIImpl::mightUseCTR(BasicBlock *BB, TargetLibraryInfo *LibInfo,
+     return false;
+   };
+ 
++  auto supportedHalfPrecisionOp = [](Instruction *Inst) {
++    switch (Inst->getOpcode()) {
++    default: return false;
++    case Instruction::FPTrunc:
++    case Instruction::FPExt:
++    case Instruction::Load:
++    case Instruction::Store:
++    case Instruction::FPToUI:
++    case Instruction::UIToFP:
++    case Instruction::FPToSI:
++    case Instruction::SIToFP:
++      return true;
++    }
++  };
++
+   for (BasicBlock::iterator J = BB->begin(), JE = BB->end();
+        J != JE; ++J) {
++    // There are no direct operations on half precision so assume that
++    // anything with that type requires a call except for a few select
++    // operations with Power9.
++    if (Instruction *CurrInst = dyn_cast<Instruction>(J)) {
++      for (const auto &Op : CurrInst->operands()) {
++        if (Op->getType()->getScalarType()->isHalfTy() ||
++            CurrInst->getType()->getScalarType()->isHalfTy())
++          return !(ST->isISA3_0() && supportedHalfPrecisionOp(CurrInst));
++      }
++    }
+     if (CallInst *CI = dyn_cast<CallInst>(J)) {
+       // Inline ASM is okay, unless it clobbers the ctr register.
+       if (InlineAsm *IA = dyn_cast<InlineAsm>(CI->getCalledOperand())) {
+diff --git a/llvm/lib/Target/X86/X86ISelDAGToDAG.cpp b/llvm/lib/Target/X86/X86ISelDAGToDAG.cpp
+index 3cd80cb04ab8..f6aaef215432 100644
+--- a/llvm/lib/Target/X86/X86ISelDAGToDAG.cpp
++++ b/llvm/lib/Target/X86/X86ISelDAGToDAG.cpp
+@@ -611,7 +611,7 @@ X86DAGToDAGISel::IsProfitableToFold(SDValue N, SDNode *U, SDNode *Root) const {
+         // best of both worlds.
+         if (U->getOpcode() == ISD::AND &&
+             Imm->getAPIntValue().getBitWidth() == 64 &&
+-            Imm->getAPIntValue().isIntN(32))
++            Imm->getAPIntValue().isSignedIntN(32))
+           return false;
+ 
+         // If this really a zext_inreg that can be represented with a movzx
+diff --git a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index c911b37afac7..f8e4add475c3 100644
+--- a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -361,7 +361,9 @@ static bool shouldInstrumentReadWriteFromAddress(const Module *M, Value *Addr) {
+   // with them.
+   if (Addr) {
+     Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+-    if (PtrTy->getPointerAddressSpace() != 0)
++    auto AS = PtrTy->getPointerAddressSpace();
++    // Allow for custom addresspaces
++    if (AS != 0 && AS < 10)
+       return false;
+   }
+ 
+diff --git a/llvm/lib/Transforms/Scalar/MergeICmps.cpp b/llvm/lib/Transforms/Scalar/MergeICmps.cpp
+index ce1e142101b8..2c40b21ddbb3 100644
+--- a/llvm/lib/Transforms/Scalar/MergeICmps.cpp
++++ b/llvm/lib/Transforms/Scalar/MergeICmps.cpp
+@@ -154,6 +154,10 @@ BCEAtom visitICmpLoadOperand(Value *const Val, BaseIdentifier &BaseId) {
+     return {};
+   }
+   Value *const Addr = LoadI->getOperand(0);
++  if (Addr->getType()->getPointerAddressSpace() != 0) {
++    LLVM_DEBUG(dbgs() << "from non-zero AddressSpace\n");
++    return {};
++  }
+   auto *const GEP = dyn_cast<GetElementPtrInst>(Addr);
+   if (!GEP)
+     return {};
+diff --git a/llvm/lib/Transforms/Utils/VNCoercion.cpp b/llvm/lib/Transforms/Utils/VNCoercion.cpp
+index 6ff08cd28712..8fe83faa81d6 100644
+--- a/llvm/lib/Transforms/Utils/VNCoercion.cpp
++++ b/llvm/lib/Transforms/Utils/VNCoercion.cpp
+@@ -36,17 +36,22 @@ bool canCoerceMustAliasedValueToLoad(Value *StoredVal, Type *LoadTy,
+   if (StoreSize < DL.getTypeSizeInBits(LoadTy).getFixedSize())
+     return false;
+ 
++  bool StoredNI = DL.isNonIntegralPointerType(StoredTy->getScalarType());
++  bool LoadNI = DL.isNonIntegralPointerType(LoadTy->getScalarType());
+   // Don't coerce non-integral pointers to integers or vice versa.
+-  if (DL.isNonIntegralPointerType(StoredVal->getType()->getScalarType()) !=
+-      DL.isNonIntegralPointerType(LoadTy->getScalarType())) {
++  if (StoredNI != LoadNI) {
+     // As a special case, allow coercion of memset used to initialize
+     // an array w/null.  Despite non-integral pointers not generally having a
+     // specific bit pattern, we do assume null is zero.
+     if (auto *CI = dyn_cast<Constant>(StoredVal))
+       return CI->isNullValue();
+     return false;
++  } else if (StoredNI && LoadNI &&
++             cast<PointerType>(StoredTy)->getAddressSpace() !=
++                 cast<PointerType>(LoadTy)->getAddressSpace()) {
++    return false;
+   }
+-  
++
+   return true;
+ }
+ 
+diff --git a/llvm/test/CodeGen/AArch64/GlobalISel/select-blockaddress.mir b/llvm/test/CodeGen/AArch64/GlobalISel/select-blockaddress.mir
+index bd5ee80d5841..10732660d34a 100644
+--- a/llvm/test/CodeGen/AArch64/GlobalISel/select-blockaddress.mir
++++ b/llvm/test/CodeGen/AArch64/GlobalISel/select-blockaddress.mir
+@@ -30,9 +30,10 @@ registers:
+ body:             |
+   ; CHECK-LABEL: name: test_blockaddress
+   ; CHECK: bb.0 (%ir-block.0):
+-  ; CHECK:   [[MOVaddrBA:%[0-9]+]]:gpr64 = MOVaddrBA target-flags(aarch64-page) blockaddress(@test_blockaddress, %ir-block.block), target-flags(aarch64-pageoff, aarch64-nc) blockaddress(@test_blockaddress, %ir-block.block)
++  ; CHECK:   [[MOVaddrBA:%[0-9]+]]:gpr64common = MOVaddrBA target-flags(aarch64-page) blockaddress(@test_blockaddress, %ir-block.block), target-flags(aarch64-pageoff, aarch64-nc) blockaddress(@test_blockaddress, %ir-block.block)
+   ; CHECK:   [[MOVaddr:%[0-9]+]]:gpr64common = MOVaddr target-flags(aarch64-page) @addr, target-flags(aarch64-pageoff, aarch64-nc) @addr
+-  ; CHECK:   STRXui [[MOVaddrBA]], [[MOVaddr]], 0 :: (store 8 into @addr)
++  ; CHECK:   [[COPY:%[0-9]+]]:gpr64 = COPY [[MOVaddrBA]]
++  ; CHECK:   STRXui [[COPY]], [[MOVaddr]], 0 :: (store 8 into @addr)
+   ; CHECK:   BR [[MOVaddrBA]]
+   ; CHECK: bb.1.block (address-taken):
+   ; CHECK:   RET_ReallyLR
+diff --git a/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt-constrain.mir b/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt-constrain.mir
+index 082bf43061da..6f3540a0768b 100644
+--- a/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt-constrain.mir
++++ b/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt-constrain.mir
+@@ -30,7 +30,7 @@ body:             |
+   ; CHECK:   Bcc 8, %bb.3, implicit $nzcv
+   ; CHECK: bb.1:
+   ; CHECK:   successors: %bb.2(0x40000000), %bb.3(0x40000000)
+-  ; CHECK:   [[MOVaddrJT:%[0-9]+]]:gpr64 = MOVaddrJT target-flags(aarch64-page) %jump-table.0, target-flags(aarch64-pageoff, aarch64-nc) %jump-table.0
++  ; CHECK:   [[MOVaddrJT:%[0-9]+]]:gpr64common = MOVaddrJT target-flags(aarch64-page) %jump-table.0, target-flags(aarch64-pageoff, aarch64-nc) %jump-table.0
+   ; CHECK:   early-clobber %6:gpr64, early-clobber %7:gpr64sp = JumpTableDest32 [[MOVaddrJT]], [[SUBREG_TO_REG]], %jump-table.0
+   ; CHECK:   BR %6
+   ; CHECK: bb.2:
+diff --git a/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt.mir b/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt.mir
+index ae7d90769f99..80631eadb5e8 100644
+--- a/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt.mir
++++ b/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt.mir
+@@ -65,7 +65,7 @@ body:             |
+   ; CHECK: bb.1.entry:
+   ; CHECK:   successors: %bb.3(0x2aaaaaab), %bb.4(0x2aaaaaab), %bb.2(0x2aaaaaab)
+   ; CHECK:   [[COPY2:%[0-9]+]]:gpr32 = COPY $wzr
+-  ; CHECK:   [[MOVaddrJT:%[0-9]+]]:gpr64 = MOVaddrJT target-flags(aarch64-page) %jump-table.0, target-flags(aarch64-pageoff, aarch64-nc) %jump-table.0
++  ; CHECK:   [[MOVaddrJT:%[0-9]+]]:gpr64common = MOVaddrJT target-flags(aarch64-page) %jump-table.0, target-flags(aarch64-pageoff, aarch64-nc) %jump-table.0
+   ; CHECK:   early-clobber %18:gpr64, early-clobber %19:gpr64sp = JumpTableDest32 [[MOVaddrJT]], [[SUBREG_TO_REG]], %jump-table.0
+   ; CHECK:   BR %18
+   ; CHECK: bb.2.sw.bb:
+diff --git a/llvm/test/CodeGen/AArch64/GlobalISel/select.mir b/llvm/test/CodeGen/AArch64/GlobalISel/select.mir
+deleted file mode 100644
+index 112aee8d552c..000000000000
+--- a/llvm/test/CodeGen/AArch64/GlobalISel/select.mir
++++ /dev/null
+@@ -1,312 +0,0 @@
+-# RUN: llc -O0 -mtriple=aarch64-apple-ios -run-pass=instruction-select -verify-machineinstrs %s -o - | FileCheck %s -check-prefix=CHECK -check-prefix=IOS
+-# RUN: llc -O0 -mtriple=aarch64-linux-gnu -run-pass=instruction-select -verify-machineinstrs %s -o - | FileCheck %s -check-prefix=CHECK -check-prefix=LINUX-DEFAULT
+-# RUN: llc -O0 -mtriple=aarch64-linux-gnu -relocation-model=pic -run-pass=instruction-select -verify-machineinstrs %s -o - | FileCheck %s -check-prefix=CHECK -check-prefix=LINUX-PIC
+-
+---- |
+-  target datalayout = "e-m:o-i64:64-i128:128-n32:64-S128"
+-
+-  define void @frame_index() {
+-    %ptr0 = alloca i64
+-    ret void
+-  }
+-
+-  define i8* @ptr_mask(i8* %in) { ret i8* undef }
+-
+-  @var_local = global i8 0
+-  define i8* @global_local() { ret i8* undef }
+-
+-  @var_got = external global i8
+-  define i8* @global_got() { ret i8* undef }
+-
+-  define void @icmp() { ret void }
+-  define void @fcmp() { ret void }
+-
+-  define void @phi() { ret void }
+-
+-  define void @select() { ret void }
+-...
+-
+----
+-# CHECK-LABEL: name: frame_index
+-name:            frame_index
+-legalized:       true
+-regBankSelected: true
+-
+-# CHECK:      registers:
+-# CHECK-NEXT:  - { id: 0, class: gpr64sp, preferred-register: '' }
+-registers:
+-  - { id: 0, class: gpr }
+-
+-stack:
+-  - { id: 0, name: ptr0, offset: 0, size: 8, alignment: 8 }
+-
+-# CHECK:  body:
+-# CHECK: %0:gpr64sp = ADDXri %stack.0.ptr0, 0, 0
+-body:             |
+-  bb.0:
+-    %0(p0) = G_FRAME_INDEX %stack.0.ptr0
+-    $x0 = COPY %0(p0)
+-...
+-
+----
+-
+----
+-# CHECK-LABEL: name: ptr_mask
+-name:            ptr_mask
+-legalized:       true
+-regBankSelected: true
+-
+-# CHECK:  body:
+-# CHECK: %2:gpr64sp = ANDXri %0, 8060
+-body:             |
+-  bb.0:
+-      liveins: $x0
+-    %0:gpr(p0) = COPY $x0
+-    %const:gpr(s64) = G_CONSTANT i64 -8
+-    %1:gpr(p0) = G_PTRMASK %0, %const
+-    $x0 = COPY %1(p0)
+-...
+-
+----
+-# Global defined in the same linkage unit so no GOT is needed
+-# CHECK-LABEL: name: global_local
+-name:            global_local
+-legalized:       true
+-regBankSelected: true
+-registers:
+-  - { id: 0, class: gpr }
+-
+-# CHECK:  body:
+-# IOS: %0:gpr64 = MOVaddr target-flags(aarch64-page) @var_local, target-flags(aarch64-pageoff, aarch64-nc) @var_local
+-# LINUX-DEFAULT: %0:gpr64 = MOVaddr target-flags(aarch64-page) @var_local, target-flags(aarch64-pageoff, aarch64-nc) @var_local
+-# LINUX-PIC: %0:gpr64 = LOADgot target-flags(aarch64-got) @var_local
+-body:             |
+-  bb.0:
+-    %0(p0) = G_GLOBAL_VALUE @var_local
+-    $x0 = COPY %0(p0)
+-...
+-
+----
+-# CHECK-LABEL: name: global_got
+-name:            global_got
+-legalized:       true
+-regBankSelected: true
+-registers:
+-  - { id: 0, class: gpr }
+-
+-# CHECK:  body:
+-# IOS: %0:gpr64 = LOADgot target-flags(aarch64-got) @var_got
+-# LINUX-DEFAULT: %0:gpr64 = MOVaddr target-flags(aarch64-page) @var_got, target-flags(aarch64-pageoff, aarch64-nc) @var_got
+-# LINUX-PIC: %0:gpr64 = LOADgot target-flags(aarch64-got) @var_got
+-body:             |
+-  bb.0:
+-    %0(p0) = G_GLOBAL_VALUE @var_got
+-    $x0 = COPY %0(p0)
+-...
+-
+----
+-# CHECK-LABEL: name: icmp
+-name:            icmp
+-legalized:       true
+-regBankSelected: true
+-
+-# CHECK:      registers:
+-# CHECK-NEXT:  - { id: 0, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 1, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 2, class: gpr64, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 3, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 4, class: gpr64, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 5, class: gpr32, preferred-register: '' }
+-registers:
+-  - { id: 0, class: gpr }
+-  - { id: 1, class: gpr }
+-  - { id: 2, class: gpr }
+-  - { id: 3, class: gpr }
+-  - { id: 4, class: gpr }
+-  - { id: 5, class: gpr }
+-  - { id: 6, class: gpr }
+-  - { id: 7, class: gpr }
+-  - { id: 8, class: gpr }
+-  - { id: 9, class: gpr }
+-  - { id: 10, class: gpr }
+-  - { id: 11, class: gpr }
+-
+-# CHECK:  body:
+-# CHECK:    SUBSWrr %0, %0, implicit-def $nzcv
+-# CHECK:    %1:gpr32 = CSINCWr $wzr, $wzr, 1, implicit $nzcv
+-
+-# CHECK:    SUBSXrr %2, %2, implicit-def $nzcv
+-# CHECK:    %3:gpr32 = CSINCWr $wzr, $wzr, 3, implicit $nzcv
+-
+-# CHECK:    SUBSXrr %4, %4, implicit-def $nzcv
+-# CHECK:    %5:gpr32 = CSINCWr $wzr, $wzr, 0, implicit $nzcv
+-
+-body:             |
+-  bb.0:
+-    liveins: $w0, $x0
+-
+-    %0(s32) = COPY $w0
+-    %1(s32) = G_ICMP intpred(eq), %0, %0
+-    %6(s1) = G_TRUNC %1(s32)
+-    %9(s32) = G_ANYEXT %6
+-    $w0 = COPY %9(s32)
+-
+-    %2(s64) = COPY $x0
+-    %3(s32) = G_ICMP intpred(uge), %2, %2
+-    %7(s1) = G_TRUNC %3(s32)
+-    %10(s32) = G_ANYEXT %7
+-    $w0 = COPY %10(s32)
+-
+-    %4(p0) = COPY $x0
+-    %5(s32) = G_ICMP intpred(ne), %4, %4
+-    %8(s1) = G_TRUNC %5(s32)
+-    %11(s32) = G_ANYEXT %8
+-    $w0 = COPY %11(s32)
+-...
+-
+----
+-# CHECK-LABEL: name: fcmp
+-name:            fcmp
+-legalized:       true
+-regBankSelected: true
+-
+-# CHECK:      registers:
+-# CHECK-NEXT:  - { id: 0, class: fpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 1, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 2, class: fpr64, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 3, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 4, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 5, class: gpr32, preferred-register: '' }
+-registers:
+-  - { id: 0, class: fpr }
+-  - { id: 1, class: gpr }
+-  - { id: 2, class: fpr }
+-  - { id: 3, class: gpr }
+-  - { id: 4, class: gpr }
+-  - { id: 5, class: gpr }
+-  - { id: 6, class: gpr }
+-  - { id: 7, class: gpr }
+-
+-# CHECK:  body:
+-# CHECK:    FCMPSrr %0, %0, implicit-def $nzcv
+-# CHECK:    [[TST_MI:%[0-9]+]]:gpr32 = CSINCWr $wzr, $wzr, 5, implicit $nzcv
+-# CHECK:    [[TST_GT:%[0-9]+]]:gpr32 = CSINCWr $wzr, $wzr, 13, implicit $nzcv
+-# CHECK:    %1:gpr32 = ORRWrr [[TST_MI]], [[TST_GT]]
+-
+-# CHECK:    FCMPDrr %2, %2, implicit-def $nzcv
+-# CHECK:    %3:gpr32 = CSINCWr $wzr, $wzr, 4, implicit $nzcv
+-
+-body:             |
+-  bb.0:
+-    liveins: $w0, $x0
+-
+-    %0(s32) = COPY $s0
+-    %1(s32) = G_FCMP floatpred(one), %0, %0
+-    %4(s1) = G_TRUNC %1(s32)
+-    %6(s32) = G_ANYEXT %4
+-    $w0 = COPY %6(s32)
+-
+-    %2(s64) = COPY $d0
+-    %3(s32) = G_FCMP floatpred(uge), %2, %2
+-    %5(s1) = G_TRUNC %3(s32)
+-    %7(s32) = G_ANYEXT %5
+-    $w0 = COPY %7(s32)
+-
+-...
+-
+----
+-# CHECK-LABEL: name: phi
+-name:            phi
+-legalized:       true
+-regBankSelected: true
+-tracksRegLiveness: true
+-
+-# CHECK:      registers:
+-# CHECK-NEXT:  - { id: 0, class: fpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 1, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 2, class: fpr32, preferred-register: '' }
+-registers:
+-  - { id: 0, class: fpr }
+-  - { id: 1, class: gpr }
+-  - { id: 2, class: fpr }
+-
+-# CHECK:  body:
+-# CHECK:    bb.1:
+-# CHECK:      %2:fpr32 = PHI %0, %bb.0, %2, %bb.1
+-
+-body:             |
+-  bb.0:
+-    liveins: $s0, $w0
+-    successors: %bb.1
+-    %0(s32) = COPY $s0
+-    %3:gpr(s32) = COPY $w0
+-    %1(s1) = G_TRUNC %3
+-
+-  bb.1:
+-    successors: %bb.1, %bb.2
+-    %2(s32) = PHI %0, %bb.0, %2, %bb.1
+-    G_BRCOND %1, %bb.1
+-
+-  bb.2:
+-    $s0 = COPY %2
+-    RET_ReallyLR implicit $s0
+-...
+-
+----
+-# CHECK-LABEL: name: select
+-name:            select
+-legalized:       true
+-regBankSelected: true
+-tracksRegLiveness: true
+-
+-# CHECK:      registers:
+-# CHECK-NEXT:  - { id: 0, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 1, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 2, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 3, class: gpr32, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 4, class: gpr64, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 5, class: gpr64, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 6, class: gpr64, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 7, class: gpr64, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 8, class: gpr64, preferred-register: '' }
+-# CHECK-NEXT:  - { id: 9, class: gpr64, preferred-register: '' }
+-registers:
+-  - { id: 0, class: gpr }
+-  - { id: 1, class: gpr }
+-  - { id: 2, class: gpr }
+-  - { id: 3, class: gpr }
+-  - { id: 4, class: gpr }
+-  - { id: 5, class: gpr }
+-  - { id: 6, class: gpr }
+-  - { id: 7, class: gpr }
+-  - { id: 8, class: gpr }
+-  - { id: 9, class: gpr }
+-
+-# CHECK:  body:
+-# CHECK:      $wzr = ANDSWri %10, 0, implicit-def $nzcv
+-# CHECK:      %3:gpr32 = CSELWr %1, %2, 1, implicit $nzcv
+-# CHECK:      $wzr = ANDSWri %10, 0, implicit-def $nzcv
+-# CHECK:      %6:gpr64 = CSELXr %4, %5, 1, implicit $nzcv
+-# CHECK:      $wzr = ANDSWri %10, 0, implicit-def $nzcv
+-# CHECK:      %9:gpr64 = CSELXr %7, %8, 1, implicit $nzcv
+-body:             |
+-  bb.0:
+-    liveins: $w0, $w1, $w2
+-    %10:gpr(s32) = COPY $w0
+-    %0(s1) = G_TRUNC %10
+-
+-    %1(s32) = COPY $w1
+-    %2(s32) = COPY $w2
+-    %3(s32) = G_SELECT %0, %1, %2
+-    $w0 = COPY %3(s32)
+-
+-    %4(s64) = COPY $x0
+-    %5(s64) = COPY $x1
+-    %6(s64) = G_SELECT %0, %4, %5
+-    $x0 = COPY %6(s64)
+-
+-    %7(p0) = COPY $x0
+-    %8(p0) = COPY $x1
+-    %9(p0) = G_SELECT %0, %7, %8
+-    $x0 = COPY %9(p0)
+-...
+diff --git a/llvm/test/CodeGen/PowerPC/aix-base-pointer.ll b/llvm/test/CodeGen/PowerPC/aix-base-pointer.ll
+index 2566e31c025d..5141fd9e4222 100644
+--- a/llvm/test/CodeGen/PowerPC/aix-base-pointer.ll
++++ b/llvm/test/CodeGen/PowerPC/aix-base-pointer.ll
+@@ -27,8 +27,8 @@ declare void @callee(i32*)
+ ; 32BIT:         stwux 1, 1, 0
+ ; 32BIT:         addi 3, 1, 64
+ ; 32BIT:         bl .callee
+-; 32BIT:         lwz 1, 0(1)
+-; 32BIT:         lwz 30, -8(1)
++; 32BIT:         mr 1, 30
++; 32BIT:         lwz 30, -16(1)
+ 
+ ; 64BIT-LABEL: .caller:
+ ; 64BIT:         std 30, -16(1)
+@@ -38,5 +38,5 @@ declare void @callee(i32*)
+ ; 64BIT:         stdux 1, 1, 0
+ ; 64BIT:         addi 3, 1, 128
+ ; 64BIT:         bl .callee
+-; 64BIT:         ld 1, 0(1)
+-; 64BIT:         ld 30, -16(1)
++; 64BIT:         mr 1, 30
++; 64BIT:         ld 30, -24(1)
+diff --git a/llvm/test/CodeGen/PowerPC/atomics-regression.ll b/llvm/test/CodeGen/PowerPC/atomics-regression.ll
+index ae79f82e1e06..3b7caeee91e4 100644
+--- a/llvm/test/CodeGen/PowerPC/atomics-regression.ll
++++ b/llvm/test/CodeGen/PowerPC/atomics-regression.ll
+@@ -4352,16 +4352,17 @@ define i64 @test259(i64* %ptr, i64 %val) {
+ define i8 @test260(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test260:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:  .LBB260_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB260_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB260_1
+ ; PPC64LE-NEXT:  .LBB260_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val monotonic
+   ret i8 %ret
+@@ -4370,16 +4371,17 @@ define i8 @test260(i8* %ptr, i8 %val) {
+ define i8 @test261(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test261:
+ ; PPC64LE:       # %bb.0:
+-; PPC64LE-NEXT:    mr 5, 3
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:  .LBB261_1:
+-; PPC64LE-NEXT:    lbarx 3, 0, 5
+-; PPC64LE-NEXT:    extsb 6, 3
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB261_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 5
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB261_1
+ ; PPC64LE-NEXT:  .LBB261_3:
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val acquire
+@@ -4389,17 +4391,18 @@ define i8 @test261(i8* %ptr, i8 %val) {
+ define i8 @test262(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test262:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB262_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB262_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB262_1
+ ; PPC64LE-NEXT:  .LBB262_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val release
+   ret i8 %ret
+@@ -4408,17 +4411,18 @@ define i8 @test262(i8* %ptr, i8 %val) {
+ define i8 @test263(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test263:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB263_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB263_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB263_1
+ ; PPC64LE-NEXT:  .LBB263_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val acq_rel
+@@ -4428,17 +4432,18 @@ define i8 @test263(i8* %ptr, i8 %val) {
+ define i8 @test264(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test264:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    sync
+ ; PPC64LE-NEXT:  .LBB264_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB264_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB264_1
+ ; PPC64LE-NEXT:  .LBB264_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val seq_cst
+@@ -4448,16 +4453,17 @@ define i8 @test264(i8* %ptr, i8 %val) {
+ define i16 @test265(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test265:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:  .LBB265_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB265_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB265_1
+ ; PPC64LE-NEXT:  .LBB265_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val monotonic
+   ret i16 %ret
+@@ -4466,16 +4472,17 @@ define i16 @test265(i16* %ptr, i16 %val) {
+ define i16 @test266(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test266:
+ ; PPC64LE:       # %bb.0:
+-; PPC64LE-NEXT:    mr 5, 3
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:  .LBB266_1:
+-; PPC64LE-NEXT:    lharx 3, 0, 5
+-; PPC64LE-NEXT:    extsh 6, 3
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB266_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 5
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB266_1
+ ; PPC64LE-NEXT:  .LBB266_3:
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val acquire
+@@ -4485,17 +4492,18 @@ define i16 @test266(i16* %ptr, i16 %val) {
+ define i16 @test267(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test267:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB267_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB267_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB267_1
+ ; PPC64LE-NEXT:  .LBB267_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val release
+   ret i16 %ret
+@@ -4504,17 +4512,18 @@ define i16 @test267(i16* %ptr, i16 %val) {
+ define i16 @test268(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test268:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB268_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB268_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB268_1
+ ; PPC64LE-NEXT:  .LBB268_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val acq_rel
+@@ -4524,17 +4533,18 @@ define i16 @test268(i16* %ptr, i16 %val) {
+ define i16 @test269(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test269:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    sync
+ ; PPC64LE-NEXT:  .LBB269_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB269_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB269_1
+ ; PPC64LE-NEXT:  .LBB269_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val seq_cst
+@@ -4726,16 +4736,17 @@ define i64 @test279(i64* %ptr, i64 %val) {
+ define i8 @test280(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test280:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:  .LBB280_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB280_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB280_1
+ ; PPC64LE-NEXT:  .LBB280_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val monotonic
+   ret i8 %ret
+@@ -4744,16 +4755,17 @@ define i8 @test280(i8* %ptr, i8 %val) {
+ define i8 @test281(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test281:
+ ; PPC64LE:       # %bb.0:
+-; PPC64LE-NEXT:    mr 5, 3
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:  .LBB281_1:
+-; PPC64LE-NEXT:    lbarx 3, 0, 5
+-; PPC64LE-NEXT:    extsb 6, 3
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB281_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 5
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB281_1
+ ; PPC64LE-NEXT:  .LBB281_3:
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val acquire
+@@ -4763,17 +4775,18 @@ define i8 @test281(i8* %ptr, i8 %val) {
+ define i8 @test282(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test282:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB282_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB282_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB282_1
+ ; PPC64LE-NEXT:  .LBB282_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val release
+   ret i8 %ret
+@@ -4782,17 +4795,18 @@ define i8 @test282(i8* %ptr, i8 %val) {
+ define i8 @test283(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test283:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB283_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB283_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB283_1
+ ; PPC64LE-NEXT:  .LBB283_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val acq_rel
+@@ -4802,17 +4816,18 @@ define i8 @test283(i8* %ptr, i8 %val) {
+ define i8 @test284(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test284:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    sync
+ ; PPC64LE-NEXT:  .LBB284_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB284_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB284_1
+ ; PPC64LE-NEXT:  .LBB284_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val seq_cst
+@@ -4822,16 +4837,17 @@ define i8 @test284(i8* %ptr, i8 %val) {
+ define i16 @test285(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test285:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:  .LBB285_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB285_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB285_1
+ ; PPC64LE-NEXT:  .LBB285_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val monotonic
+   ret i16 %ret
+@@ -4840,16 +4856,17 @@ define i16 @test285(i16* %ptr, i16 %val) {
+ define i16 @test286(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test286:
+ ; PPC64LE:       # %bb.0:
+-; PPC64LE-NEXT:    mr 5, 3
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:  .LBB286_1:
+-; PPC64LE-NEXT:    lharx 3, 0, 5
+-; PPC64LE-NEXT:    extsh 6, 3
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB286_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 5
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB286_1
+ ; PPC64LE-NEXT:  .LBB286_3:
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val acquire
+@@ -4859,17 +4876,18 @@ define i16 @test286(i16* %ptr, i16 %val) {
+ define i16 @test287(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test287:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB287_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB287_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB287_1
+ ; PPC64LE-NEXT:  .LBB287_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val release
+   ret i16 %ret
+@@ -4878,17 +4896,18 @@ define i16 @test287(i16* %ptr, i16 %val) {
+ define i16 @test288(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test288:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB288_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB288_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB288_1
+ ; PPC64LE-NEXT:  .LBB288_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val acq_rel
+@@ -4898,17 +4917,18 @@ define i16 @test288(i16* %ptr, i16 %val) {
+ define i16 @test289(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test289:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    sync
+ ; PPC64LE-NEXT:  .LBB289_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB289_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB289_1
+ ; PPC64LE-NEXT:  .LBB289_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val seq_cst
+@@ -8076,16 +8096,17 @@ define i64 @test479(i64* %ptr, i64 %val) {
+ define i8 @test480(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test480:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:  .LBB480_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB480_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB480_1
+ ; PPC64LE-NEXT:  .LBB480_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val syncscope("singlethread") monotonic
+   ret i8 %ret
+@@ -8094,16 +8115,17 @@ define i8 @test480(i8* %ptr, i8 %val) {
+ define i8 @test481(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test481:
+ ; PPC64LE:       # %bb.0:
+-; PPC64LE-NEXT:    mr 5, 3
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:  .LBB481_1:
+-; PPC64LE-NEXT:    lbarx 3, 0, 5
+-; PPC64LE-NEXT:    extsb 6, 3
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB481_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 5
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB481_1
+ ; PPC64LE-NEXT:  .LBB481_3:
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val syncscope("singlethread") acquire
+@@ -8113,17 +8135,18 @@ define i8 @test481(i8* %ptr, i8 %val) {
+ define i8 @test482(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test482:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB482_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB482_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB482_1
+ ; PPC64LE-NEXT:  .LBB482_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val syncscope("singlethread") release
+   ret i8 %ret
+@@ -8132,17 +8155,18 @@ define i8 @test482(i8* %ptr, i8 %val) {
+ define i8 @test483(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test483:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB483_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB483_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB483_1
+ ; PPC64LE-NEXT:  .LBB483_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val syncscope("singlethread") acq_rel
+@@ -8152,17 +8176,18 @@ define i8 @test483(i8* %ptr, i8 %val) {
+ define i8 @test484(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test484:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    sync
+ ; PPC64LE-NEXT:  .LBB484_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB484_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB484_1
+ ; PPC64LE-NEXT:  .LBB484_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i8* %ptr, i8 %val syncscope("singlethread") seq_cst
+@@ -8172,16 +8197,17 @@ define i8 @test484(i8* %ptr, i8 %val) {
+ define i16 @test485(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test485:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:  .LBB485_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB485_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB485_1
+ ; PPC64LE-NEXT:  .LBB485_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val syncscope("singlethread") monotonic
+   ret i16 %ret
+@@ -8190,16 +8216,17 @@ define i16 @test485(i16* %ptr, i16 %val) {
+ define i16 @test486(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test486:
+ ; PPC64LE:       # %bb.0:
+-; PPC64LE-NEXT:    mr 5, 3
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:  .LBB486_1:
+-; PPC64LE-NEXT:    lharx 3, 0, 5
+-; PPC64LE-NEXT:    extsh 6, 3
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB486_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 5
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB486_1
+ ; PPC64LE-NEXT:  .LBB486_3:
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val syncscope("singlethread") acquire
+@@ -8209,17 +8236,18 @@ define i16 @test486(i16* %ptr, i16 %val) {
+ define i16 @test487(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test487:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB487_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB487_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB487_1
+ ; PPC64LE-NEXT:  .LBB487_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val syncscope("singlethread") release
+   ret i16 %ret
+@@ -8228,17 +8256,18 @@ define i16 @test487(i16* %ptr, i16 %val) {
+ define i16 @test488(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test488:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB488_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB488_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB488_1
+ ; PPC64LE-NEXT:  .LBB488_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val syncscope("singlethread") acq_rel
+@@ -8248,17 +8277,18 @@ define i16 @test488(i16* %ptr, i16 %val) {
+ define i16 @test489(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test489:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    sync
+ ; PPC64LE-NEXT:  .LBB489_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    ble 0, .LBB489_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB489_1
+ ; PPC64LE-NEXT:  .LBB489_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw max i16* %ptr, i16 %val syncscope("singlethread") seq_cst
+@@ -8450,16 +8480,17 @@ define i64 @test499(i64* %ptr, i64 %val) {
+ define i8 @test500(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test500:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:  .LBB500_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB500_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB500_1
+ ; PPC64LE-NEXT:  .LBB500_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val syncscope("singlethread") monotonic
+   ret i8 %ret
+@@ -8468,16 +8499,17 @@ define i8 @test500(i8* %ptr, i8 %val) {
+ define i8 @test501(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test501:
+ ; PPC64LE:       # %bb.0:
+-; PPC64LE-NEXT:    mr 5, 3
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:  .LBB501_1:
+-; PPC64LE-NEXT:    lbarx 3, 0, 5
+-; PPC64LE-NEXT:    extsb 6, 3
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB501_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 5
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB501_1
+ ; PPC64LE-NEXT:  .LBB501_3:
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val syncscope("singlethread") acquire
+@@ -8487,17 +8519,18 @@ define i8 @test501(i8* %ptr, i8 %val) {
+ define i8 @test502(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test502:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB502_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB502_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB502_1
+ ; PPC64LE-NEXT:  .LBB502_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val syncscope("singlethread") release
+   ret i8 %ret
+@@ -8506,17 +8539,18 @@ define i8 @test502(i8* %ptr, i8 %val) {
+ define i8 @test503(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test503:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB503_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB503_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB503_1
+ ; PPC64LE-NEXT:  .LBB503_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val syncscope("singlethread") acq_rel
+@@ -8526,17 +8560,18 @@ define i8 @test503(i8* %ptr, i8 %val) {
+ define i8 @test504(i8* %ptr, i8 %val) {
+ ; PPC64LE-LABEL: test504:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsb 5, 4
+ ; PPC64LE-NEXT:    sync
+ ; PPC64LE-NEXT:  .LBB504_1:
+-; PPC64LE-NEXT:    lbarx 5, 0, 3
+-; PPC64LE-NEXT:    extsb 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lbarx 4, 0, 3
++; PPC64LE-NEXT:    extsb 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB504_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    stbcx. 4, 0, 3
++; PPC64LE-NEXT:    stbcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB504_1
+ ; PPC64LE-NEXT:  .LBB504_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i8* %ptr, i8 %val syncscope("singlethread") seq_cst
+@@ -8546,16 +8581,17 @@ define i8 @test504(i8* %ptr, i8 %val) {
+ define i16 @test505(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test505:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:  .LBB505_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB505_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB505_1
+ ; PPC64LE-NEXT:  .LBB505_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val syncscope("singlethread") monotonic
+   ret i16 %ret
+@@ -8564,16 +8600,17 @@ define i16 @test505(i16* %ptr, i16 %val) {
+ define i16 @test506(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test506:
+ ; PPC64LE:       # %bb.0:
+-; PPC64LE-NEXT:    mr 5, 3
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:  .LBB506_1:
+-; PPC64LE-NEXT:    lharx 3, 0, 5
+-; PPC64LE-NEXT:    extsh 6, 3
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB506_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 5
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB506_1
+ ; PPC64LE-NEXT:  .LBB506_3:
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val syncscope("singlethread") acquire
+@@ -8583,17 +8620,18 @@ define i16 @test506(i16* %ptr, i16 %val) {
+ define i16 @test507(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test507:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB507_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB507_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB507_1
+ ; PPC64LE-NEXT:  .LBB507_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val syncscope("singlethread") release
+   ret i16 %ret
+@@ -8602,17 +8640,18 @@ define i16 @test507(i16* %ptr, i16 %val) {
+ define i16 @test508(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test508:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:  .LBB508_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB508_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB508_1
+ ; PPC64LE-NEXT:  .LBB508_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val syncscope("singlethread") acq_rel
+@@ -8622,17 +8661,18 @@ define i16 @test508(i16* %ptr, i16 %val) {
+ define i16 @test509(i16* %ptr, i16 %val) {
+ ; PPC64LE-LABEL: test509:
+ ; PPC64LE:       # %bb.0:
++; PPC64LE-NEXT:    extsh 5, 4
+ ; PPC64LE-NEXT:    sync
+ ; PPC64LE-NEXT:  .LBB509_1:
+-; PPC64LE-NEXT:    lharx 5, 0, 3
+-; PPC64LE-NEXT:    extsh 6, 5
+-; PPC64LE-NEXT:    cmpw 4, 6
++; PPC64LE-NEXT:    lharx 4, 0, 3
++; PPC64LE-NEXT:    extsh 6, 4
++; PPC64LE-NEXT:    cmpw 5, 6
+ ; PPC64LE-NEXT:    bge 0, .LBB509_3
+ ; PPC64LE-NEXT:  # %bb.2:
+-; PPC64LE-NEXT:    sthcx. 4, 0, 3
++; PPC64LE-NEXT:    sthcx. 5, 0, 3
+ ; PPC64LE-NEXT:    bne 0, .LBB509_1
+ ; PPC64LE-NEXT:  .LBB509_3:
+-; PPC64LE-NEXT:    mr 3, 5
++; PPC64LE-NEXT:    mr 3, 4
+ ; PPC64LE-NEXT:    lwsync
+ ; PPC64LE-NEXT:    blr
+   %ret = atomicrmw min i16* %ptr, i16 %val syncscope("singlethread") seq_cst
+diff --git a/llvm/test/CodeGen/PowerPC/handle-f16-storage-type.ll b/llvm/test/CodeGen/PowerPC/handle-f16-storage-type.ll
+index bb15e52e1b02..06bf57ca0d7d 100644
+--- a/llvm/test/CodeGen/PowerPC/handle-f16-storage-type.ll
++++ b/llvm/test/CodeGen/PowerPC/handle-f16-storage-type.ll
+@@ -1156,6 +1156,7 @@ define float @test_sitofp_fadd_i32(i32 %a, half* %b) #0 {
+ ; P8-NEXT:    xscvsxdsp f1, f0
+ ; P8-NEXT:    bl __gnu_f2h_ieee
+ ; P8-NEXT:    nop
++; P8-NEXT:    clrldi r3, r3, 48
+ ; P8-NEXT:    bl __gnu_h2f_ieee
+ ; P8-NEXT:    nop
+ ; P8-NEXT:    xsaddsp f1, f31, f1
+@@ -1175,6 +1176,7 @@ define float @test_sitofp_fadd_i32(i32 %a, half* %b) #0 {
+ ; CHECK-NEXT:    xscvhpdp f0, f0
+ ; CHECK-NEXT:    xscvdphp f1, f1
+ ; CHECK-NEXT:    mffprwz r3, f1
++; CHECK-NEXT:    clrlwi r3, r3, 16
+ ; CHECK-NEXT:    mtfprwz f1, r3
+ ; CHECK-NEXT:    xscvhpdp f1, f1
+ ; CHECK-NEXT:    xsaddsp f1, f0, f1
+@@ -1225,6 +1227,7 @@ define half @PR40273(half) #0 {
+ ; P8-NEXT:    stdu r1, -32(r1)
+ ; P8-NEXT:    bl __gnu_f2h_ieee
+ ; P8-NEXT:    nop
++; P8-NEXT:    clrldi r3, r3, 48
+ ; P8-NEXT:    bl __gnu_h2f_ieee
+ ; P8-NEXT:    nop
+ ; P8-NEXT:    xxlxor f0, f0, f0
+@@ -1245,6 +1248,7 @@ define half @PR40273(half) #0 {
+ ; CHECK-NEXT:    xscvdphp f0, f1
+ ; CHECK-NEXT:    xxlxor f1, f1, f1
+ ; CHECK-NEXT:    mffprwz r3, f0
++; CHECK-NEXT:    clrlwi r3, r3, 16
+ ; CHECK-NEXT:    mtfprwz f0, r3
+ ; CHECK-NEXT:    xscvhpdp f0, f0
+ ; CHECK-NEXT:    fcmpu cr0, f0, f1
+diff --git a/llvm/test/CodeGen/PowerPC/pr46759.ll b/llvm/test/CodeGen/PowerPC/pr46759.ll
+index d1d68a5db7e3..92f2c64bc06a 100644
+--- a/llvm/test/CodeGen/PowerPC/pr46759.ll
++++ b/llvm/test/CodeGen/PowerPC/pr46759.ll
+@@ -45,7 +45,7 @@ define void @foo(i32 %vla_size) #0 {
+ ; CHECK-LE-NEXT:  .LBB0_2: # %entry
+ ; CHECK-LE-NEXT:    addi r3, r1, 2048
+ ; CHECK-LE-NEXT:    lbz r3, 0(r3)
+-; CHECK-LE-NEXT:    ld r1, 0(r1)
++; CHECK-LE-NEXT:    mr r1, r30
+ ; CHECK-LE-NEXT:    ld r31, -8(r1)
+ ; CHECK-LE-NEXT:    ld r30, -16(r1)
+ ; CHECK-LE-NEXT:    blr
+diff --git a/llvm/test/CodeGen/PowerPC/stack-clash-prologue.ll b/llvm/test/CodeGen/PowerPC/stack-clash-prologue.ll
+index cb513be9128c..6443059c9704 100644
+--- a/llvm/test/CodeGen/PowerPC/stack-clash-prologue.ll
++++ b/llvm/test/CodeGen/PowerPC/stack-clash-prologue.ll
+@@ -528,4 +528,502 @@ entry:
+   ret i8 %c
+ }
+ 
++; alloca + align < probe_size
++define i32 @f8(i64 %i) local_unnamed_addr #0 {
++; CHECK-LE-LABEL: f8:
++; CHECK-LE:       # %bb.0:
++; CHECK-LE-NEXT:    clrldi r0, r1, 58
++; CHECK-LE-NEXT:    std r30, -16(r1)
++; CHECK-LE-NEXT:    mr r30, r1
++; CHECK-LE-NEXT:    subfic r0, r0, -896
++; CHECK-LE-NEXT:    stdux r1, r1, r0
++; CHECK-LE-NEXT:    .cfi_def_cfa_register r30
++; CHECK-LE-NEXT:    .cfi_offset r30, -16
++; CHECK-LE-NEXT:    addi r4, r1, 64
++; CHECK-LE-NEXT:    sldi r3, r3, 2
++; CHECK-LE-NEXT:    li r5, 1
++; CHECK-LE-NEXT:    stwx r5, r4, r3
++; CHECK-LE-NEXT:    lwz r3, 64(r1)
++; CHECK-LE-NEXT:    mr r1, r30
++; CHECK-LE-NEXT:    ld r30, -16(r1)
++; CHECK-LE-NEXT:    blr
++;
++; CHECK-BE-LABEL: f8:
++; CHECK-BE:       # %bb.0:
++; CHECK-BE-NEXT:    clrldi r0, r1, 58
++; CHECK-BE-NEXT:    std r30, -16(r1)
++; CHECK-BE-NEXT:    mr r30, r1
++; CHECK-BE-NEXT:    subfic r0, r0, -896
++; CHECK-BE-NEXT:    stdux r1, r1, r0
++; CHECK-BE-NEXT:    .cfi_def_cfa_register r30
++; CHECK-BE-NEXT:    .cfi_offset r30, -16
++; CHECK-BE-NEXT:    addi r4, r1, 64
++; CHECK-BE-NEXT:    li r5, 1
++; CHECK-BE-NEXT:    sldi r3, r3, 2
++; CHECK-BE-NEXT:    stwx r5, r4, r3
++; CHECK-BE-NEXT:    lwz r3, 64(r1)
++; CHECK-BE-NEXT:    mr r1, r30
++; CHECK-BE-NEXT:    ld r30, -16(r1)
++; CHECK-BE-NEXT:    blr
++;
++; CHECK-32-LABEL: f8:
++; CHECK-32:       # %bb.0:
++; CHECK-32-NEXT:    clrlwi r0, r1, 26
++; CHECK-32-NEXT:    subfic r0, r0, -896
++; CHECK-32-NEXT:    stwux r1, r1, r0
++; CHECK-32-NEXT:    sub r0, r1, r0
++; CHECK-32-NEXT:    addic r0, r0, -8
++; CHECK-32-NEXT:    stwx r30, 0, r0
++; CHECK-32-NEXT:    addic r30, r0, 8
++; CHECK-32-NEXT:    .cfi_def_cfa_register r30
++; CHECK-32-NEXT:    .cfi_offset r30, -8
++; CHECK-32-NEXT:    addi r3, r1, 64
++; CHECK-32-NEXT:    li r5, 1
++; CHECK-32-NEXT:    slwi r4, r4, 2
++; CHECK-32-NEXT:    stwx r5, r3, r4
++; CHECK-32-NEXT:    mr r0, r31
++; CHECK-32-NEXT:    lwz r3, 64(r1)
++; CHECK-32-NEXT:    lwz r31, 0(r1)
++; CHECK-32-NEXT:    lwz r30, -8(r31)
++; CHECK-32-NEXT:    mr r1, r31
++; CHECK-32-NEXT:    mr r31, r0
++; CHECK-32-NEXT:    blr
++  %a = alloca i32, i32 200, align 64
++  %b = getelementptr inbounds i32, i32* %a, i64 %i
++  store volatile i32 1, i32* %b
++  %c = load volatile i32, i32* %a
++  ret i32 %c
++}
++
++; alloca > probe_size, align > probe_size
++define i32 @f9(i64 %i) local_unnamed_addr #0 {
++; CHECK-LE-LABEL: f9:
++; CHECK-LE:       # %bb.0:
++; CHECK-LE-NEXT:    std r30, -16(r1)
++; CHECK-LE-NEXT:    mr r30, r1
++; CHECK-LE-NEXT:    .cfi_def_cfa r30, 0
++; CHECK-LE-NEXT:    clrldi r0, r30, 53
++; CHECK-LE-NEXT:    subc r12, r30, r0
++; CHECK-LE-NEXT:    clrldi r0, r0, 52
++; CHECK-LE-NEXT:    cmpdi r0, 0
++; CHECK-LE-NEXT:    beq cr0, .LBB9_2
++; CHECK-LE-NEXT:  # %bb.1:
++; CHECK-LE-NEXT:    neg r0, r0
++; CHECK-LE-NEXT:    stdux r30, r1, r0
++; CHECK-LE-NEXT:  .LBB9_2:
++; CHECK-LE-NEXT:    li r0, -4096
++; CHECK-LE-NEXT:    cmpd r1, r12
++; CHECK-LE-NEXT:    beq cr0, .LBB9_4
++; CHECK-LE-NEXT:  .LBB9_3:
++; CHECK-LE-NEXT:    stdux r30, r1, r0
++; CHECK-LE-NEXT:    cmpd r1, r12
++; CHECK-LE-NEXT:    bne cr0, .LBB9_3
++; CHECK-LE-NEXT:  .LBB9_4:
++; CHECK-LE-NEXT:    mr r12, r30
++; CHECK-LE-NEXT:    stdu r12, -2048(r1)
++; CHECK-LE-NEXT:    stdu r12, -4096(r1)
++; CHECK-LE-NEXT:    stdu r12, -4096(r1)
++; CHECK-LE-NEXT:    .cfi_def_cfa_register r1
++; CHECK-LE-NEXT:    .cfi_def_cfa_register r30
++; CHECK-LE-NEXT:    .cfi_offset r30, -16
++; CHECK-LE-NEXT:    addi r4, r1, 2048
++; CHECK-LE-NEXT:    sldi r3, r3, 2
++; CHECK-LE-NEXT:    li r5, 1
++; CHECK-LE-NEXT:    stwx r5, r4, r3
++; CHECK-LE-NEXT:    lwz r3, 2048(r1)
++; CHECK-LE-NEXT:    mr r1, r30
++; CHECK-LE-NEXT:    ld r30, -16(r1)
++; CHECK-LE-NEXT:    blr
++;
++; CHECK-BE-LABEL: f9:
++; CHECK-BE:       # %bb.0:
++; CHECK-BE-NEXT:    std r30, -16(r1)
++; CHECK-BE-NEXT:    mr r30, r1
++; CHECK-BE-NEXT:    .cfi_def_cfa r30, 0
++; CHECK-BE-NEXT:    clrldi r0, r30, 53
++; CHECK-BE-NEXT:    subc r12, r30, r0
++; CHECK-BE-NEXT:    clrldi r0, r0, 52
++; CHECK-BE-NEXT:    cmpdi r0, 0
++; CHECK-BE-NEXT:    beq cr0, .LBB9_2
++; CHECK-BE-NEXT:  # %bb.1:
++; CHECK-BE-NEXT:    neg r0, r0
++; CHECK-BE-NEXT:    stdux r30, r1, r0
++; CHECK-BE-NEXT:  .LBB9_2:
++; CHECK-BE-NEXT:    li r0, -4096
++; CHECK-BE-NEXT:    cmpd r1, r12
++; CHECK-BE-NEXT:    beq cr0, .LBB9_4
++; CHECK-BE-NEXT:  .LBB9_3:
++; CHECK-BE-NEXT:    stdux r30, r1, r0
++; CHECK-BE-NEXT:    cmpd r1, r12
++; CHECK-BE-NEXT:    bne cr0, .LBB9_3
++; CHECK-BE-NEXT:  .LBB9_4:
++; CHECK-BE-NEXT:    mr r12, r30
++; CHECK-BE-NEXT:    stdu r12, -2048(r1)
++; CHECK-BE-NEXT:    stdu r12, -4096(r1)
++; CHECK-BE-NEXT:    stdu r12, -4096(r1)
++; CHECK-BE-NEXT:    .cfi_def_cfa_register r1
++; CHECK-BE-NEXT:    .cfi_def_cfa_register r30
++; CHECK-BE-NEXT:    .cfi_offset r30, -16
++; CHECK-BE-NEXT:    addi r4, r1, 2048
++; CHECK-BE-NEXT:    li r5, 1
++; CHECK-BE-NEXT:    sldi r3, r3, 2
++; CHECK-BE-NEXT:    stwx r5, r4, r3
++; CHECK-BE-NEXT:    lwz r3, 2048(r1)
++; CHECK-BE-NEXT:    mr r1, r30
++; CHECK-BE-NEXT:    ld r30, -16(r1)
++; CHECK-BE-NEXT:    blr
++;
++; CHECK-32-LABEL: f9:
++; CHECK-32:       # %bb.0:
++; CHECK-32-NEXT:    mr r12, r1
++; CHECK-32-NEXT:    .cfi_def_cfa r12, 0
++; CHECK-32-NEXT:    clrlwi r0, r12, 21
++; CHECK-32-NEXT:    subc r1, r1, r0
++; CHECK-32-NEXT:    stwu r12, -2048(r1)
++; CHECK-32-NEXT:    stwu r12, -4096(r1)
++; CHECK-32-NEXT:    stwu r12, -4096(r1)
++; CHECK-32-NEXT:    .cfi_def_cfa_register r1
++; CHECK-32-NEXT:    sub r0, r1, r12
++; CHECK-32-NEXT:    sub r0, r1, r0
++; CHECK-32-NEXT:    addic r0, r0, -8
++; CHECK-32-NEXT:    stwx r30, 0, r0
++; CHECK-32-NEXT:    addic r30, r0, 8
++; CHECK-32-NEXT:    .cfi_def_cfa_register r30
++; CHECK-32-NEXT:    .cfi_offset r30, -8
++; CHECK-32-NEXT:    addi r3, r1, 2048
++; CHECK-32-NEXT:    li r5, 1
++; CHECK-32-NEXT:    slwi r4, r4, 2
++; CHECK-32-NEXT:    stwx r5, r3, r4
++; CHECK-32-NEXT:    mr r0, r31
++; CHECK-32-NEXT:    lwz r3, 2048(r1)
++; CHECK-32-NEXT:    lwz r31, 0(r1)
++; CHECK-32-NEXT:    lwz r30, -8(r31)
++; CHECK-32-NEXT:    mr r1, r31
++; CHECK-32-NEXT:    mr r31, r0
++; CHECK-32-NEXT:    blr
++  %a = alloca i32, i32 2000, align 2048
++  %b = getelementptr inbounds i32, i32* %a, i64 %i
++  store volatile i32 1, i32* %b
++  %c = load volatile i32, i32* %a
++  ret i32 %c
++}
++
++; alloca < probe_size, align < probe_size, alloca + align > probe_size
++define i32 @f10(i64 %i) local_unnamed_addr #0 {
++; CHECK-LE-LABEL: f10:
++; CHECK-LE:       # %bb.0:
++; CHECK-LE-NEXT:    std r30, -16(r1)
++; CHECK-LE-NEXT:    mr r30, r1
++; CHECK-LE-NEXT:    .cfi_def_cfa r30, 0
++; CHECK-LE-NEXT:    clrldi r0, r30, 54
++; CHECK-LE-NEXT:    subc r12, r30, r0
++; CHECK-LE-NEXT:    clrldi r0, r0, 52
++; CHECK-LE-NEXT:    cmpdi r0, 0
++; CHECK-LE-NEXT:    beq cr0, .LBB10_2
++; CHECK-LE-NEXT:  # %bb.1:
++; CHECK-LE-NEXT:    neg r0, r0
++; CHECK-LE-NEXT:    stdux r30, r1, r0
++; CHECK-LE-NEXT:  .LBB10_2:
++; CHECK-LE-NEXT:    li r0, -4096
++; CHECK-LE-NEXT:    cmpd r1, r12
++; CHECK-LE-NEXT:    beq cr0, .LBB10_4
++; CHECK-LE-NEXT:  .LBB10_3:
++; CHECK-LE-NEXT:    stdux r30, r1, r0
++; CHECK-LE-NEXT:    cmpd r1, r12
++; CHECK-LE-NEXT:    bne cr0, .LBB10_3
++; CHECK-LE-NEXT:  .LBB10_4:
++; CHECK-LE-NEXT:    mr r12, r30
++; CHECK-LE-NEXT:    stdu r12, -1024(r1)
++; CHECK-LE-NEXT:    stdu r12, -4096(r1)
++; CHECK-LE-NEXT:    .cfi_def_cfa_register r1
++; CHECK-LE-NEXT:    .cfi_def_cfa_register r30
++; CHECK-LE-NEXT:    .cfi_offset r30, -16
++; CHECK-LE-NEXT:    addi r4, r1, 1024
++; CHECK-LE-NEXT:    sldi r3, r3, 2
++; CHECK-LE-NEXT:    li r5, 1
++; CHECK-LE-NEXT:    stwx r5, r4, r3
++; CHECK-LE-NEXT:    lwz r3, 1024(r1)
++; CHECK-LE-NEXT:    mr r1, r30
++; CHECK-LE-NEXT:    ld r30, -16(r1)
++; CHECK-LE-NEXT:    blr
++;
++; CHECK-BE-LABEL: f10:
++; CHECK-BE:       # %bb.0:
++; CHECK-BE-NEXT:    std r30, -16(r1)
++; CHECK-BE-NEXT:    mr r30, r1
++; CHECK-BE-NEXT:    .cfi_def_cfa r30, 0
++; CHECK-BE-NEXT:    clrldi r0, r30, 54
++; CHECK-BE-NEXT:    subc r12, r30, r0
++; CHECK-BE-NEXT:    clrldi r0, r0, 52
++; CHECK-BE-NEXT:    cmpdi r0, 0
++; CHECK-BE-NEXT:    beq cr0, .LBB10_2
++; CHECK-BE-NEXT:  # %bb.1:
++; CHECK-BE-NEXT:    neg r0, r0
++; CHECK-BE-NEXT:    stdux r30, r1, r0
++; CHECK-BE-NEXT:  .LBB10_2:
++; CHECK-BE-NEXT:    li r0, -4096
++; CHECK-BE-NEXT:    cmpd r1, r12
++; CHECK-BE-NEXT:    beq cr0, .LBB10_4
++; CHECK-BE-NEXT:  .LBB10_3:
++; CHECK-BE-NEXT:    stdux r30, r1, r0
++; CHECK-BE-NEXT:    cmpd r1, r12
++; CHECK-BE-NEXT:    bne cr0, .LBB10_3
++; CHECK-BE-NEXT:  .LBB10_4:
++; CHECK-BE-NEXT:    mr r12, r30
++; CHECK-BE-NEXT:    stdu r12, -1024(r1)
++; CHECK-BE-NEXT:    stdu r12, -4096(r1)
++; CHECK-BE-NEXT:    .cfi_def_cfa_register r1
++; CHECK-BE-NEXT:    .cfi_def_cfa_register r30
++; CHECK-BE-NEXT:    .cfi_offset r30, -16
++; CHECK-BE-NEXT:    addi r4, r1, 1024
++; CHECK-BE-NEXT:    li r5, 1
++; CHECK-BE-NEXT:    sldi r3, r3, 2
++; CHECK-BE-NEXT:    stwx r5, r4, r3
++; CHECK-BE-NEXT:    lwz r3, 1024(r1)
++; CHECK-BE-NEXT:    mr r1, r30
++; CHECK-BE-NEXT:    ld r30, -16(r1)
++; CHECK-BE-NEXT:    blr
++;
++; CHECK-32-LABEL: f10:
++; CHECK-32:       # %bb.0:
++; CHECK-32-NEXT:    mr r12, r1
++; CHECK-32-NEXT:    .cfi_def_cfa r12, 0
++; CHECK-32-NEXT:    clrlwi r0, r12, 22
++; CHECK-32-NEXT:    subc r1, r1, r0
++; CHECK-32-NEXT:    stwu r12, -1024(r1)
++; CHECK-32-NEXT:    stwu r12, -4096(r1)
++; CHECK-32-NEXT:    .cfi_def_cfa_register r1
++; CHECK-32-NEXT:    sub r0, r1, r12
++; CHECK-32-NEXT:    sub r0, r1, r0
++; CHECK-32-NEXT:    addic r0, r0, -8
++; CHECK-32-NEXT:    stwx r30, 0, r0
++; CHECK-32-NEXT:    addic r30, r0, 8
++; CHECK-32-NEXT:    .cfi_def_cfa_register r30
++; CHECK-32-NEXT:    .cfi_offset r30, -8
++; CHECK-32-NEXT:    addi r3, r1, 1024
++; CHECK-32-NEXT:    li r5, 1
++; CHECK-32-NEXT:    slwi r4, r4, 2
++; CHECK-32-NEXT:    stwx r5, r3, r4
++; CHECK-32-NEXT:    mr r0, r31
++; CHECK-32-NEXT:    lwz r3, 1024(r1)
++; CHECK-32-NEXT:    lwz r31, 0(r1)
++; CHECK-32-NEXT:    lwz r30, -8(r31)
++; CHECK-32-NEXT:    mr r1, r31
++; CHECK-32-NEXT:    mr r31, r0
++; CHECK-32-NEXT:    blr
++  %a = alloca i32, i32 1000, align 1024
++  %b = getelementptr inbounds i32, i32* %a, i64 %i
++  store volatile i32 1, i32* %b
++  %c = load volatile i32, i32* %a
++  ret i32 %c
++}
++
++define void @f11(i32 %vla_size, i64 %i) #0 {
++; CHECK-LE-LABEL: f11:
++; CHECK-LE:       # %bb.0:
++; CHECK-LE-NEXT:    std r31, -8(r1)
++; CHECK-LE-NEXT:    std r30, -16(r1)
++; CHECK-LE-NEXT:    mr r30, r1
++; CHECK-LE-NEXT:    .cfi_def_cfa r30, 0
++; CHECK-LE-NEXT:    clrldi r0, r30, 49
++; CHECK-LE-NEXT:    subc r12, r30, r0
++; CHECK-LE-NEXT:    clrldi r0, r0, 52
++; CHECK-LE-NEXT:    cmpdi r0, 0
++; CHECK-LE-NEXT:    beq cr0, .LBB11_2
++; CHECK-LE-NEXT:  # %bb.1:
++; CHECK-LE-NEXT:    neg r0, r0
++; CHECK-LE-NEXT:    stdux r30, r1, r0
++; CHECK-LE-NEXT:  .LBB11_2:
++; CHECK-LE-NEXT:    li r0, -4096
++; CHECK-LE-NEXT:    cmpd r1, r12
++; CHECK-LE-NEXT:    beq cr0, .LBB11_4
++; CHECK-LE-NEXT:  .LBB11_3:
++; CHECK-LE-NEXT:    stdux r30, r1, r0
++; CHECK-LE-NEXT:    cmpd r1, r12
++; CHECK-LE-NEXT:    bne cr0, .LBB11_3
++; CHECK-LE-NEXT:  .LBB11_4:
++; CHECK-LE-NEXT:    mr r12, r30
++; CHECK-LE-NEXT:    li r0, 24
++; CHECK-LE-NEXT:    mtctr r0
++; CHECK-LE-NEXT:  .LBB11_5:
++; CHECK-LE-NEXT:    stdu r12, -4096(r1)
++; CHECK-LE-NEXT:    bdnz .LBB11_5
++; CHECK-LE-NEXT:  # %bb.6:
++; CHECK-LE-NEXT:    .cfi_def_cfa_register r1
++; CHECK-LE-NEXT:    .cfi_def_cfa_register r30
++; CHECK-LE-NEXT:    .cfi_offset r31, -8
++; CHECK-LE-NEXT:    .cfi_offset r30, -16
++; CHECK-LE-NEXT:    clrldi r3, r3, 32
++; CHECK-LE-NEXT:    lis r5, 1
++; CHECK-LE-NEXT:    mr r31, r1
++; CHECK-LE-NEXT:    li r6, 1
++; CHECK-LE-NEXT:    addi r3, r3, 15
++; CHECK-LE-NEXT:    ori r5, r5, 0
++; CHECK-LE-NEXT:    rldicl r3, r3, 60, 4
++; CHECK-LE-NEXT:    sldi r4, r4, 2
++; CHECK-LE-NEXT:    add r5, r31, r5
++; CHECK-LE-NEXT:    rldicl r3, r3, 4, 31
++; CHECK-LE-NEXT:    stwx r6, r5, r4
++; CHECK-LE-NEXT:    li r4, -32768
++; CHECK-LE-NEXT:    neg r7, r3
++; CHECK-LE-NEXT:    ld r3, 0(r1)
++; CHECK-LE-NEXT:    and r4, r7, r4
++; CHECK-LE-NEXT:    mr r7, r4
++; CHECK-LE-NEXT:    li r4, -4096
++; CHECK-LE-NEXT:    divd r5, r7, r4
++; CHECK-LE-NEXT:    mulld r4, r5, r4
++; CHECK-LE-NEXT:    sub r5, r7, r4
++; CHECK-LE-NEXT:    add r4, r1, r7
++; CHECK-LE-NEXT:    stdux r3, r1, r5
++; CHECK-LE-NEXT:    cmpd r1, r4
++; CHECK-LE-NEXT:    beq cr0, .LBB11_8
++; CHECK-LE-NEXT:  .LBB11_7:
++; CHECK-LE-NEXT:    stdu r3, -4096(r1)
++; CHECK-LE-NEXT:    cmpd r1, r4
++; CHECK-LE-NEXT:    bne cr0, .LBB11_7
++; CHECK-LE-NEXT:  .LBB11_8:
++; CHECK-LE-NEXT:    addi r3, r1, -32768
++; CHECK-LE-NEXT:    lbz r3, 0(r3)
++; CHECK-LE-NEXT:    mr r1, r30
++; CHECK-LE-NEXT:    ld r31, -8(r1)
++; CHECK-LE-NEXT:    ld r30, -16(r1)
++; CHECK-LE-NEXT:    blr
++;
++; CHECK-BE-LABEL: f11:
++; CHECK-BE:       # %bb.0:
++; CHECK-BE-NEXT:    std r31, -8(r1)
++; CHECK-BE-NEXT:    std r30, -16(r1)
++; CHECK-BE-NEXT:    mr r30, r1
++; CHECK-BE-NEXT:    .cfi_def_cfa r30, 0
++; CHECK-BE-NEXT:    clrldi r0, r30, 49
++; CHECK-BE-NEXT:    subc r12, r30, r0
++; CHECK-BE-NEXT:    clrldi r0, r0, 52
++; CHECK-BE-NEXT:    cmpdi r0, 0
++; CHECK-BE-NEXT:    beq cr0, .LBB11_2
++; CHECK-BE-NEXT:  # %bb.1:
++; CHECK-BE-NEXT:    neg r0, r0
++; CHECK-BE-NEXT:    stdux r30, r1, r0
++; CHECK-BE-NEXT:  .LBB11_2:
++; CHECK-BE-NEXT:    li r0, -4096
++; CHECK-BE-NEXT:    cmpd r1, r12
++; CHECK-BE-NEXT:    beq cr0, .LBB11_4
++; CHECK-BE-NEXT:  .LBB11_3:
++; CHECK-BE-NEXT:    stdux r30, r1, r0
++; CHECK-BE-NEXT:    cmpd r1, r12
++; CHECK-BE-NEXT:    bne cr0, .LBB11_3
++; CHECK-BE-NEXT:  .LBB11_4:
++; CHECK-BE-NEXT:    mr r12, r30
++; CHECK-BE-NEXT:    li r0, 24
++; CHECK-BE-NEXT:    mtctr r0
++; CHECK-BE-NEXT:  .LBB11_5:
++; CHECK-BE-NEXT:    stdu r12, -4096(r1)
++; CHECK-BE-NEXT:    bdnz .LBB11_5
++; CHECK-BE-NEXT:  # %bb.6:
++; CHECK-BE-NEXT:    .cfi_def_cfa_register r1
++; CHECK-BE-NEXT:    .cfi_def_cfa_register r30
++; CHECK-BE-NEXT:    .cfi_offset r31, -8
++; CHECK-BE-NEXT:    .cfi_offset r30, -16
++; CHECK-BE-NEXT:    clrldi r3, r3, 32
++; CHECK-BE-NEXT:    lis r5, 1
++; CHECK-BE-NEXT:    addi r3, r3, 15
++; CHECK-BE-NEXT:    mr r31, r1
++; CHECK-BE-NEXT:    ori r5, r5, 0
++; CHECK-BE-NEXT:    rldicl r3, r3, 60, 4
++; CHECK-BE-NEXT:    add r5, r31, r5
++; CHECK-BE-NEXT:    sldi r4, r4, 2
++; CHECK-BE-NEXT:    li r6, 1
++; CHECK-BE-NEXT:    rldicl r3, r3, 4, 31
++; CHECK-BE-NEXT:    stwx r6, r5, r4
++; CHECK-BE-NEXT:    neg r7, r3
++; CHECK-BE-NEXT:    li r4, -32768
++; CHECK-BE-NEXT:    and r4, r7, r4
++; CHECK-BE-NEXT:    ld r3, 0(r1)
++; CHECK-BE-NEXT:    mr r7, r4
++; CHECK-BE-NEXT:    li r4, -4096
++; CHECK-BE-NEXT:    divd r5, r7, r4
++; CHECK-BE-NEXT:    mulld r4, r5, r4
++; CHECK-BE-NEXT:    sub r5, r7, r4
++; CHECK-BE-NEXT:    add r4, r1, r7
++; CHECK-BE-NEXT:    stdux r3, r1, r5
++; CHECK-BE-NEXT:    cmpd r1, r4
++; CHECK-BE-NEXT:    beq cr0, .LBB11_8
++; CHECK-BE-NEXT:  .LBB11_7:
++; CHECK-BE-NEXT:    stdu r3, -4096(r1)
++; CHECK-BE-NEXT:    cmpd r1, r4
++; CHECK-BE-NEXT:    bne cr0, .LBB11_7
++; CHECK-BE-NEXT:  .LBB11_8:
++; CHECK-BE-NEXT:    addi r3, r1, -32768
++; CHECK-BE-NEXT:    lbz r3, 0(r3)
++; CHECK-BE-NEXT:    mr r1, r30
++; CHECK-BE-NEXT:    ld r31, -8(r1)
++; CHECK-BE-NEXT:    ld r30, -16(r1)
++; CHECK-BE-NEXT:    blr
++;
++; CHECK-32-LABEL: f11:
++; CHECK-32:       # %bb.0:
++; CHECK-32-NEXT:    mr r12, r1
++; CHECK-32-NEXT:    .cfi_def_cfa r12, 0
++; CHECK-32-NEXT:    clrlwi r0, r12, 17
++; CHECK-32-NEXT:    subc r1, r1, r0
++; CHECK-32-NEXT:    li r0, 24
++; CHECK-32-NEXT:    mtctr r0
++; CHECK-32-NEXT:  .LBB11_1:
++; CHECK-32-NEXT:    stwu r12, -4096(r1)
++; CHECK-32-NEXT:    bdnz .LBB11_1
++; CHECK-32-NEXT:  # %bb.2:
++; CHECK-32-NEXT:    .cfi_def_cfa_register r1
++; CHECK-32-NEXT:    sub r0, r1, r12
++; CHECK-32-NEXT:    sub r0, r1, r0
++; CHECK-32-NEXT:    addic r0, r0, -4
++; CHECK-32-NEXT:    stwx r31, 0, r0
++; CHECK-32-NEXT:    addic r0, r0, -4
++; CHECK-32-NEXT:    stwx r30, 0, r0
++; CHECK-32-NEXT:    addic r30, r0, 8
++; CHECK-32-NEXT:    .cfi_def_cfa_register r30
++; CHECK-32-NEXT:    .cfi_offset r31, -4
++; CHECK-32-NEXT:    .cfi_offset r30, -8
++; CHECK-32-NEXT:    lis r4, 1
++; CHECK-32-NEXT:    mr r31, r1
++; CHECK-32-NEXT:    ori r4, r4, 0
++; CHECK-32-NEXT:    addi r3, r3, 15
++; CHECK-32-NEXT:    add r4, r31, r4
++; CHECK-32-NEXT:    li r5, 1
++; CHECK-32-NEXT:    slwi r6, r6, 2
++; CHECK-32-NEXT:    rlwinm r3, r3, 0, 0, 27
++; CHECK-32-NEXT:    neg r7, r3
++; CHECK-32-NEXT:    stwx r5, r4, r6
++; CHECK-32-NEXT:    li r4, -32768
++; CHECK-32-NEXT:    and r4, r7, r4
++; CHECK-32-NEXT:    lwz r3, 0(r1)
++; CHECK-32-NEXT:    mr r7, r4
++; CHECK-32-NEXT:    li r4, -4096
++; CHECK-32-NEXT:    divw r5, r7, r4
++; CHECK-32-NEXT:    mullw r4, r5, r4
++; CHECK-32-NEXT:    sub r5, r7, r4
++; CHECK-32-NEXT:    add r4, r1, r7
++; CHECK-32-NEXT:    stwux r3, r1, r5
++; CHECK-32-NEXT:    cmpw r1, r4
++; CHECK-32-NEXT:    beq cr0, .LBB11_4
++; CHECK-32-NEXT:  .LBB11_3:
++; CHECK-32-NEXT:    stwu r3, -4096(r1)
++; CHECK-32-NEXT:    cmpw r1, r4
++; CHECK-32-NEXT:    bne cr0, .LBB11_3
++; CHECK-32-NEXT:  .LBB11_4:
++; CHECK-32-NEXT:    addi r3, r1, -32768
++; CHECK-32-NEXT:    lbz r3, 0(r3)
++; CHECK-32-NEXT:    lwz r31, 0(r1)
++; CHECK-32-NEXT:    lwz r0, -4(r31)
++; CHECK-32-NEXT:    lwz r30, -8(r31)
++; CHECK-32-NEXT:    mr r1, r31
++; CHECK-32-NEXT:    mr r31, r0
++; CHECK-32-NEXT:    blr
++  %a = alloca i32, i32 4096, align 32768
++  %b = getelementptr inbounds i32, i32* %a, i64 %i
++  store volatile i32 1, i32* %b
++  %1 = zext i32 %vla_size to i64
++  %vla = alloca i8, i64 %1, align 2048
++  %2 = load volatile i8, i8* %vla, align 2048
++  ret void
++}
++
+ attributes #0 = { "probe-stack"="inline-asm" }
+diff --git a/llvm/test/CodeGen/PowerPC/stack-realign.ll b/llvm/test/CodeGen/PowerPC/stack-realign.ll
+index ea3603b9ce20..640bfb81709a 100644
+--- a/llvm/test/CodeGen/PowerPC/stack-realign.ll
++++ b/llvm/test/CodeGen/PowerPC/stack-realign.ll
+@@ -43,7 +43,7 @@ entry:
+ 
+ ; CHECK: std 3, 48(30)
+ 
+-; CHECK: ld 1, 0(1)
++; CHECK: mr 1, 30
+ ; CHECK-DAG: ld [[SR:[0-9]+]], 16(1)
+ ; CHECK-DAG: ld 30, -16(1)
+ ; CHECK-DAG: mtlr [[SR]]
+@@ -69,7 +69,7 @@ entry:
+ 
+ ; CHECK-FP: std 3, 48(30)
+ 
+-; CHECK-FP: ld 1, 0(1)
++; CHECK-FP: mr 1, 30
+ ; CHECK-FP-DAG: ld [[SR:[0-9]+]], 16(1)
+ ; CHECK-FP-DAG: ld 31, -8(1)
+ ; CHECK-FP-DAG: ld 30, -16(1)
+diff --git a/llvm/test/MC/COFF/diff.s b/llvm/test/MC/COFF/diff.s
+index 2fb48ccc4ee7..0607ff437537 100644
+--- a/llvm/test/MC/COFF/diff.s
++++ b/llvm/test/MC/COFF/diff.s
+@@ -1,14 +1,19 @@
+ // RUN: llvm-mc -filetype=obj -triple i686-pc-mingw32 %s | llvm-readobj -S --sr --sd | FileCheck %s
+ 
+-// COFF resolves differences between labels in the same section, unless that
+-// label is declared with function type.
+-
+ .section baz, "xr"
++	.def	X
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	X
+ X:
+ 	mov	Y-X+42,	%eax
+ 	retl
+ 
++	.def	Y
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	Y
+ Y:
+ 	retl
+@@ -25,11 +30,6 @@ _foobar:                                # @foobar
+ # %bb.0:
+ 	ret
+ 
+-	.globl	_baz
+-_baz:
+-	calll	_foobar
+-	retl
+-
+ 	.data
+ 	.globl	_rust_crate             # @rust_crate
+ 	.align	4
+@@ -39,15 +39,6 @@ _rust_crate:
+ 	.long	_foobar-_rust_crate
+ 	.long	_foobar-_rust_crate
+ 
+-// Even though _baz and _foobar are in the same .text section, we keep the
+-// relocation for compatibility with the VC linker's /guard:cf and /incremental
+-// flags, even on mingw.
+-
+-// CHECK:        Name: .text
+-// CHECK:        Relocations [
+-// CHECK-NEXT:     0x12 IMAGE_REL_I386_REL32 _foobar
+-// CHECK-NEXT:   ]
+-
+ // CHECK:        Name: .data
+ // CHECK:        Relocations [
+ // CHECK-NEXT:     0x4 IMAGE_REL_I386_DIR32 _foobar
+diff --git a/llvm/test/Transforms/GVN/non-integral-pointers.ll b/llvm/test/Transforms/GVN/non-integral-pointers.ll
+index a017dda926e3..148b8c1dceef 100644
+--- a/llvm/test/Transforms/GVN/non-integral-pointers.ll
++++ b/llvm/test/Transforms/GVN/non-integral-pointers.ll
+@@ -1,7 +1,7 @@
+ ; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
+ ; RUN: opt -gvn -S < %s | FileCheck %s
+ 
+-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128-ni:4"
++target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128-ni:4:5"
+ target triple = "x86_64-unknown-linux-gnu"
+ 
+ define void @f0(i1 %alwaysFalse, i64 %val, i64* %loc) {
+@@ -386,3 +386,21 @@ entry:
+   %ref = load i8 addrspace(4)*, i8 addrspace(4)* addrspace(4)* %loc.off
+   ret i8 addrspace(4)* %ref
+ }
++
++ define i8 addrspace(5)* @multini(i1 %alwaysFalse, i8 addrspace(4)* %val, i8 addrspace(4)** %loc) {
++ ; CHECK-LABEL: @multini(
++ ; CHECK-NOT: inttoptr
++ ; CHECK-NOT: ptrtoint
++ ; CHECK-NOT: addrspacecast
++  entry:
++   store i8 addrspace(4)* %val, i8 addrspace(4)** %loc
++   br i1 %alwaysFalse, label %neverTaken, label %alwaysTaken
++
++  neverTaken:
++   %loc.bc = bitcast i8 addrspace(4)** %loc to i8 addrspace(5)**
++   %differentas = load i8 addrspace(5)*, i8 addrspace(5)** %loc.bc
++   ret i8 addrspace(5)* %differentas
++
++  alwaysTaken:
++   ret i8 addrspace(5)* null
++ }
+diff --git a/llvm/test/Transforms/LoopStrengthReduce/nonintegral.ll b/llvm/test/Transforms/LoopStrengthReduce/nonintegral.ll
+index 5648e3aa74af..6936521f3a64 100644
+--- a/llvm/test/Transforms/LoopStrengthReduce/nonintegral.ll
++++ b/llvm/test/Transforms/LoopStrengthReduce/nonintegral.ll
+@@ -2,7 +2,7 @@
+ 
+ ; Address Space 10 is non-integral. The optimizer is not allowed to use
+ ; ptrtoint/inttoptr instructions. Make sure that this doesn't happen
+-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128-ni:10:11:12"
++target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128-ni:10:11:12:13"
+ target triple = "x86_64-unknown-linux-gnu"
+ 
+ define void @japi1__unsafe_getindex_65028(i64 addrspace(10)* %arg) {
+@@ -43,3 +43,36 @@ if38:                                             ; preds = %L119
+ done:                                             ; preds = %if38
+   ret void
+ }
++
++; This is a bugpoint-reduced regression test - It doesn't make too much sense by itself,
++; but creates the correct SCEV expressions to reproduce the issue. See
++; https://github.com/JuliaLang/julia/issues/31156 for the original bug report.
++define void @"japi1_permutedims!_4259"(i64 %a, i64 %b, i64 %c, i64 %d, i64 %e, i64 %f, i1 %g, i8 addrspace(13)* %base) #0 {
++; CHECK-NOT: inttoptr
++; CHECK-NOT: ptrtoint
++; CHECK: getelementptr i8, i8 addrspace(13)* {{.*}}, i64 {{.*}}
++top:
++  br label %L42.L46_crit_edge.us
++
++L42.L46_crit_edge.us:                             ; preds = %L82.us.us.loopexit, %top
++  %value_phi11.us = phi i64 [ %a, %top ], [ %2, %L82.us.us.loopexit ]
++  %0 = sub i64 %value_phi11.us, %b
++  %1 = add i64 %0, %c
++  %spec.select = select i1 %g, i64 %d, i64 0
++  br label %L62.us.us
++
++L82.us.us.loopexit:                               ; preds = %L62.us.us
++  %2 = add i64 %e, %value_phi11.us
++  br label %L42.L46_crit_edge.us
++
++L62.us.us:                                        ; preds = %L62.us.us, %L42.L46_crit_edge.us
++  %value_phi21.us.us = phi i64 [ %6, %L62.us.us ], [ %spec.select, %L42.L46_crit_edge.us ]
++  %3 = add i64 %1, %value_phi21.us.us
++  %4 = getelementptr inbounds i8, i8 addrspace(13)* %base, i64 %3
++  %5 = load i8, i8 addrspace(13)* %4, align 1
++  %6 = add i64 %f, %value_phi21.us.us
++  br i1 %g, label %L82.us.us.loopexit, label %L62.us.us, !llvm.loop !1
++}
++
++!1 = distinct !{!1, !2}
++!2 = !{!"llvm.loop.isvectorized", i32 1}
+diff --git a/llvm/test/Transforms/LoopVectorize/float-reduction.ll b/llvm/test/Transforms/LoopVectorize/float-reduction.ll
+index f3b95d0ead7d..669c54d55a29 100644
+--- a/llvm/test/Transforms/LoopVectorize/float-reduction.ll
++++ b/llvm/test/Transforms/LoopVectorize/float-reduction.ll
+@@ -44,3 +44,25 @@ for.body:                                         ; preds = %for.body, %entry
+ for.end:                                          ; preds = %for.body
+   ret float %sub
+ }
++
++;CHECK-LABEL: @foodiv(
++;CHECK: fdiv fast <4 x float>
++;CHECK: ret
++define float @foodiv(float* nocapture %A, i32* nocapture %n) nounwind uwtable readonly ssp {
++entry:
++  br label %for.body
++
++for.body:                                         ; preds = %for.body, %entry
++  %indvars.iv = phi i64 [ 0, %entry ], [ %indvars.iv.next, %for.body ]
++  %sum.04 = phi float [ 1.000000e+00, %entry ], [ %sub, %for.body ]
++  %arrayidx = getelementptr inbounds float, float* %A, i64 %indvars.iv
++  %0 = load float, float* %arrayidx, align 4
++  %sub = fdiv fast float %sum.04, %0
++  %indvars.iv.next = add i64 %indvars.iv, 1
++  %lftr.wideiv = trunc i64 %indvars.iv.next to i32
++  %exitcond = icmp eq i32 %lftr.wideiv, 200
++  br i1 %exitcond, label %for.end, label %for.body
++
++for.end:                                          ; preds = %for.body
++  ret float %sub
++}
+diff --git a/llvm/tools/llvm-cfi-verify/CMakeLists.txt b/llvm/tools/llvm-cfi-verify/CMakeLists.txt
+index 647c2f733f29..ff01db9962f1 100644
+--- a/llvm/tools/llvm-cfi-verify/CMakeLists.txt
++++ b/llvm/tools/llvm-cfi-verify/CMakeLists.txt
+@@ -10,7 +10,7 @@ set(LLVM_LINK_COMPONENTS
+   Symbolize
+   )
+ 
+-add_llvm_tool(llvm-cfi-verify
++add_llvm_tool(llvm-cfi-verify DISABLE_LLVM_LINK_LLVM_DYLIB
+   llvm-cfi-verify.cpp
+   )
+ 
+diff --git a/llvm/utils/benchmark/src/benchmark_register.h b/llvm/utils/benchmark/src/benchmark_register.h
+index 0705e219f2fa..4caa5ad4da07 100644
+--- a/llvm/utils/benchmark/src/benchmark_register.h
++++ b/llvm/utils/benchmark/src/benchmark_register.h
+@@ -1,6 +1,7 @@
+ #ifndef BENCHMARK_REGISTER_H
+ #define BENCHMARK_REGISTER_H
+ 
++#include <limits>
+ #include <vector>
+ 
+ #include "check.h"
