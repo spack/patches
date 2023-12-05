@@ -1,0 +1,1768 @@
+From ae2638d84b63af89ece7e30f39d435013ce42ee2 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Fri, 1 Oct 2021 19:45:59 -0400
+Subject: [PATCH 01/16] Revert "[MC] Always emit relocations for same-section
+ function references"
+
+This reverts commit 5a5ac65768d124d98a10e8520363a0a4be3f4e38.
+---
+ llvm/lib/MC/WinCOFFObjectWriter.cpp | 12 +++++-------
+ llvm/test/MC/COFF/diff.s            | 25 ++++++++-----------------
+ 2 files changed, 13 insertions(+), 24 deletions(-)
+
+diff --git a/llvm/lib/MC/WinCOFFObjectWriter.cpp b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+index 901d2c06e716f..dbb4a3409289c 100644
+--- a/llvm/lib/MC/WinCOFFObjectWriter.cpp
++++ b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+@@ -698,14 +698,12 @@ void WinCOFFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
+ bool WinCOFFObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
+     const MCAssembler &Asm, const MCSymbol &SymA, const MCFragment &FB,
+     bool InSet, bool IsPCRel) const {
+-  // Don't drop relocations between functions, even if they are in the same text
+-  // section. Multiple Visual C++ linker features depend on having the
+-  // relocations present. The /INCREMENTAL flag will cause these relocations to
+-  // point to thunks, and the /GUARD:CF flag assumes that it can use relocations
+-  // to approximate the set of all address taken functions. LLD's implementation
+-  // of /GUARD:CF also relies on the existance of these relocations.
++  // MS LINK expects to be able to replace all references to a function with a
++  // thunk to implement their /INCREMENTAL feature.  Make sure we don't optimize
++  // away any relocations to functions.
+   uint16_t Type = cast<MCSymbolCOFF>(SymA).getType();
+-  if ((Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
++  if (Asm.isIncrementalLinkerCompatible() &&
++      (Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
+     return false;
+   return MCObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(Asm, SymA, FB,
+                                                                 InSet, IsPCRel);
+diff --git a/llvm/test/MC/COFF/diff.s b/llvm/test/MC/COFF/diff.s
+index 90466b59d0252..640bf8189e039 100644
+--- a/llvm/test/MC/COFF/diff.s
++++ b/llvm/test/MC/COFF/diff.s
+@@ -1,14 +1,19 @@
+ // RUN: llvm-mc -filetype=obj -triple i686-pc-mingw32 %s | llvm-readobj -S --sr --sd - | FileCheck %s
+ 
+-// COFF resolves differences between labels in the same section, unless that
+-// label is declared with function type.
+-
+ .section baz, "xr"
++	.def	X
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	X
+ X:
+ 	mov	Y-X+42,	%eax
+ 	retl
+ 
++	.def	Y
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	Y
+ Y:
+ 	retl
+@@ -25,11 +30,6 @@ _foobar:                                # @foobar
+ # %bb.0:
+ 	ret
+ 
+-	.globl	_baz
+-_baz:
+-	calll	_foobar
+-	retl
+-
+ 	.data
+ 	.globl	_rust_crate             # @rust_crate
+ 	.align	4
+@@ -39,15 +39,6 @@ _rust_crate:
+ 	.long	_foobar-_rust_crate
+ 	.long	_foobar-_rust_crate
+ 
+-// Even though _baz and _foobar are in the same .text section, we keep the
+-// relocation for compatibility with the VC linker's /guard:cf and /incremental
+-// flags, even on mingw.
+-
+-// CHECK:        Name: .text
+-// CHECK:        Relocations [
+-// CHECK-NEXT:     0x12 IMAGE_REL_I386_REL32 _foobar
+-// CHECK-NEXT:   ]
+-
+ // CHECK:        Name: .data
+ // CHECK:        Relocations [
+ // CHECK-NEXT:     0x4 IMAGE_REL_I386_DIR32 _foobar
+
+From 359a31d78d1819f9f5c000562d2cd16f0486ff31 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Wed, 21 Apr 2021 12:25:07 -0400
+Subject: [PATCH 02/16] Record NI types in add exprs
+
+This fixes a case where loop-reduce introduces ptrtoint/inttoptr for
+non-integral address space pointers. Over the past several years, we
+have gradually improved the SCEVExpander to actually do something
+sensible for non-integral pointer types. However, that obviously
+relies on the expander knowing what the type of the SCEV expression is.
+That is usually the case, but there is one important case where it's
+not: The type of an add expression is just the type of the last operand,
+so if the non-integral pointer is not the last operand, later uses of
+that SCEV may not realize that the given add expression contains
+non-integral pointers and may try to expand it as integers.
+
+One interesting observation is that we do get away with this scheme in
+shockingly many cases. The reason for this is that SCEV expressions
+often have an `scUnknown` pointer base, which our sort order on the
+operands of add expressions sort behind basically everything else,
+so it usually ends up as the last operand.
+
+One situation where this fails is included as a test case. This test
+case was bugpoint-reduced from the issue reported at
+https://github.com/JuliaLang/julia/issues/31156. What happens here
+is that the pointer base is an scAddRec from an outer loop, plus an
+scUnknown integer offset. By our sort order, the scUnknown gets sorted
+after the scAddRec pointer base, thus making an add expression of these
+two operands have integer type. This then confuses the expander, into
+attempting to expand the whole thing as integers, which will obviously
+fail when reaching the non-integral pointer.
+
+I considered a few options to solve this, but here's what I ended up
+settling on: The AddExpr class gains a new subclass that explicitly
+stores the type of the expression. This subclass is used whenever one
+of the operands is a non-integral pointer. To reduce the impact for the
+regular case (where the SCEV expression contains no non-integral
+pointers), a bit flag is kept in each flag expression to indicate
+whether it is of non-integral pointer type (this should give the same
+answer as asking if getType() is non-integral, but performing that
+query may involve a pointer chase and requires the DataLayout). For
+add expressions that flag is also used to indicate whether we're using
+the subclass or not. This is slightly inefficient, because it uses
+the subclass even in the (not uncommon) case where the last operand
+does actually accurately reflect the non-integral pointer type. However,
+it didn't seem worth the extra flag bit and complexity to do this
+micro-optimization.
+
+I had hoped that we could additionally restrict mul exprs from
+containing any non-integral pointers, and also require add exprs to
+only have one operand containg such pointers (but not more), but this
+turned out not to work. The reason for this is that SCEV wants to
+form differences between pointers, which it represents as `A + B*-1`,
+so we need to allow both multiplication by `-1` and addition with
+multiple non-integral pointer arguments. I'm not super happy with
+that situation, but I think it exposes a more general problem with
+non-integral pointers in LLVM. We don't actually have a way to express
+the difference between two non-integral pointers at the IR level.
+In theory this is a problem for SCEV, because it means that we can't
+materialize such SCEV expression. However, in practice, these
+expressions generally have the same base pointer, so SCEV will
+appropriately simplify them to just the integer components.
+Nevertheless it is a bit unsatisfying. Perhaps we could have an
+intrinsic that takes the byte difference between two pointers to the
+same allocated object (in the same sense as is used in getelementptr),
+which should be a sensible operation even for non-integral pointers.
+However, given the practical considerations above, that's a project
+for another time. For now, simply allowing the existing pointer-diff
+pattern for non-integral pointers seems to work ok.
+
+Differential Revision: https://reviews.llvm.org/D75072
+---
+ llvm/include/llvm/Analysis/ScalarEvolution.h  | 21 ++++-
+ .../Analysis/ScalarEvolutionExpressions.h     | 81 ++++++++++++++++---
+ llvm/lib/Analysis/ScalarEvolution.cpp         | 41 +++++++---
+ .../LoopStrengthReduce/nonintegral.ll         | 35 +++++++-
+ 4 files changed, 155 insertions(+), 23 deletions(-)
+
+diff --git a/llvm/include/llvm/Analysis/ScalarEvolution.h b/llvm/include/llvm/Analysis/ScalarEvolution.h
+index b3f199de2cfa0..d98fbeb5dcf7f 100644
+--- a/llvm/include/llvm/Analysis/ScalarEvolution.h
++++ b/llvm/include/llvm/Analysis/ScalarEvolution.h
+@@ -120,6 +120,19 @@ class SCEV : public FoldingSetNode {
+     NoWrapMask = (1 << 3) - 1
+   };
+ 
++  /// HasNonIntegralPointerFlag are bitfield indices into SubclassData.
++  ///
++  /// When constructing SCEV expressions for LLVM expressions with non-integral
++  /// pointer types, some additional processing is required to ensure that we
++  /// don't introduce any illegal transformations. However, non-integral pointer
++  /// types are a very rarely used feature, so we want to make sure to only do
++  /// such processing if they are actually used. To ensure minimal performance
++  /// impact, we memoize that fact in using these flags.
++  enum HasNonIntegralPointerFlag {
++    FlagNoNIPointers = 0,
++    FlagHasNIPointers = (1 << 3)
++  };
++
+   explicit SCEV(const FoldingSetNodeIDRef ID, SCEVTypes SCEVTy,
+                 unsigned short ExpressionSize)
+       : FastID(ID), SCEVType(SCEVTy), ExpressionSize(ExpressionSize) {}
+@@ -156,6 +169,10 @@ class SCEV : public FoldingSetNode {
+     return ExpressionSize;
+   }
+ 
++  bool hasNonIntegralPointers() const {
++    return SubclassData & FlagHasNIPointers;
++  }
++
+   /// Print out the internal representation of this scalar to the specified
+   /// stream.  This should really only be used for debugging purposes.
+   void print(raw_ostream &OS) const;
+@@ -745,7 +762,7 @@ class ScalarEvolution {
+                                         const BasicBlock *ExitingBlock);
+ 
+   /// The terms "backedge taken count" and "exit count" are used
+-  /// interchangeably to refer to the number of times the backedge of a loop 
++  /// interchangeably to refer to the number of times the backedge of a loop
+   /// has executed before the loop is exited.
+   enum ExitCountKind {
+     /// An expression exactly describing the number of times the backedge has
+@@ -758,7 +775,7 @@ class ScalarEvolution {
+   };
+ 
+   /// Return the number of times the backedge executes before the given exit
+-  /// would be taken; if not exactly computable, return SCEVCouldNotCompute. 
++  /// would be taken; if not exactly computable, return SCEVCouldNotCompute.
+   /// For a single exit loop, this value is equivelent to the result of
+   /// getBackedgeTakenCount.  The loop is guaranteed to exit (via *some* exit)
+   /// before the backedge is executed (ExitCount + 1) times.  Note that there
+diff --git a/llvm/include/llvm/Analysis/ScalarEvolutionExpressions.h b/llvm/include/llvm/Analysis/ScalarEvolutionExpressions.h
+index 37e675f08afc3..6e532b22f5b34 100644
+--- a/llvm/include/llvm/Analysis/ScalarEvolutionExpressions.h
++++ b/llvm/include/llvm/Analysis/ScalarEvolutionExpressions.h
+@@ -228,6 +228,13 @@ class Type;
+       return getNoWrapFlags(FlagNW) != FlagAnyWrap;
+     }
+ 
++    void setHasNIPtr(bool HasNIPtr) {
++      if (HasNIPtr)
++        SubclassData |= FlagHasNIPointers;
++      else
++        SubclassData &= ~FlagHasNIPointers;
++    }
++
+     /// Methods for support type inquiry through isa, cast, and dyn_cast:
+     static bool classof(const SCEV *S) {
+       return S->getSCEVType() == scAddExpr || S->getSCEVType() == scMulExpr ||
+@@ -264,19 +271,16 @@ class Type;
+ 
+     Type *Ty;
+ 
++  protected:
+     SCEVAddExpr(const FoldingSetNodeIDRef ID, const SCEV *const *O, size_t N)
+         : SCEVCommutativeExpr(ID, scAddExpr, O, N) {
+-      auto *FirstPointerTypedOp = find_if(operands(), [](const SCEV *Op) {
+-        return Op->getType()->isPointerTy();
+-      });
+-      if (FirstPointerTypedOp != operands().end())
+-        Ty = (*FirstPointerTypedOp)->getType();
+-      else
+-        Ty = getOperand(0)->getType();
++
+     }
+ 
+   public:
+-    Type *getType() const { return Ty; }
++    // Returns the type of the add expression, by looking either at the last operand
++    // or deferring to the SCEVAddNIExpr subclass.
++    Type *getType() const;
+ 
+     /// Methods for support type inquiry through isa, cast, and dyn_cast:
+     static bool classof(const SCEV *S) {
+@@ -284,6 +288,46 @@ class Type;
+     }
+   };
+ 
++  /// This node represents an addition of some number of SCEVs, one which
++  /// is a non-integral pointer type, requiring us to know the type exactly for
++  /// correctness.
++  class SCEVAddNIExpr : public SCEVAddExpr {
++    friend class ScalarEvolution;
++    PointerType *NIType;
++
++    SCEVAddNIExpr(const FoldingSetNodeIDRef ID, const SCEV *const *O, size_t N,
++                  PointerType *NIType)
++        : SCEVAddExpr(ID, O, N), NIType(NIType) {
++      SubclassData |= FlagHasNIPointers;
++    }
++
++  public:
++    Type *getType() const { return NIType; }
++
++    /// Methods for support type inquiry through isa, cast, and dyn_cast:
++    static bool classof(const SCEV *S) {
++      return S->getSCEVType() == scAddExpr && S->hasNonIntegralPointers();
++    }
++  };
++
++  inline Type *SCEVAddExpr::getType() const {
++    // In general, use the type of the last operand, which is likely to be a
++    // pointer type, if there is one. This doesn't usually matter, but it can
++    // help reduce casts when the expressions are expanded. In the (unusual)
++    // case that we're working with non-integral pointers, we have a subclass
++    // that stores that type explicitly.
++    if (hasNonIntegralPointers())
++      return cast<SCEVAddNIExpr>(this)->getType();
++
++    auto *FirstPointerTypedOp = find_if(operands(), [](const SCEV *Op) {
++      return Op->getType()->isPointerTy();
++    });
++    if (FirstPointerTypedOp != operands().end())
++      return (*FirstPointerTypedOp)->getType();
++    else
++      return  getOperand(0)->getType();
++  }
++
+   /// This node represents multiplication of some number of SCEVs.
+   class SCEVMulExpr : public SCEVCommutativeExpr {
+     friend class ScalarEvolution;
+@@ -293,6 +337,18 @@ class Type;
+       : SCEVCommutativeExpr(ID, scMulExpr, O, N) {}
+ 
+   public:
++    Type *getType() const {
++      // In general, we can't form SCEVMulExprs with non-integral pointer types,
++      // but for the moment we need to allow a special case: Multiplying by
++      // -1 to be able express the difference between two pointers. In order
++      // to maintain the invariant that SCEVs with the NI flag set should have
++      // a type corresponding to the contained NI ptr, we need to return the
++      // type of the pointer here.
++      if (hasNonIntegralPointers())
++        return getOperand(getNumOperands() - 1)->getType();
++      return SCEVCommutativeExpr::getType();
++    }
++
+     /// Methods for support type inquiry through isa, cast, and dyn_cast:
+     static bool classof(const SCEV *S) {
+       return S->getSCEVType() == scMulExpr;
+@@ -531,9 +587,12 @@ class Type;
+     /// instances owned by a ScalarEvolution.
+     SCEVUnknown *Next;
+ 
+-    SCEVUnknown(const FoldingSetNodeIDRef ID, Value *V,
+-                ScalarEvolution *se, SCEVUnknown *next) :
+-      SCEV(ID, scUnknown, 1), CallbackVH(V), SE(se), Next(next) {}
++    SCEVUnknown(const FoldingSetNodeIDRef ID, Value *V, ScalarEvolution *se,
++                SCEVUnknown *next, bool ValueIsNIPtr)
++        : SCEV(ID, scUnknown, 1), CallbackVH(V), SE(se), Next(next) {
++      if (ValueIsNIPtr)
++        SubclassData |= FlagHasNIPointers;
++    }
+ 
+     // Implement CallbackVH.
+     void deleted() override;
+diff --git a/llvm/lib/Analysis/ScalarEvolution.cpp b/llvm/lib/Analysis/ScalarEvolution.cpp
+index 1a9ae68573e94..9930820966c6d 100644
+--- a/llvm/lib/Analysis/ScalarEvolution.cpp
++++ b/llvm/lib/Analysis/ScalarEvolution.cpp
+@@ -389,12 +389,13 @@ Type *SCEV::getType() const {
+   case scSignExtend:
+     return cast<SCEVCastExpr>(this)->getType();
+   case scAddRecExpr:
+-  case scMulExpr:
+   case scUMaxExpr:
+   case scSMaxExpr:
+   case scUMinExpr:
+   case scSMinExpr:
+     return cast<SCEVNAryExpr>(this)->getType();
++  case scMulExpr:
++    return cast<SCEVMulExpr>(this)->getType();
+   case scAddExpr:
+     return cast<SCEVAddExpr>(this)->getType();
+   case scUDivExpr:
+@@ -2679,16 +2680,27 @@ ScalarEvolution::getOrCreateAddExpr(ArrayRef<const SCEV *> Ops,
+                                     SCEV::NoWrapFlags Flags) {
+   FoldingSetNodeID ID;
+   ID.AddInteger(scAddExpr);
+-  for (const SCEV *Op : Ops)
+-    ID.AddPointer(Op);
++  bool HasNIPtr = false;
++  PointerType *NIPtrType = nullptr;
++  for (unsigned i = 0, e = Ops.size(); i != e; ++i) {
++    ID.AddPointer(Ops[i]);
++    if (Ops[i]->hasNonIntegralPointers()) {
++      HasNIPtr = true;
++      NIPtrType = cast<PointerType>(Ops[i]->getType());
++    }
++  }
+   void *IP = nullptr;
+   SCEVAddExpr *S =
+       static_cast<SCEVAddExpr *>(UniqueSCEVs.FindNodeOrInsertPos(ID, IP));
+   if (!S) {
+     const SCEV **O = SCEVAllocator.Allocate<const SCEV *>(Ops.size());
+     std::uninitialized_copy(Ops.begin(), Ops.end(), O);
+-    S = new (SCEVAllocator)
+-        SCEVAddExpr(ID.Intern(SCEVAllocator), O, Ops.size());
++    if (HasNIPtr)
++      S = new (SCEVAllocator)
++          SCEVAddNIExpr(ID.Intern(SCEVAllocator), O, Ops.size(), NIPtrType);
++    else
++      S = new (SCEVAllocator)
++          SCEVAddExpr(ID.Intern(SCEVAllocator), O, Ops.size());
+     UniqueSCEVs.InsertNode(S, IP);
+     addToLoopUseLists(S);
+   }
+@@ -2701,8 +2713,10 @@ ScalarEvolution::getOrCreateAddRecExpr(ArrayRef<const SCEV *> Ops,
+                                        const Loop *L, SCEV::NoWrapFlags Flags) {
+   FoldingSetNodeID ID;
+   ID.AddInteger(scAddRecExpr);
+-  for (unsigned i = 0, e = Ops.size(); i != e; ++i)
++  for (unsigned i = 0, e = Ops.size(); i != e; ++i) {
++    assert(i == 0 || !Ops[i]->hasNonIntegralPointers());
+     ID.AddPointer(Ops[i]);
++  }
+   ID.AddPointer(L);
+   void *IP = nullptr;
+   SCEVAddRecExpr *S =
+@@ -2716,6 +2730,7 @@ ScalarEvolution::getOrCreateAddRecExpr(ArrayRef<const SCEV *> Ops,
+     addToLoopUseLists(S);
+   }
+   setNoWrapFlags(S, Flags);
++  S->setHasNIPtr(Ops[0]->hasNonIntegralPointers());
+   return S;
+ }
+ 
+@@ -2724,8 +2739,11 @@ ScalarEvolution::getOrCreateMulExpr(ArrayRef<const SCEV *> Ops,
+                                     SCEV::NoWrapFlags Flags) {
+   FoldingSetNodeID ID;
+   ID.AddInteger(scMulExpr);
+-  for (unsigned i = 0, e = Ops.size(); i != e; ++i)
++  bool HasNIPtr = false;
++  for (unsigned i = 0, e = Ops.size(); i != e; ++i) {
++    HasNIPtr |= Ops[i]->hasNonIntegralPointers();
+     ID.AddPointer(Ops[i]);
++  }
+   void *IP = nullptr;
+   SCEVMulExpr *S =
+     static_cast<SCEVMulExpr *>(UniqueSCEVs.FindNodeOrInsertPos(ID, IP));
+@@ -2738,6 +2756,7 @@ ScalarEvolution::getOrCreateMulExpr(ArrayRef<const SCEV *> Ops,
+     addToLoopUseLists(S);
+   }
+   S->setNoWrapFlags(Flags);
++  S->setHasNIPtr(HasNIPtr);
+   return S;
+ }
+ 
+@@ -3615,8 +3634,11 @@ const SCEV *ScalarEvolution::getMinMaxExpr(SCEVTypes Kind,
+     return ExistingSCEV;
+   const SCEV **O = SCEVAllocator.Allocate<const SCEV *>(Ops.size());
+   std::uninitialized_copy(Ops.begin(), Ops.end(), O);
+-  SCEV *S = new (SCEVAllocator)
++  SCEVMinMaxExpr *S = new (SCEVAllocator)
+       SCEVMinMaxExpr(ID.Intern(SCEVAllocator), Kind, O, Ops.size());
++  // For MinMaxExprs it's sufficient to see if the first Op has NI data, as the
++  // operands all need to be of the same type.
++  S->setHasNIPtr(Ops[0]->hasNonIntegralPointers());
+ 
+   UniqueSCEVs.InsertNode(S, IP);
+   addToLoopUseLists(S);
+@@ -3716,8 +3738,9 @@ const SCEV *ScalarEvolution::getUnknown(Value *V) {
+            "Stale SCEVUnknown in uniquing map!");
+     return S;
+   }
++  bool ValueIsNIPtr = getDataLayout().isNonIntegralPointerType(V->getType());
+   SCEV *S = new (SCEVAllocator) SCEVUnknown(ID.Intern(SCEVAllocator), V, this,
+-                                            FirstUnknown);
++                                            FirstUnknown, ValueIsNIPtr);
+   FirstUnknown = cast<SCEVUnknown>(S);
+   UniqueSCEVs.InsertNode(S, IP);
+   return S;
+diff --git a/llvm/test/Transforms/LoopStrengthReduce/nonintegral.ll b/llvm/test/Transforms/LoopStrengthReduce/nonintegral.ll
+index 5648e3aa74afa..6936521f3a64a 100644
+--- a/llvm/test/Transforms/LoopStrengthReduce/nonintegral.ll
++++ b/llvm/test/Transforms/LoopStrengthReduce/nonintegral.ll
+@@ -2,7 +2,7 @@
+ 
+ ; Address Space 10 is non-integral. The optimizer is not allowed to use
+ ; ptrtoint/inttoptr instructions. Make sure that this doesn't happen
+-target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128-ni:10:11:12"
++target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128-ni:10:11:12:13"
+ target triple = "x86_64-unknown-linux-gnu"
+ 
+ define void @japi1__unsafe_getindex_65028(i64 addrspace(10)* %arg) {
+@@ -43,3 +43,36 @@ if38:                                             ; preds = %L119
+ done:                                             ; preds = %if38
+   ret void
+ }
++
++; This is a bugpoint-reduced regression test - It doesn't make too much sense by itself,
++; but creates the correct SCEV expressions to reproduce the issue. See
++; https://github.com/JuliaLang/julia/issues/31156 for the original bug report.
++define void @"japi1_permutedims!_4259"(i64 %a, i64 %b, i64 %c, i64 %d, i64 %e, i64 %f, i1 %g, i8 addrspace(13)* %base) #0 {
++; CHECK-NOT: inttoptr
++; CHECK-NOT: ptrtoint
++; CHECK: getelementptr i8, i8 addrspace(13)* {{.*}}, i64 {{.*}}
++top:
++  br label %L42.L46_crit_edge.us
++
++L42.L46_crit_edge.us:                             ; preds = %L82.us.us.loopexit, %top
++  %value_phi11.us = phi i64 [ %a, %top ], [ %2, %L82.us.us.loopexit ]
++  %0 = sub i64 %value_phi11.us, %b
++  %1 = add i64 %0, %c
++  %spec.select = select i1 %g, i64 %d, i64 0
++  br label %L62.us.us
++
++L82.us.us.loopexit:                               ; preds = %L62.us.us
++  %2 = add i64 %e, %value_phi11.us
++  br label %L42.L46_crit_edge.us
++
++L62.us.us:                                        ; preds = %L62.us.us, %L42.L46_crit_edge.us
++  %value_phi21.us.us = phi i64 [ %6, %L62.us.us ], [ %spec.select, %L42.L46_crit_edge.us ]
++  %3 = add i64 %1, %value_phi21.us.us
++  %4 = getelementptr inbounds i8, i8 addrspace(13)* %base, i64 %3
++  %5 = load i8, i8 addrspace(13)* %4, align 1
++  %6 = add i64 %f, %value_phi21.us.us
++  br i1 %g, label %L82.us.us.loopexit, label %L62.us.us, !llvm.loop !1
++}
++
++!1 = distinct !{!1, !2}
++!2 = !{!"llvm.loop.isvectorized", i32 1}
+
+From 3f53397f402b67341afe2bcb3a3316606b47d15c Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sat, 19 May 2018 11:56:55 -0400
+Subject: [PATCH 03/16] Allow for custom address spaces
+
+Julia uses addressspaces for GC and we want these to be sanitized as well.
+---
+ llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index 783878cf1ec0b..16cc283fb5707 100644
+--- a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -401,7 +401,9 @@ static bool shouldInstrumentReadWriteFromAddress(const Module *M, Value *Addr) {
+   // with them.
+   if (Addr) {
+     Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+-    if (PtrTy->getPointerAddressSpace() != 0)
++    auto AS = PtrTy->getPointerAddressSpace();
++    // Allow for custom addresspaces
++    if (AS != 0 && AS < 10)
+       return false;
+   }
+ 
+
+From f252e1795b885bf83f76ff4b029b0484aefebb31 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Wed, 29 Sep 2021 15:17:47 -0400
+Subject: [PATCH 04/16] [clang/CMake] Respect LLVM_TOOLS_INSTALL_DIR
+
+Otherwise clang installs all of its tools into `bin/` while
+LLVM installs its tools into (LLVM_TOOLS_INSTALL_DIR).
+I could swear this used to work (and in fact the julia build system
+assumes it), but I can't pin down a specific commit that would
+have broken this, and julia has been relying on pre-compiled binaries
+for a while now (that don't use this setting), so it may have been
+broken for quite a while.
+
+Differential Revision: https://reviews.llvm.org/D88630
+
+(cherry picked from commit 6104e14b830c31dffb1b6bce1c6f9a0760993ff1)
+---
+ clang/cmake/modules/AddClang.cmake | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/clang/cmake/modules/AddClang.cmake b/clang/cmake/modules/AddClang.cmake
+index 704278a0e93bf..a455365cabf85 100644
+--- a/clang/cmake/modules/AddClang.cmake
++++ b/clang/cmake/modules/AddClang.cmake
+@@ -170,7 +170,7 @@ macro(add_clang_tool name)
+ 
+     install(TARGETS ${name}
+       ${export_to_clangtargets}
+-      RUNTIME DESTINATION bin
++      RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
+       COMPONENT ${name})
+ 
+     if(NOT LLVM_ENABLE_IDE)
+
+From fcdf8f28a963931efce9095f92c5a2eb2fe88cb3 Mon Sep 17 00:00:00 2001
+From: Tim Besard <tim@juliacomputing.com>
+Date: Wed, 29 Sep 2021 15:20:09 -0400
+Subject: [PATCH 05/16] Don't sink ptrtoint/inttoptr sequences into non-noop
+ addrspacecasts.
+
+Differential Revision: https://reviews.llvm.org/D92210
+
+(cherry picked from commit 822b19a512f6939dca7f26c1fea1c847b93d25c0)
+---
+ llvm/lib/CodeGen/CodeGenPrepare.cpp           | 32 +++++++++++---
+ .../NVPTX/dont-introduce-addrspacecast.ll     | 43 +++++++++++++++++++
+ 2 files changed, 70 insertions(+), 5 deletions(-)
+ create mode 100644 llvm/test/Transforms/CodeGenPrepare/NVPTX/dont-introduce-addrspacecast.ll
+
+diff --git a/llvm/lib/CodeGen/CodeGenPrepare.cpp b/llvm/lib/CodeGen/CodeGenPrepare.cpp
+index b2bc75c197095..7a2c674b501a7 100644
+--- a/llvm/lib/CodeGen/CodeGenPrepare.cpp
++++ b/llvm/lib/CodeGen/CodeGenPrepare.cpp
+@@ -5044,18 +5044,29 @@ bool CodeGenPrepare::optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
+   WeakTrackingVH SunkAddrVH = SunkAddrs[Addr];
+ 
+   Value * SunkAddr = SunkAddrVH.pointsToAliveValue() ? SunkAddrVH : nullptr;
++  Type *IntPtrTy = DL->getIntPtrType(Addr->getType());
+   if (SunkAddr) {
+     LLVM_DEBUG(dbgs() << "CGP: Reusing nonlocal addrmode: " << AddrMode
+                       << " for " << *MemoryInst << "\n");
+-    if (SunkAddr->getType() != Addr->getType())
+-      SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++    if (SunkAddr->getType() != Addr->getType()) {
++      // Even though we only considered no-op addrspacecasts,
++      // semantically-meaningful conversions may still be present due to
++      // ptrtoint/inttoptr sequences.
++      if (SunkAddr->getType()->getPointerAddressSpace() !=
++              Addr->getType()->getPointerAddressSpace() &&
++          !DL->isNonIntegralPointerType(Addr->getType())) {
++        SunkAddr = Builder.CreatePtrToInt(SunkAddr, IntPtrTy, "sunkaddr");
++        SunkAddr =
++            Builder.CreateIntToPtr(SunkAddr, Addr->getType(), "sunkaddr");
++      } else
++        SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++    }
+   } else if (AddrSinkUsingGEPs || (!AddrSinkUsingGEPs.getNumOccurrences() &&
+                                    SubtargetInfo->addrSinkUsingGEPs())) {
+     // By default, we use the GEP-based method when AA is used later. This
+     // prevents new inttoptr/ptrtoint pairs from degrading AA capabilities.
+     LLVM_DEBUG(dbgs() << "CGP: SINKING nonlocal addrmode: " << AddrMode
+                       << " for " << *MemoryInst << "\n");
+-    Type *IntPtrTy = DL->getIntPtrType(Addr->getType());
+     Value *ResultPtr = nullptr, *ResultIndex = nullptr;
+ 
+     // First, find the pointer.
+@@ -5184,8 +5195,19 @@ bool CodeGenPrepare::optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
+                 : Builder.CreateGEP(I8Ty, ResultPtr, ResultIndex, "sunkaddr");
+       }
+ 
+-      if (SunkAddr->getType() != Addr->getType())
+-        SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++      if (SunkAddr->getType() != Addr->getType()) {
++        // Even though we only considered no-op addrspacecasts,
++        // semantically-meaningful conversions may still be present due to
++        // ptrtoint/inttoptr sequences.
++        if (SunkAddr->getType()->getPointerAddressSpace() !=
++                Addr->getType()->getPointerAddressSpace() &&
++            !DL->isNonIntegralPointerType(Addr->getType())) {
++          SunkAddr = Builder.CreatePtrToInt(SunkAddr, IntPtrTy, "sunkaddr");
++          SunkAddr =
++              Builder.CreateIntToPtr(SunkAddr, Addr->getType(), "sunkaddr");
++        } else
++          SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++      }
+     }
+   } else {
+     // We'd require a ptrtoint/inttoptr down the line, which we can't do for
+diff --git a/llvm/test/Transforms/CodeGenPrepare/NVPTX/dont-introduce-addrspacecast.ll b/llvm/test/Transforms/CodeGenPrepare/NVPTX/dont-introduce-addrspacecast.ll
+new file mode 100644
+index 0000000000000..39e50241c9cc6
+--- /dev/null
++++ b/llvm/test/Transforms/CodeGenPrepare/NVPTX/dont-introduce-addrspacecast.ll
+@@ -0,0 +1,43 @@
++; RUN: opt -S -codegenprepare < %s | FileCheck %s
++
++target datalayout = "e-i64:64-v16:16-v32:32-n16:32:64"
++target triple = "nvptx64-nvidia-cuda"
++
++
++; ptrtoint/inttoptr combinations can introduce semantically-meaningful address space casts
++; which we can't sink into an addrspacecast
++
++; CHECK-LABEL: @test
++define void @test(i8* %input_ptr) {
++  ; CHECK-LABEL: l1:
++  ; CHECK-NOT: addrspacecast
++  %intptr = ptrtoint i8* %input_ptr to i64
++  %ptr = inttoptr i64 %intptr to i32 addrspace(3)*
++
++  br label %l1
++l1:
++
++  store atomic i32 1, i32 addrspace(3)* %ptr unordered, align 4
++  ret void
++}
++
++
++; we still should be able to look through multiple sequences of inttoptr/ptrtoint
++
++; CHECK-LABEL: @test2
++define void @test2(i8* %input_ptr) {
++  ; CHECK-LABEL: l2:
++  ; CHECK: bitcast
++  ; CHECK-NEXT: store
++  %intptr = ptrtoint i8* %input_ptr to i64
++  %ptr = inttoptr i64 %intptr to i32 addrspace(3)*
++
++  %intptr2 = ptrtoint i32 addrspace(3)* %ptr to i64
++  %ptr2 = inttoptr i64 %intptr2 to i32*
++
++  br label %l2
++l2:
++
++  store atomic i32 1, i32* %ptr2 unordered, align 4
++  ret void
++}
+
+From fe53a18840ca5668044a56f536a1669fb684b2d2 Mon Sep 17 00:00:00 2001
+From: Jameson Nash <vtjnash@gmail.com>
+Date: Tue, 15 Dec 2020 10:04:08 -0500
+Subject: [PATCH 06/16] GlobalISel: remove assert that memcpy Src and Dst
+ addrspace must be identical
+
+The LangRef does not require these arguments to have the same type.
+
+Differential Revision: https://reviews.llvm.org/D93154
+---
+ .../lib/CodeGen/GlobalISel/CombinerHelper.cpp | 27 +++++++++++--------
+ 1 file changed, 16 insertions(+), 11 deletions(-)
+
+diff --git a/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp b/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp
+index a9353bdfb780e..d48346d78f9c9 100644
+--- a/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp
++++ b/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp
+@@ -1300,7 +1300,6 @@ bool CombinerHelper::optimizeMemcpy(MachineInstr &MI, Register Dst,
+   // of that value loaded. This can result in a sequence of loads and stores
+   // mixed types, depending on what the target specifies as good types to use.
+   unsigned CurrOffset = 0;
+-  LLT PtrTy = MRI.getType(Src);
+   unsigned Size = KnownLen;
+   for (auto CopyTy : MemOps) {
+     // Issuing an unaligned load / store pair  that overlaps with the previous
+@@ -1318,15 +1317,20 @@ bool CombinerHelper::optimizeMemcpy(MachineInstr &MI, Register Dst,
+     Register LoadPtr = Src;
+     Register Offset;
+     if (CurrOffset != 0) {
+-      Offset = MIB.buildConstant(LLT::scalar(PtrTy.getSizeInBits()), CurrOffset)
+-                   .getReg(0);
+-      LoadPtr = MIB.buildPtrAdd(PtrTy, Src, Offset).getReg(0);
++      LLT LoadTy = MRI.getType(Src);
++      Offset =
++          MIB.buildConstant(LLT::scalar(LoadTy.getSizeInBits()), CurrOffset)
++              .getReg(0);
++      LoadPtr = MIB.buildPtrAdd(LoadTy, Src, Offset).getReg(0);
+     }
+     auto LdVal = MIB.buildLoad(CopyTy, LoadPtr, *LoadMMO);
+ 
+     // Create the store.
+-    Register StorePtr =
+-        CurrOffset == 0 ? Dst : MIB.buildPtrAdd(PtrTy, Dst, Offset).getReg(0);
++    Register StorePtr = Dst;
++    if (CurrOffset != 0) {
++      LLT StoreTy = MRI.getType(Dst);
++      StorePtr = MIB.buildPtrAdd(StoreTy, Dst, Offset).getReg(0);
++    }
+     MIB.buildStore(LdVal, StorePtr, *StoreMMO);
+     CurrOffset += CopyTy.getSizeInBytes();
+     Size -= CopyTy.getSizeInBytes();
+@@ -1403,7 +1407,6 @@ bool CombinerHelper::optimizeMemmove(MachineInstr &MI, Register Dst,
+   // Apart from that, this loop is pretty much doing the same thing as the
+   // memcpy codegen function.
+   unsigned CurrOffset = 0;
+-  LLT PtrTy = MRI.getType(Src);
+   SmallVector<Register, 16> LoadVals;
+   for (auto CopyTy : MemOps) {
+     // Construct MMO for the load.
+@@ -1413,9 +1416,10 @@ bool CombinerHelper::optimizeMemmove(MachineInstr &MI, Register Dst,
+     // Create the load.
+     Register LoadPtr = Src;
+     if (CurrOffset != 0) {
++      LLT LoadTy = MRI.getType(Src);
+       auto Offset =
+-          MIB.buildConstant(LLT::scalar(PtrTy.getSizeInBits()), CurrOffset);
+-      LoadPtr = MIB.buildPtrAdd(PtrTy, Src, Offset).getReg(0);
++          MIB.buildConstant(LLT::scalar(LoadTy.getSizeInBits()), CurrOffset);
++      LoadPtr = MIB.buildPtrAdd(LoadTy, Src, Offset).getReg(0);
+     }
+     LoadVals.push_back(MIB.buildLoad(CopyTy, LoadPtr, *LoadMMO).getReg(0));
+     CurrOffset += CopyTy.getSizeInBytes();
+@@ -1430,9 +1434,10 @@ bool CombinerHelper::optimizeMemmove(MachineInstr &MI, Register Dst,
+ 
+     Register StorePtr = Dst;
+     if (CurrOffset != 0) {
++      LLT StoreTy = MRI.getType(Dst);
+       auto Offset =
+-          MIB.buildConstant(LLT::scalar(PtrTy.getSizeInBits()), CurrOffset);
+-      StorePtr = MIB.buildPtrAdd(PtrTy, Dst, Offset).getReg(0);
++          MIB.buildConstant(LLT::scalar(StoreTy.getSizeInBits()), CurrOffset);
++      StorePtr = MIB.buildPtrAdd(StoreTy, Dst, Offset).getReg(0);
+     }
+     MIB.buildStore(LoadVals[I], StorePtr, *StoreMMO);
+     CurrOffset += CopyTy.getSizeInBytes();
+
+From 458b259600f7efd82387eb7c4e09bdcee328106b Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sat, 16 Jan 2021 17:36:09 -0500
+Subject: [PATCH 07/16] Don't merge icmps derived from pointers with
+ addressspaces
+
+IIUC we can't emit `memcmp` between pointers in addressspaces,
+doing so will trigger an assertion since the signature of the memcmp
+will not match it's arguments (https://bugs.llvm.org/show_bug.cgi?id=48661).
+
+This PR disables the attempt to merge icmps,
+when the pointer is in an addressspace.
+
+Differential Revision: https://reviews.llvm.org/D94813
+---
+ llvm/lib/Transforms/Scalar/MergeICmps.cpp     |  4 ++
+ .../Transforms/MergeICmps/addressspaces.ll    | 67 +++++++++++++++++++
+ 2 files changed, 71 insertions(+)
+ create mode 100644 llvm/test/Transforms/MergeICmps/addressspaces.ll
+
+diff --git a/llvm/lib/Transforms/Scalar/MergeICmps.cpp b/llvm/lib/Transforms/Scalar/MergeICmps.cpp
+index 7f8b75ac88067..17dca3cf4a366 100644
+--- a/llvm/lib/Transforms/Scalar/MergeICmps.cpp
++++ b/llvm/lib/Transforms/Scalar/MergeICmps.cpp
+@@ -154,6 +154,10 @@ BCEAtom visitICmpLoadOperand(Value *const Val, BaseIdentifier &BaseId) {
+     return {};
+   }
+   Value *const Addr = LoadI->getOperand(0);
++  if (Addr->getType()->getPointerAddressSpace() != 0) {
++    LLVM_DEBUG(dbgs() << "from non-zero AddressSpace\n");
++    return {};
++  }
+   auto *const GEP = dyn_cast<GetElementPtrInst>(Addr);
+   if (!GEP)
+     return {};
+diff --git a/llvm/test/Transforms/MergeICmps/addressspaces.ll b/llvm/test/Transforms/MergeICmps/addressspaces.ll
+new file mode 100644
+index 0000000000000..9a74b4a5b2ca4
+--- /dev/null
++++ b/llvm/test/Transforms/MergeICmps/addressspaces.ll
+@@ -0,0 +1,67 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
++; RUN: opt < %s -mergeicmps -S | FileCheck %s
++
++source_filename = "=="
++target datalayout = "e-m:e-i64:64-n32:64"
++target triple = "powerpc64le-unknown-linux-gnu"
++
++define void @juliaAS([2 x [5 x i64]] addrspace(11)* nocapture nonnull readonly align 8 dereferenceable(80) %0, [2 x [5 x i64]] addrspace(11)* nocapture nonnull readonly align 8 dereferenceable(80) %1) {
++; CHECK-LABEL: @juliaAS(
++; CHECK-NEXT:  top:
++; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0:%.*]], i64 0, i64 1, i64 2
++; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0]], i64 0, i64 1, i64 3
++; CHECK-NEXT:    [[TMP4:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0]], i64 0, i64 1, i64 4
++; CHECK-NEXT:    [[TMP5:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1:%.*]], i64 0, i64 1, i64 2
++; CHECK-NEXT:    [[TMP6:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1]], i64 0, i64 1, i64 3
++; CHECK-NEXT:    [[TMP7:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1]], i64 0, i64 1, i64 4
++; CHECK-NEXT:    [[TMP8:%.*]] = load i64, i64 addrspace(11)* [[TMP2]], align 8
++; CHECK-NEXT:    [[TMP9:%.*]] = load i64, i64 addrspace(11)* [[TMP5]], align 8
++; CHECK-NEXT:    [[DOTNOT17:%.*]] = icmp eq i64 [[TMP8]], [[TMP9]]
++; CHECK-NEXT:    br i1 [[DOTNOT17]], label [[L70:%.*]], label [[L90:%.*]]
++; CHECK:       L70:
++; CHECK-NEXT:    [[TMP10:%.*]] = load i64, i64 addrspace(11)* [[TMP3]], align 8
++; CHECK-NEXT:    [[TMP11:%.*]] = load i64, i64 addrspace(11)* [[TMP6]], align 8
++; CHECK-NEXT:    [[DOTNOT18:%.*]] = icmp eq i64 [[TMP10]], [[TMP11]]
++; CHECK-NEXT:    br i1 [[DOTNOT18]], label [[L74:%.*]], label [[L90]]
++; CHECK:       L74:
++; CHECK-NEXT:    [[TMP12:%.*]] = load i64, i64 addrspace(11)* [[TMP4]], align 8
++; CHECK-NEXT:    [[TMP13:%.*]] = load i64, i64 addrspace(11)* [[TMP7]], align 8
++; CHECK-NEXT:    [[DOTNOT19:%.*]] = icmp eq i64 [[TMP12]], [[TMP13]]
++; CHECK-NEXT:    br label [[L90]]
++; CHECK:       L90:
++; CHECK-NEXT:    [[VALUE_PHI2_OFF0:%.*]] = phi i1 [ false, [[TOP:%.*]] ], [ [[DOTNOT19]], [[L74]] ], [ false, [[L70]] ]
++; CHECK-NEXT:    ret void
++;
++top:
++  %2 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 2
++  %3 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 3
++  %4 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 4
++  %5 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 2
++  %6 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 3
++  %7 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 4
++  %8 = load i64, i64 addrspace(11)* %2, align 8
++  %9 = load i64, i64 addrspace(11)* %5, align 8
++  %.not17 = icmp eq i64 %8, %9
++  br i1 %.not17, label %L70, label %L90
++
++L70:                                              ; preds = %top
++  %10 = load i64, i64 addrspace(11)* %3, align 8
++  %11 = load i64, i64 addrspace(11)* %6, align 8
++  %.not18 = icmp eq i64 %10, %11
++  br i1 %.not18, label %L74, label %L90
++
++L74:                                              ; preds = %L70
++  %12 = load i64, i64 addrspace(11)* %4, align 8
++  %13 = load i64, i64 addrspace(11)* %7, align 8
++  %.not19 = icmp eq i64 %12, %13
++  br label %L90
++
++L90:                                              ; preds = %L74, %L70, %top
++  %value_phi2.off0 = phi i1 [ false, %top ], [ %.not19, %L74 ], [ false, %L70 ]
++  ret void
++}
++
++!llvm.module.flags = !{!0}
++
++!0 = !{i32 1, !"Debug Info Version", i32 3}
++
+
+From e4f1085c5c04e106e5a7ee72c9f4dfe1dccb7b94 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Mon, 1 Mar 2021 16:42:05 -0500
+Subject: [PATCH 08/16] AArch64: Remove Bad optimization
+
+Removes the code responsible for causing https://bugs.llvm.org/show_bug.cgi?id=49357.
+A fix is in progress upstream, but I don't think it's easy, so this
+fixes the bug in the meantime. The optimization it does is minor.
+---
+ llvm/lib/Target/AArch64/AArch64FastISel.cpp | 24 ---------------------
+ 1 file changed, 24 deletions(-)
+
+diff --git a/llvm/lib/Target/AArch64/AArch64FastISel.cpp b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+index 9801036653f73..66a7ba71b5d07 100644
+--- a/llvm/lib/Target/AArch64/AArch64FastISel.cpp
++++ b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+@@ -4597,30 +4597,6 @@ bool AArch64FastISel::selectIntExt(const Instruction *I) {
+ 
+   // Try to optimize already sign-/zero-extended values from function arguments.
+   bool IsZExt = isa<ZExtInst>(I);
+-  if (const auto *Arg = dyn_cast<Argument>(I->getOperand(0))) {
+-    if ((IsZExt && Arg->hasZExtAttr()) || (!IsZExt && Arg->hasSExtAttr())) {
+-      if (RetVT == MVT::i64 && SrcVT != MVT::i64) {
+-        unsigned ResultReg = createResultReg(&AArch64::GPR64RegClass);
+-        BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
+-                TII.get(AArch64::SUBREG_TO_REG), ResultReg)
+-            .addImm(0)
+-            .addReg(SrcReg, getKillRegState(SrcIsKill))
+-            .addImm(AArch64::sub_32);
+-        SrcReg = ResultReg;
+-      }
+-      // Conservatively clear all kill flags from all uses, because we are
+-      // replacing a sign-/zero-extend instruction at IR level with a nop at MI
+-      // level. The result of the instruction at IR level might have been
+-      // trivially dead, which is now not longer true.
+-      unsigned UseReg = lookUpRegForValue(I);
+-      if (UseReg)
+-        MRI.clearKillFlags(UseReg);
+-
+-      updateValueMap(I, SrcReg);
+-      return true;
+-    }
+-  }
+-
+   unsigned ResultReg = emitIntExt(SrcVT, SrcReg, RetVT, IsZExt);
+   if (!ResultReg)
+     return false;
+
+From 089b115f4a91d184791e41de0ce58b6bca43ea6e Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Wed, 21 Apr 2021 12:38:40 -0400
+Subject: [PATCH 09/16] Correct register class for pseudo instructions
+
+This constrains the Mov* and similar pseudo instruction to take
+GPR64common register classes rather than GPR64. GPR64 includs XZR
+which is invalid here, because this pseudo instructions expands
+into an adrp/add pair sharing a destination register. XZR is invalid
+on add and attempting to encode it will instead increment the stack
+pointer causing crashes (downstream report at [1]). The test case
+there reproduces on LLVM11, but I do not have a test case that
+reaches this code path on main, since it is being masked by
+improved dead code elimination introduced in D91513. Nevertheless,
+this seems like a good thing to fix in case there are other cases
+that dead code elimination doesn't clean up (e.g. if `optnone` is
+used and the optimization is skipped).
+
+I think it would be worth auditing uses of GPR64 in pseudo
+instructions to see if there are any similar issues, but I do not
+have a high enough view of the backend or knowledge of the
+Aarch64 architecture to do this quickly.
+
+[1] https://github.com/JuliaLang/julia/issues/39818
+
+Reviewed By: t.p.northover
+
+Differential Revision: https://reviews.llvm.org/D97435
+---
+ .../AArch64/AArch64ExpandPseudoInsts.cpp      |  1 +
+ llvm/lib/Target/AArch64/AArch64InstrInfo.td   | 32 +++++++++----------
+ .../GlobalISel/select-blockaddress.mir        |  5 +--
+ .../select-jump-table-brjt-constrain.mir      |  2 +-
+ .../GlobalISel/select-jump-table-brjt.mir     |  2 +-
+ 5 files changed, 22 insertions(+), 20 deletions(-)
+
+diff --git a/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp b/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp
+index e57650ae60b1c..612fbeb5f5318 100644
+--- a/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp
++++ b/llvm/lib/Target/AArch64/AArch64ExpandPseudoInsts.cpp
+@@ -886,6 +886,7 @@ bool AArch64ExpandPseudo::expandMI(MachineBasicBlock &MBB,
+   case AArch64::MOVaddrEXT: {
+     // Expand into ADRP + ADD.
+     Register DstReg = MI.getOperand(0).getReg();
++    assert(DstReg != AArch64::XZR);
+     MachineInstrBuilder MIB1 =
+         BuildMI(MBB, MBBI, MI.getDebugLoc(), TII->get(AArch64::ADRP), DstReg)
+             .add(MI.getOperand(1));
+diff --git a/llvm/lib/Target/AArch64/AArch64InstrInfo.td b/llvm/lib/Target/AArch64/AArch64InstrInfo.td
+index 171d3dbaa814a..6fe0bd1ef1687 100644
+--- a/llvm/lib/Target/AArch64/AArch64InstrInfo.td
++++ b/llvm/lib/Target/AArch64/AArch64InstrInfo.td
+@@ -656,40 +656,40 @@ let isReMaterializable = 1, isCodeGenOnly = 1 in {
+ // removed, along with the AArch64Wrapper node.
+ 
+ let AddedComplexity = 10 in
+-def LOADgot : Pseudo<(outs GPR64:$dst), (ins i64imm:$addr),
+-                     [(set GPR64:$dst, (AArch64LOADgot tglobaladdr:$addr))]>,
++def LOADgot : Pseudo<(outs GPR64common:$dst), (ins i64imm:$addr),
++                     [(set GPR64common:$dst, (AArch64LOADgot tglobaladdr:$addr))]>,
+               Sched<[WriteLDAdr]>;
+ 
+ // The MOVaddr instruction should match only when the add is not folded
+ // into a load or store address.
+ def MOVaddr
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tglobaladdr:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tglobaladdr:$hi),
+                                             tglobaladdr:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrJT
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tjumptable:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tjumptable:$hi),
+                                              tjumptable:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrCP
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tconstpool:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tconstpool:$hi),
+                                              tconstpool:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrBA
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tblockaddress:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tblockaddress:$hi),
+                                              tblockaddress:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrTLS
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp tglobaltlsaddr:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp tglobaltlsaddr:$hi),
+                                             tglobaltlsaddr:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ def MOVaddrEXT
+-    : Pseudo<(outs GPR64:$dst), (ins i64imm:$hi, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow (AArch64adrp texternalsym:$hi),
++    : Pseudo<(outs GPR64common:$dst), (ins i64imm:$hi, i64imm:$low),
++             [(set GPR64common:$dst, (AArch64addlow (AArch64adrp texternalsym:$hi),
+                                             texternalsym:$low))]>,
+       Sched<[WriteAdrAdr]>;
+ // Normally AArch64addlow either gets folded into a following ldr/str,
+@@ -697,8 +697,8 @@ def MOVaddrEXT
+ // might appear without either of them, so allow lowering it into a plain
+ // add.
+ def ADDlowTLS
+-    : Pseudo<(outs GPR64:$dst), (ins GPR64:$src, i64imm:$low),
+-             [(set GPR64:$dst, (AArch64addlow GPR64:$src,
++    : Pseudo<(outs GPR64sp:$dst), (ins GPR64sp:$src, i64imm:$low),
++             [(set GPR64sp:$dst, (AArch64addlow GPR64sp:$src,
+                                             tglobaltlsaddr:$low))]>,
+       Sched<[WriteAdr]>;
+ 
+diff --git a/llvm/test/CodeGen/AArch64/GlobalISel/select-blockaddress.mir b/llvm/test/CodeGen/AArch64/GlobalISel/select-blockaddress.mir
+index 45012f23de620..70cb802ed3a33 100644
+--- a/llvm/test/CodeGen/AArch64/GlobalISel/select-blockaddress.mir
++++ b/llvm/test/CodeGen/AArch64/GlobalISel/select-blockaddress.mir
+@@ -30,9 +30,10 @@ registers:
+ body:             |
+   ; CHECK-LABEL: name: test_blockaddress
+   ; CHECK: bb.0 (%ir-block.0):
+-  ; CHECK:   [[MOVaddrBA:%[0-9]+]]:gpr64 = MOVaddrBA target-flags(aarch64-page) blockaddress(@test_blockaddress, %ir-block.block), target-flags(aarch64-pageoff, aarch64-nc) blockaddress(@test_blockaddress, %ir-block.block)
++  ; CHECK:   [[MOVaddrBA:%[0-9]+]]:gpr64common = MOVaddrBA target-flags(aarch64-page) blockaddress(@test_blockaddress, %ir-block.block), target-flags(aarch64-pageoff, aarch64-nc) blockaddress(@test_blockaddress, %ir-block.block)
+   ; CHECK:   [[MOVaddr:%[0-9]+]]:gpr64common = MOVaddr target-flags(aarch64-page) @addr, target-flags(aarch64-pageoff, aarch64-nc) @addr
+-  ; CHECK:   STRXui [[MOVaddrBA]], [[MOVaddr]], 0 :: (store 8 into @addr)
++  ; CHECK:   [[COPY:%[0-9]+]]:gpr64 = COPY [[MOVaddrBA]]
++  ; CHECK:   STRXui [[COPY]], [[MOVaddr]], 0 :: (store 8 into @addr)
+   ; CHECK:   BR [[MOVaddrBA]]
+   ; CHECK: bb.1.block (address-taken):
+   ; CHECK:   RET_ReallyLR
+diff --git a/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt-constrain.mir b/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt-constrain.mir
+index 440a03173c83c..59b8dea2d0cea 100644
+--- a/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt-constrain.mir
++++ b/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt-constrain.mir
+@@ -30,7 +30,7 @@ body:             |
+   ; CHECK:   Bcc 8, %bb.3, implicit $nzcv
+   ; CHECK: bb.1:
+   ; CHECK:   successors: %bb.2(0x40000000), %bb.3(0x40000000)
+-  ; CHECK:   [[MOVaddrJT:%[0-9]+]]:gpr64 = MOVaddrJT target-flags(aarch64-page) %jump-table.0, target-flags(aarch64-pageoff, aarch64-nc) %jump-table.0
++  ; CHECK:   [[MOVaddrJT:%[0-9]+]]:gpr64common = MOVaddrJT target-flags(aarch64-page) %jump-table.0, target-flags(aarch64-pageoff, aarch64-nc) %jump-table.0
+   ; CHECK:   early-clobber %6:gpr64, early-clobber %7:gpr64sp = JumpTableDest32 [[MOVaddrJT]], [[SUBREG_TO_REG]], %jump-table.0
+   ; CHECK:   BR %6
+   ; CHECK: bb.2:
+diff --git a/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt.mir b/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt.mir
+index 6b84c6d108437..b8c9a6c881da7 100644
+--- a/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt.mir
++++ b/llvm/test/CodeGen/AArch64/GlobalISel/select-jump-table-brjt.mir
+@@ -65,7 +65,7 @@ body:             |
+   ; CHECK: bb.1.entry:
+   ; CHECK:   successors: %bb.3(0x2aaaaaab), %bb.4(0x2aaaaaab), %bb.2(0x2aaaaaab)
+   ; CHECK:   [[COPY2:%[0-9]+]]:gpr32 = COPY $wzr
+-  ; CHECK:   [[MOVaddrJT:%[0-9]+]]:gpr64 = MOVaddrJT target-flags(aarch64-page) %jump-table.0, target-flags(aarch64-pageoff, aarch64-nc) %jump-table.0
++  ; CHECK:   [[MOVaddrJT:%[0-9]+]]:gpr64common = MOVaddrJT target-flags(aarch64-page) %jump-table.0, target-flags(aarch64-pageoff, aarch64-nc) %jump-table.0
+   ; CHECK:   early-clobber %18:gpr64, early-clobber %19:gpr64sp = JumpTableDest32 [[MOVaddrJT]], [[SUBREG_TO_REG]], %jump-table.0
+   ; CHECK:   BR %18
+   ; CHECK: bb.2.sw.bb:
+
+From bdf0cf018c71bcfca739e4a21306fb46a27ede32 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Mon, 1 Mar 2021 16:38:19 -0500
+Subject: [PATCH 10/16] Fix emitting an AdrpAddLdr LOH when there's a potential
+ clobber of the def of the adrp before the ldr.
+
+Apparently this pass used to have liveness analysis but it was removed for scompile time reasons. This workaround prevents the LOH from being emitted unless the ADD and LDR are adjacent.
+
+Fixes https://github.com/JuliaLang/julia/issues/39820
+
+Reviewed By: loladiro, qcolombet
+
+Differential Revision: https://reviews.llvm.org/D97571
+---
+ llvm/lib/Target/AArch64/AArch64CollectLOH.cpp | 26 +++++++++++++++-
+ .../AArch64/loh-adrp-add-ldr-clobber.mir      | 30 +++++++++++++++++++
+ 2 files changed, 55 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/test/CodeGen/AArch64/loh-adrp-add-ldr-clobber.mir
+
+diff --git a/llvm/lib/Target/AArch64/AArch64CollectLOH.cpp b/llvm/lib/Target/AArch64/AArch64CollectLOH.cpp
+index efdb1131abc91..ac243347b24d9 100644
+--- a/llvm/lib/Target/AArch64/AArch64CollectLOH.cpp
++++ b/llvm/lib/Target/AArch64/AArch64CollectLOH.cpp
+@@ -419,13 +419,37 @@ static void handleADRP(const MachineInstr &MI, AArch64FunctionInfo &AFI,
+         ++NumADRPToLDR;
+       }
+       break;
+-    case MCLOH_AdrpAddLdr:
++    case MCLOH_AdrpAddLdr: {
++      // There is a possibility that the linker may try to rewrite:
++      // adrp x0, @sym@PAGE
++      // add x1, x0, @sym@PAGEOFF
++      // [x0 = some other def]
++      // ldr x2, [x1]
++      //    ...into...
++      // adrp x0, @sym
++      // nop
++      // [x0 = some other def]
++      // ldr x2, [x0]
++      // ...if the offset to the symbol won't fit within a literal load.
++      // This causes the load to use the result of the adrp, which in this
++      // case has already been clobbered.
++      // FIXME: Implement proper liveness tracking for all registers. For now,
++      // don't emit the LOH if there are any instructions between the add and
++      // the ldr.
++      MachineInstr *AddMI = const_cast<MachineInstr *>(Info.MI1);
++      const MachineInstr *LdrMI = Info.MI0;
++      auto AddIt = MachineBasicBlock::iterator(AddMI);
++      auto EndIt = AddMI->getParent()->end();
++      if (AddMI->getIterator() == EndIt || LdrMI != &*next_nodbg(AddIt, EndIt))
++        break;
++
+       LLVM_DEBUG(dbgs() << "Adding MCLOH_AdrpAddLdr:\n"
+                         << '\t' << MI << '\t' << *Info.MI1 << '\t'
+                         << *Info.MI0);
+       AFI.addLOHDirective(MCLOH_AdrpAddLdr, {&MI, Info.MI1, Info.MI0});
+       ++NumADDToLDR;
+       break;
++    }
+     case MCLOH_AdrpAddStr:
+       if (Info.MI1 != nullptr) {
+         LLVM_DEBUG(dbgs() << "Adding MCLOH_AdrpAddStr:\n"
+diff --git a/llvm/test/CodeGen/AArch64/loh-adrp-add-ldr-clobber.mir b/llvm/test/CodeGen/AArch64/loh-adrp-add-ldr-clobber.mir
+new file mode 100644
+index 0000000000000..e1e893c6383ad
+--- /dev/null
++++ b/llvm/test/CodeGen/AArch64/loh-adrp-add-ldr-clobber.mir
+@@ -0,0 +1,30 @@
++# RUN: llc -o /dev/null %s -mtriple=aarch64-apple-ios -run-pass=aarch64-collect-loh -debug-only=aarch64-collect-loh 2>&1 | FileCheck %s
++--- |
++  @sym2 = local_unnamed_addr global [10000000 x i32] zeroinitializer, align 8
++  @sym = local_unnamed_addr global i32 zeroinitializer, align 8
++
++  define i32 @main() {
++    ret i32 0
++  }
++
++...
++---
++name:            main
++alignment:       4
++tracksRegLiveness: true
++liveins:
++  - { reg: '$x22', virtual-reg: '' }
++  - { reg: '$x21', virtual-reg: '' }
++body:             |
++  bb.0:
++    liveins: $x21, $x22
++    ; Check we don't emit an loh here because there's a clobbering def of x8 before the ldr.
++    ; CHECK-LABEL: main
++    ; CHECK-NOT: MCLOH_AdrpAddLdr
++    renamable $x8 = ADRP target-flags(aarch64-page) @sym
++    renamable $x9 = ADDXri killed renamable $x8, target-flags(aarch64-pageoff, aarch64-nc) @sym, 0
++    renamable $x8 = ADDXri killed renamable $x22, 1, 0
++    $x9 = LDRXui $x9, 0
++    RET undef $lr
++
++...
+
+From cc1d5c9060a55cb845280f2835a80e01882430cb Mon Sep 17 00:00:00 2001
+From: Tim Northover <t.p.northover@gmail.com>
+Date: Thu, 25 Feb 2021 10:13:59 +0000
+Subject: [PATCH 11/16] AArch64: relax address-space assertion in FastISel.
+
+Some people are using alternative address spaces to track GC data, but
+otherwise they behave exactly the same. This is the only place in the backend
+we even try to care about it so it's really not achieving anything.
+---
+ llvm/lib/Target/AArch64/AArch64FastISel.cpp | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/llvm/lib/Target/AArch64/AArch64FastISel.cpp b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+index 66a7ba71b5d07..8d65341eed53d 100644
+--- a/llvm/lib/Target/AArch64/AArch64FastISel.cpp
++++ b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+@@ -526,10 +526,7 @@ unsigned AArch64FastISel::fastMaterializeConstant(const Constant *C) {
+   MVT VT = CEVT.getSimpleVT();
+   // arm64_32 has 32-bit pointers held in 64-bit registers. Because of that,
+   // 'null' pointers need to have a somewhat special treatment.
+-  if (const auto *CPN = dyn_cast<ConstantPointerNull>(C)) {
+-    (void)CPN;
+-    assert(CPN->getType()->getPointerAddressSpace() == 0 &&
+-           "Unexpected address space");
++  if (isa<ConstantPointerNull>(C)) {
+     assert(VT == MVT::i64 && "Expected 64-bit pointers");
+     return materializeInt(ConstantInt::get(Type::getInt64Ty(*Context), 0), VT);
+   }
+
+From 261a651c932317ec1a13c5de55a7209fb767d609 Mon Sep 17 00:00:00 2001
+From: Cody Tapscott <cody+github@tapscott.me>
+Date: Mon, 24 May 2021 15:11:39 -0700
+Subject: [PATCH 12/16] Do not patch FDE symbols in RuntimeDyld, on targets
+ that use non-absolute symbol relocations in `.eh_frame`
+
+Since processFDE adds a delta to the values in the FDE, it assumes that the relocations for the .eh_frame section have not been applied by RuntimeDyld. It expects instead that only the relocation addend has been written to the symbol locations, and that the section-to-section offset needs to be added.
+
+However, there are platform differences that interfere with this:
+1) X86-64 has DwarfFDESymbolsUseAbsDiff enabled in its AsmInfo, causing an absolute symbol to be emitted for the FDE pcStart.  Absolute symbols are skipped as a relocation by RuntimeDyld, so the processFDE function in RuntimeDyldMachO.cpp calculates the relocation correctly.
+2) AArch64 has DwarfFDESymbolsUseAbsDiff disabled, so a relocation is emitted in the eh_frame section. Since this isn't absolute, the relocation is applied by RuntimeDyld. This means that processFDE ends up adding an additional section-to-section offset to the pcStart field, generating an incorrect FDE
+
+Differential Revision: https://reviews.llvm.org/D103052
+---
+ .../RuntimeDyld/RuntimeDyldMachO.cpp          | 37 +++++++++++--------
+ .../RuntimeDyld/RuntimeDyldMachO.h            |  8 +++-
+ .../Targets/RuntimeDyldMachOAArch64.h         |  2 +
+ .../RuntimeDyld/Targets/RuntimeDyldMachOARM.h |  2 +
+ .../Targets/RuntimeDyldMachOI386.h            |  2 +
+ .../Targets/RuntimeDyldMachOX86_64.h          |  2 +
+ 6 files changed, 35 insertions(+), 18 deletions(-)
+
+diff --git a/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.cpp b/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.cpp
+index 9ca76602ea18e..e61bfd1bd31c9 100644
+--- a/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.cpp
++++ b/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.cpp
+@@ -272,9 +272,9 @@ RuntimeDyldMachOCRTPBase<Impl>::finalizeLoad(const ObjectFile &Obj,
+ }
+ 
+ template <typename Impl>
+-unsigned char *RuntimeDyldMachOCRTPBase<Impl>::processFDE(uint8_t *P,
+-                                                          int64_t DeltaForText,
+-                                                          int64_t DeltaForEH) {
++unsigned char *RuntimeDyldMachOCRTPBase<Impl>::patchFDERelocations(uint8_t *P,
++                                                                   int64_t DeltaForText,
++                                                                   int64_t DeltaForEH) {
+   typedef typename Impl::TargetPtrT TargetPtrT;
+ 
+   LLVM_DEBUG(dbgs() << "Processing FDE: Delta for text: " << DeltaForText
+@@ -324,19 +324,24 @@ void RuntimeDyldMachOCRTPBase<Impl>::registerEHFrames() {
+       continue;
+     SectionEntry *Text = &Sections[SectionInfo.TextSID];
+     SectionEntry *EHFrame = &Sections[SectionInfo.EHFrameSID];
+-    SectionEntry *ExceptTab = nullptr;
+-    if (SectionInfo.ExceptTabSID != RTDYLD_INVALID_SECTION_ID)
+-      ExceptTab = &Sections[SectionInfo.ExceptTabSID];
+-
+-    int64_t DeltaForText = computeDelta(Text, EHFrame);
+-    int64_t DeltaForEH = 0;
+-    if (ExceptTab)
+-      DeltaForEH = computeDelta(ExceptTab, EHFrame);
+-
+-    uint8_t *P = EHFrame->getAddress();
+-    uint8_t *End = P + EHFrame->getSize();
+-    while (P != End) {
+-      P = processFDE(P, DeltaForText, DeltaForEH);
++
++    // If the FDE includes absolute symbol relocations (not supported
++    // by RuntimeDyld), we need to manually patch-up the values
++    if (doDwarfFDESymbolsUseAbsDiff()) {
++      SectionEntry *ExceptTab = nullptr;
++      if (SectionInfo.ExceptTabSID != RTDYLD_INVALID_SECTION_ID)
++        ExceptTab = &Sections[SectionInfo.ExceptTabSID];
++
++      int64_t DeltaForText = computeDelta(Text, EHFrame);
++      int64_t DeltaForEH = 0;
++      if (ExceptTab)
++        DeltaForEH = computeDelta(ExceptTab, EHFrame);
++
++      uint8_t *P = EHFrame->getAddress();
++      uint8_t *End = P + EHFrame->getSize();
++      while (P != End) {
++        P = patchFDERelocations(P, DeltaForText, DeltaForEH);
++      }
+     }
+ 
+     MemMgr.registerEHFrames(EHFrame->getAddress(), EHFrame->getLoadAddress(),
+diff --git a/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.h b/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.h
+index 650e7b79fbb8e..a7e5c9cb56e83 100644
+--- a/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.h
++++ b/llvm/lib/ExecutionEngine/RuntimeDyld/RuntimeDyldMachO.h
+@@ -43,6 +43,10 @@ class RuntimeDyldMachO : public RuntimeDyldImpl {
+     SID ExceptTabSID;
+   };
+ 
++  // Returns true if the FDE section includes absolute symbol relocations
++  // on this platform.
++  virtual bool doDwarfFDESymbolsUseAbsDiff() = 0;
++
+   // When a module is loaded we save the SectionID of the EH frame section
+   // in a table until we receive a request to register all unregistered
+   // EH frame sections with the memory manager.
+@@ -147,8 +151,8 @@ class RuntimeDyldMachOCRTPBase : public RuntimeDyldMachO {
+   Impl &impl() { return static_cast<Impl &>(*this); }
+   const Impl &impl() const { return static_cast<const Impl &>(*this); }
+ 
+-  unsigned char *processFDE(uint8_t *P, int64_t DeltaForText,
+-                            int64_t DeltaForEH);
++  unsigned char *patchFDERelocations(uint8_t *P, int64_t DeltaForText,
++                                     int64_t DeltaForEH);
+ 
+ public:
+   RuntimeDyldMachOCRTPBase(RuntimeDyld::MemoryManager &MemMgr,
+diff --git a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOAArch64.h b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOAArch64.h
+index f2ee1b06d4943..90a9a4c44c842 100644
+--- a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOAArch64.h
++++ b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOAArch64.h
+@@ -30,6 +30,8 @@ class RuntimeDyldMachOAArch64
+ 
+   unsigned getStubAlignment() override { return 8; }
+ 
++  bool doDwarfFDESymbolsUseAbsDiff() override { return false; }
++  
+   /// Extract the addend encoded in the instruction / memory location.
+   Expected<int64_t> decodeAddend(const RelocationEntry &RE) const {
+     const SectionEntry &Section = Sections[RE.SectionID];
+diff --git a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOARM.h b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOARM.h
+index a76958a9e2c2a..7281249d25bf9 100644
+--- a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOARM.h
++++ b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOARM.h
+@@ -33,6 +33,8 @@ class RuntimeDyldMachOARM
+ 
+   unsigned getStubAlignment() override { return 4; }
+ 
++  bool doDwarfFDESymbolsUseAbsDiff() override { return false; }
++
+   Expected<JITSymbolFlags> getJITSymbolFlags(const SymbolRef &SR) override {
+     auto Flags = RuntimeDyldImpl::getJITSymbolFlags(SR);
+     if (!Flags)
+diff --git a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOI386.h b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOI386.h
+index 523deb29b723e..755bc13afeb40 100644
+--- a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOI386.h
++++ b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOI386.h
+@@ -30,6 +30,8 @@ class RuntimeDyldMachOI386
+ 
+   unsigned getStubAlignment() override { return 1; }
+ 
++  bool doDwarfFDESymbolsUseAbsDiff() override { return true; }
++
+   Expected<relocation_iterator>
+   processRelocationRef(unsigned SectionID, relocation_iterator RelI,
+                        const ObjectFile &BaseObjT,
+diff --git a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOX86_64.h b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOX86_64.h
+index 28febbdb948c3..9854da24a2ced 100644
+--- a/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOX86_64.h
++++ b/llvm/lib/ExecutionEngine/RuntimeDyld/Targets/RuntimeDyldMachOX86_64.h
+@@ -30,6 +30,8 @@ class RuntimeDyldMachOX86_64
+ 
+   unsigned getStubAlignment() override { return 8; }
+ 
++  bool doDwarfFDESymbolsUseAbsDiff() override { return true; }
++
+   Expected<relocation_iterator>
+   processRelocationRef(unsigned SectionID, relocation_iterator RelI,
+                        const ObjectFile &BaseObjT,
+
+From 60e041894288848e37870c42749a1aabcc2c2274 Mon Sep 17 00:00:00 2001
+From: Cody Tapscott <cody+github@tapscott.me>
+Date: Mon, 24 May 2021 16:36:06 -0700
+Subject: [PATCH 13/16] Force `.eh_frame` emission on AArch64
+
+We need to force the emission of the EH Frame section (currently done via SupportsCompactUnwindWithoutEHFrame in the MCObjectFileInfo for the target), since libunwind doesn't yet support dynamically registering compact unwind information at run-time.
+---
+ llvm/lib/MC/MCObjectFileInfo.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/lib/MC/MCObjectFileInfo.cpp b/llvm/lib/MC/MCObjectFileInfo.cpp
+index 398de873fe0bd..be8f98bc548ad 100644
+--- a/llvm/lib/MC/MCObjectFileInfo.cpp
++++ b/llvm/lib/MC/MCObjectFileInfo.cpp
+@@ -56,9 +56,10 @@ void MCObjectFileInfo::initMachOMCObjectFileInfo(const Triple &T) {
+           MachO::S_ATTR_STRIP_STATIC_SYMS | MachO::S_ATTR_LIVE_SUPPORT,
+       SectionKind::getReadOnly());
+ 
+-  if (T.isOSDarwin() &&
+-      (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32))
+-    SupportsCompactUnwindWithoutEHFrame = true;
++  // Disabled for now, since we need to emit EH Frames for stack unwinding in the JIT
++  // if (T.isOSDarwin() &&
++  //     (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32))
++  //   SupportsCompactUnwindWithoutEHFrame = true;
+ 
+   if (T.isWatchABI())
+     OmitDwarfIfHaveCompactUnwind = true;
+
+From dc15204d802984660a12a505fdc652024ab4d924 Mon Sep 17 00:00:00 2001
+From: Elliot Saba <staticfloat@gmail.com>
+Date: Fri, 1 Oct 2021 19:54:39 -0400
+Subject: [PATCH 14/16] [X86] Don't clobber EBX in stackprobes
+
+On X86, the stackprobe emission code chooses the R11D register, which
+is illegal on i686. This ends up wrapping around to EBX, which does
+not get properly callee-saved within the stack probing prologue,
+clobbering the register for the callers.
+
+We fix this by explicitly using EAX as the stack probe register.
+---
+ llvm/lib/Target/X86/X86FrameLowering.cpp   |  8 +-
+ llvm/test/CodeGen/X86/stack-clash-large.ll | 97 +++++++++++++---------
+ 2 files changed, 65 insertions(+), 40 deletions(-)
+
+diff --git a/llvm/lib/Target/X86/X86FrameLowering.cpp b/llvm/lib/Target/X86/X86FrameLowering.cpp
+index 866f113640047..5cb43e30c4537 100644
+--- a/llvm/lib/Target/X86/X86FrameLowering.cpp
++++ b/llvm/lib/Target/X86/X86FrameLowering.cpp
+@@ -652,7 +652,9 @@ void X86FrameLowering::emitStackProbeInlineGenericLoop(
+   MF.insert(MBBIter, testMBB);
+   MF.insert(MBBIter, tailMBB);
+ 
+-  Register FinalStackProbed = Uses64BitFramePtr ? X86::R11 : X86::R11D;
++  Register FinalStackProbed = Uses64BitFramePtr ? X86::R11
++                              : Is64Bit         ? X86::R11D
++                                                : X86::EAX;
+   BuildMI(MBB, MBBI, DL, TII.get(TargetOpcode::COPY), FinalStackProbed)
+       .addReg(StackPtr)
+       .setMIFlag(MachineInstr::FrameSetup);
+@@ -1073,7 +1075,9 @@ void X86FrameLowering::BuildStackAlignAND(MachineBasicBlock &MBB,
+       MF.insert(MBBIter, bodyMBB);
+       MF.insert(MBBIter, footMBB);
+       const unsigned MovMIOpc = Is64Bit ? X86::MOV64mi32 : X86::MOV32mi;
+-      Register FinalStackProbed = Uses64BitFramePtr ? X86::R11 : X86::R11D;
++      Register FinalStackProbed = Uses64BitFramePtr ? X86::R11
++                                  : Is64Bit         ? X86::R11D
++                                                    : X86::EAX;
+ 
+       // Setup entry block
+       {
+diff --git a/llvm/test/CodeGen/X86/stack-clash-large.ll b/llvm/test/CodeGen/X86/stack-clash-large.ll
+index dd53cd8f69646..91d28beb87b36 100644
+--- a/llvm/test/CodeGen/X86/stack-clash-large.ll
++++ b/llvm/test/CodeGen/X86/stack-clash-large.ll
+@@ -1,5 +1,6 @@
+-; RUN: llc -mtriple=x86_64-linux-android < %s | FileCheck -check-prefix=CHECK-X86-64 %s 
+-; RUN: llc -mtriple=i686-linux-android < %s | FileCheck -check-prefix=CHECK-X86-32 %s 
++; RUN: llc -mtriple=x86_64-linux-android < %s | FileCheck -check-prefix=CHECK-X64 %s 
++; RUN: llc -mtriple=i686-linux-android < %s | FileCheck -check-prefix=CHECK-X86 %s 
++; RUN: llc -mtriple=x86_64-linux-gnux32 < %s | FileCheck -check-prefix=CHECK-X32 %s 
+ 
+ define i32 @foo() local_unnamed_addr #0 {
+ 
+@@ -14,40 +15,60 @@ define i32 @foo() local_unnamed_addr #0 {
+ 
+ attributes #0 =  {"probe-stack"="inline-asm"}
+ 
+-; CHECK-X86-64-LABEL: foo:
+-; CHECK-X86-64:        # %bb.0:
+-; CHECK-X86-64-NEXT:	movq	%rsp, %r11
+-; CHECK-X86-64-NEXT:	subq	$69632, %r11 # imm = 0x11000
+-; CHECK-X86-64-NEXT:   .LBB0_1:
+-; CHECK-X86-64-NEXT:	subq	$4096, %rsp # imm = 0x1000
+-; CHECK-X86-64-NEXT:	movq	$0, (%rsp)
+-; CHECK-X86-64-NEXT:	cmpq	%r11, %rsp
+-; CHECK-X86-64-NEXT:	jne	.LBB0_1
+-; CHECK-X86-64-NEXT:# %bb.2:
+-; CHECK-X86-64-NEXT:	subq    $2248, %rsp
+-; CHECK-X86-64-NEXT:	.cfi_def_cfa_offset 71888
+-; CHECK-X86-64-NEXT:	movl	$1, 264(%rsp)
+-; CHECK-X86-64-NEXT:	movl	$1, 28664(%rsp)
+-; CHECK-X86-64-NEXT:	movl	-128(%rsp), %eax
+-; CHECK-X86-64-NEXT:	addq	$71880, %rsp # imm = 0x118C8
+-; CHECK-X86-64-NEXT:	.cfi_def_cfa_offset 8
+-; CHECK-X86-64-NEXT:	retq
++; CHECK-X64-LABEL: foo:
++; CHECK-X64:        # %bb.0:
++; CHECK-X64-NEXT:	movq	%rsp, %r11
++; CHECK-X64-NEXT:	subq	$69632, %r11 # imm = 0x11000
++; CHECK-X64-NEXT:   .LBB0_1:
++; CHECK-X64-NEXT:	subq	$4096, %rsp # imm = 0x1000
++; CHECK-X64-NEXT:	movq	$0, (%rsp)
++; CHECK-X64-NEXT:	cmpq	%r11, %rsp
++; CHECK-X64-NEXT:	jne	.LBB0_1
++; CHECK-X64-NEXT:# %bb.2:
++; CHECK-X64-NEXT:	subq    $2248, %rsp
++; CHECK-X64-NEXT:	.cfi_def_cfa_offset 71888
++; CHECK-X64-NEXT:	movl	$1, 264(%rsp)
++; CHECK-X64-NEXT:	movl	$1, 28664(%rsp)
++; CHECK-X64-NEXT:	movl	-128(%rsp), %eax
++; CHECK-X64-NEXT:	addq	$71880, %rsp # imm = 0x118C8
++; CHECK-X64-NEXT:	.cfi_def_cfa_offset 8
++; CHECK-X64-NEXT:	retq
++
++; CHECK-X86-LABEL: foo:
++; CHECK-X86:      # %bb.0:
++; CHECK-X86-NEXT:    movl    %esp, %eax
++; CHECK-X86-NEXT:    subl    $69632, %eax # imm = 0x11000
++; CHECK-X86-NEXT:    .LBB0_1: # =>This Inner Loop Header: Depth=1
++; CHECK-X86-NEXT:    subl    $4096, %esp # imm = 0x1000
++; CHECK-X86-NEXT:    movl    $0, (%esp)
++; CHECK-X86-NEXT:    cmpl    %eax, %esp
++; CHECK-X86-NEXT:    jne  .LBB0_1
++; CHECK-X86-NEXT:# %bb.2:
++; CHECK-X86-NEXT:    subl    $2380, %esp
++; CHECK-X86-NEXT:    .cfi_def_cfa_offset 72016
++; CHECK-X86-NEXT:    movl    $1, 392(%esp)
++; CHECK-X86-NEXT:    movl    $1, 28792(%esp)
++; CHECK-X86-NEXT:    movl    (%esp), %eax
++; CHECK-X86-NEXT:    addl    $72012, %esp # imm = 0x1194C
++; CHECK-X86-NEXT:    .cfi_def_cfa_offset 4
++; CHECK-X86-NEXT:    retl
++
++; CHECK-X32-LABEL: foo:
++; CHECK-X32:      # %bb.0:
++; CHECK-X32-NEXT:    movl    %esp, %r11d
++; CHECK-X32-NEXT:    subl    $69632, %r11d # imm = 0x11000
++; CHECK-X32-NEXT:    .LBB0_1: # =>This Inner Loop Header: Depth=1
++; CHECK-X32-NEXT:    subl    $4096, %esp # imm = 0x1000
++; CHECK-X32-NEXT:    movq    $0, (%esp)
++; CHECK-X32-NEXT:    cmpl    %r11d, %esp
++; CHECK-X32-NEXT:    jne  .LBB0_1
++; CHECK-X32-NEXT:# %bb.2:
++; CHECK-X32-NEXT:    subl    $2248, %esp
++; CHECK-X32-NEXT:    .cfi_def_cfa_offset 71888
++; CHECK-X32-NEXT:    movl    $1, 264(%esp)
++; CHECK-X32-NEXT:    movl    $1, 28664(%esp)
++; CHECK-X32-NEXT:    movl    -128(%esp), %eax
++; CHECK-X32-NEXT:    addl    $71880, %esp # imm = 0x118C8
++; CHECK-X32-NEXT:    .cfi_def_cfa_offset 8
++; CHECK-X32-NEXT:    retq
+ 
+-; CHECK-X86-32-LABEL: foo:
+-; CHECK-X86-32:      # %bb.0:
+-; CHECK-X86-32-NEXT:    movl    %esp, %r11d
+-; CHECK-X86-32-NEXT:    subl    $69632, %r11d # imm = 0x11000
+-; CHECK-X86-32-NEXT:    .LBB0_1: # =>This Inner Loop Header: Depth=1
+-; CHECK-X86-32-NEXT:    subl    $4096, %esp # imm = 0x1000
+-; CHECK-X86-32-NEXT:    movl    $0, (%esp)
+-; CHECK-X86-32-NEXT:    cmpl    %r11d, %esp
+-; CHECK-X86-32-NEXT:    jne  .LBB0_1
+-; CHECK-X86-32-NEXT:# %bb.2:
+-; CHECK-X86-32-NEXT:    subl    $2380, %esp
+-; CHECK-X86-32-NEXT:    .cfi_def_cfa_offset 72016
+-; CHECK-X86-32-NEXT:    movl    $1, 392(%esp)
+-; CHECK-X86-32-NEXT:    movl    $1, 28792(%esp)
+-; CHECK-X86-32-NEXT:    movl    (%esp), %eax
+-; CHECK-X86-32-NEXT:    addl    $72012, %esp # imm = 0x1194C
+-; CHECK-X86-32-NEXT:    .cfi_def_cfa_offset 4
+-; CHECK-X86-32-NEXT:    retl
+
+From 8f6e49e8a3c0f31a55c342a2a41dda630508c5eb Mon Sep 17 00:00:00 2001
+From: Takafumi Arakaki <aka.tkf@gmail.com>
+Date: Sat, 2 Oct 2021 08:33:31 -0700
+Subject: [PATCH 15/16] Re-apply the fix on DwarfEHPrepare and add a test (#2)
+
+* Ad -run-twice to dwarf-eh-prepare.ll
+
+* In DwarfEHPrepare, after all passes are run, RewindFunction may be a dangling
+pointer to a dead function. To make sure it's valid, doFinalization nullptrs
+RewindFunction just like the constructor and so it will be found on next run.
+
+llvm-svn: 217737
+
+Co-authored-by: Yaron Keren <yaron.keren@gmail.com>
+
+https://reviews.llvm.org/D110979
+---
+ llvm/lib/CodeGen/DwarfEHPrepare.cpp       | 5 +++++
+ llvm/test/CodeGen/X86/dwarf-eh-prepare.ll | 2 +-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/CodeGen/DwarfEHPrepare.cpp b/llvm/lib/CodeGen/DwarfEHPrepare.cpp
+index 97e0162f35a16..0a26c78f9cc8c 100644
+--- a/llvm/lib/CodeGen/DwarfEHPrepare.cpp
++++ b/llvm/lib/CodeGen/DwarfEHPrepare.cpp
+@@ -302,6 +302,11 @@ class DwarfEHPrepareLegacyPass : public FunctionPass {
+     return prepareDwarfEH(OptLevel, RewindFunction, F, TLI, DT, TTI);
+   }
+ 
++  bool doFinalization(Module &M) override {
++    RewindFunction = nullptr;
++    return false;
++  }
++
+   void getAnalysisUsage(AnalysisUsage &AU) const override {
+     AU.addRequired<TargetPassConfig>();
+     AU.addRequired<TargetTransformInfoWrapperPass>();
+diff --git a/llvm/test/CodeGen/X86/dwarf-eh-prepare.ll b/llvm/test/CodeGen/X86/dwarf-eh-prepare.ll
+index 921f4f9a7d85f..c54fdfceea4b2 100644
+--- a/llvm/test/CodeGen/X86/dwarf-eh-prepare.ll
++++ b/llvm/test/CodeGen/X86/dwarf-eh-prepare.ll
+@@ -1,4 +1,4 @@
+-; RUN: opt -mtriple=x86_64-linux-gnu -dwarfehprepare -simplifycfg-require-and-preserve-domtree=1 < %s -S | FileCheck %s
++; RUN: opt -mtriple=x86_64-linux-gnu -dwarfehprepare -simplifycfg-require-and-preserve-domtree=1 -run-twice < %s -S | FileCheck %s
+ 
+ ; Check basic functionality of IR-to-IR DWARF EH preparation. This should
+ ; eliminate resumes. This pass requires a TargetMachine, so we put it under X86
+
+From 980d2f60a8524c5546397db9e8bbb7d6ea56c1b7 Mon Sep 17 00:00:00 2001
+From: Jameson Nash <vtjnash@gmail.com>
+Date: Thu, 22 Jul 2021 19:42:23 -0400
+Subject: [PATCH 16/16] Bad SLPVectorization shufflevector replacement,
+ resulting in write to wrong memory location
+
+We see that it might otherwise do:
+
+  %10 = getelementptr {}**, <2 x {}***> %9, <2 x i32> <i32 10, i32 4>
+  %11 = bitcast <2 x {}***> %10 to <2 x i64*>
+...
+  %27 = extractelement <2 x i64*> %11, i32 0
+  %28 = bitcast i64* %27 to <2 x i64>*
+  store <2 x i64> %22, <2 x i64>* %28, align 4, !tbaa !2
+
+Which is an out-of-bounds store (the extractelement got offset 10
+instead of offset 4 as intended). With the fix, we correctly generate
+extractelement for i32 1 and generate correct code.
+
+Differential Revision: https://reviews.llvm.org/D106613
+---
+ .../Transforms/Vectorize/SLPVectorizer.cpp    | 45 +++++++++++++------
+ .../SLPVectorizer/X86/extract_in_tree_user.ll | 33 ++++++++++++++
+ 2 files changed, 65 insertions(+), 13 deletions(-)
+
+diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp
+index 0b630197911a7..8d0facb2f906e 100644
+--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp
++++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp
+@@ -1707,6 +1707,18 @@ class BoUpSLP {
+       return true;
+     }
+ 
++    /// When ReuseShuffleIndices is empty it just returns position of \p V
++    /// within vector of Scalars. Otherwise, try to remap on its reuse index.
++    int findLaneForValue(Value *V) const {
++      unsigned FoundLane = std::distance(Scalars.begin(), find(Scalars, V));
++      assert(FoundLane < Scalars.size() && "Couldn't find extract lane");
++      if (!ReuseShuffleIndices.empty()) {
++        FoundLane = std::distance(ReuseShuffleIndices.begin(),
++                                  find(ReuseShuffleIndices, FoundLane));
++      }
++      return FoundLane;
++    }
++
+ #ifndef NDEBUG
+     /// Debug printer.
+     LLVM_DUMP_METHOD void dump() const {
+@@ -4268,13 +4280,7 @@ Value *BoUpSLP::gather(ArrayRef<Value *> VL) {
+     // Add to our 'need-to-extract' list.
+     if (TreeEntry *Entry = getTreeEntry(Val)) {
+       // Find which lane we need to extract.
+-      unsigned FoundLane = std::distance(Entry->Scalars.begin(),
+-                                         find(Entry->Scalars, Val));
+-      assert(FoundLane < Entry->Scalars.size() && "Couldn't find extract lane");
+-      if (!Entry->ReuseShuffleIndices.empty()) {
+-        FoundLane = std::distance(Entry->ReuseShuffleIndices.begin(),
+-                                  find(Entry->ReuseShuffleIndices, FoundLane));
+-      }
++      unsigned FoundLane = Entry->findLaneForValue(Val);
+       ExternalUses.push_back(ExternalUser(Val, InsElt, FoundLane));
+     }
+   }
+@@ -4602,8 +4608,11 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {
+         // The pointer operand uses an in-tree scalar so we add the new BitCast
+         // to ExternalUses list to make sure that an extract will be generated
+         // in the future.
+-        if (getTreeEntry(PO))
+-          ExternalUses.emplace_back(PO, cast<User>(VecPtr), 0);
++        if (TreeEntry *Entry = getTreeEntry(PO)) {
++          // Find which lane we need to extract.
++          unsigned FoundLane = Entry->findLaneForValue(PO);
++          ExternalUses.emplace_back(PO, cast<User>(VecPtr), FoundLane);
++        }
+ 
+         NewLI = Builder.CreateAlignedLoad(VecTy, VecPtr, LI->getAlign());
+       } else {
+@@ -4654,8 +4663,12 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {
+       // The pointer operand uses an in-tree scalar, so add the new BitCast to
+       // ExternalUses to make sure that an extract will be generated in the
+       // future.
+-      if (getTreeEntry(ScalarPtr))
+-        ExternalUses.push_back(ExternalUser(ScalarPtr, cast<User>(VecPtr), 0));
++      if (TreeEntry *Entry = getTreeEntry(ScalarPtr)) {
++        // Find which lane we need to extract.
++        unsigned FoundLane = Entry->findLaneForValue(ScalarPtr);
++        ExternalUses.push_back(
++            ExternalUser(ScalarPtr, cast<User>(VecPtr), FoundLane));
++      }
+ 
+       Value *V = propagateMetadata(ST, E->Scalars);
+       if (NeedToShuffleReuses)
+@@ -4756,8 +4769,14 @@ Value *BoUpSLP::vectorizeTree(TreeEntry *E) {
+       // The scalar argument uses an in-tree scalar so we add the new vectorized
+       // call to ExternalUses list to make sure that an extract will be
+       // generated in the future.
+-      if (ScalarArg && getTreeEntry(ScalarArg))
+-        ExternalUses.push_back(ExternalUser(ScalarArg, cast<User>(V), 0));
++      if (ScalarArg) {
++        if (TreeEntry *Entry = getTreeEntry(ScalarArg)) {
++          // Find which lane we need to extract.
++          unsigned FoundLane = Entry->findLaneForValue(ScalarArg);
++          ExternalUses.push_back(
++              ExternalUser(ScalarArg, cast<User>(V), FoundLane));
++        }
++      }
+ 
+       propagateIRFlags(V, E->Scalars, VL0);
+       if (NeedToShuffleReuses)
+diff --git a/llvm/test/Transforms/SLPVectorizer/X86/extract_in_tree_user.ll b/llvm/test/Transforms/SLPVectorizer/X86/extract_in_tree_user.ll
+index 16321c4d22a10..6a66e76af5f24 100644
+--- a/llvm/test/Transforms/SLPVectorizer/X86/extract_in_tree_user.ll
++++ b/llvm/test/Transforms/SLPVectorizer/X86/extract_in_tree_user.ll
+@@ -99,3 +99,36 @@ entry:
+   ret void
+ 
+ }
++
++define void @externally_used_ptrs() {
++; CHECK-LABEL: @externally_used_ptrs(
++; CHECK-NEXT:  entry:
++; CHECK-NEXT:    [[TMP0:%.*]] = load i64*, i64** @a, align 8
++; CHECK-NEXT:    [[TMP1:%.*]] = insertelement <2 x i64*> poison, i64* [[TMP0]], i32 0
++; CHECK-NEXT:    [[TMP2:%.*]] = insertelement <2 x i64*> [[TMP1]], i64* [[TMP0]], i32 1
++; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr i64, <2 x i64*> [[TMP2]], <2 x i64> <i64 56, i64 11>
++; CHECK-NEXT:    [[TMP4:%.*]] = ptrtoint <2 x i64*> [[TMP3]] to <2 x i64>
++; CHECK-NEXT:    [[ARRAYIDX2:%.*]] = getelementptr inbounds i64, i64* [[TMP0]], i64 12
++; CHECK-NEXT:    [[TMP5:%.*]] = extractelement <2 x i64*> [[TMP3]], i32 1
++; CHECK-NEXT:    [[TMP6:%.*]] = bitcast i64* [[TMP5]] to <2 x i64>*
++; CHECK-NEXT:    [[TMP7:%.*]] = load <2 x i64>, <2 x i64>* [[TMP6]], align 8
++; CHECK-NEXT:    [[TMP9:%.*]] = add <2 x i64> [[TMP4]], [[TMP7]]
++; CHECK-NEXT:    [[TMP10:%.*]] = bitcast i64* [[TMP5]] to <2 x i64>*
++; CHECK-NEXT:    store <2 x i64> [[TMP9]], <2 x i64>* [[TMP10]], align 8
++; CHECK-NEXT:    ret void
++;
++entry:
++  %0 = load i64*, i64** @a, align 8
++  %add.ptr = getelementptr inbounds i64, i64* %0, i64 11
++  %1 = ptrtoint i64* %add.ptr to i64
++  %add.ptr1 = getelementptr inbounds i64, i64* %0, i64 56
++  %2 = ptrtoint i64* %add.ptr1 to i64
++  %arrayidx2 = getelementptr inbounds i64, i64* %0, i64 12
++  %3 = load i64, i64* %arrayidx2, align 8
++  %4 = load i64, i64* %add.ptr, align 8
++  %5 = add i64 %1, %3
++  %6 = add i64 %2, %4
++  store i64 %6, i64* %add.ptr, align 8
++  store i64 %5, i64* %arrayidx2, align 8
++  ret void
++}

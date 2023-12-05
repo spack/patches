@@ -1,0 +1,1436 @@
+From 05848b6d4d8ccc212f3ba9d9f58af42f26983e2c Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Fri, 1 Oct 2021 19:45:59 -0400
+Subject: [PATCH 01/18] Revert "[MC] Always emit relocations for same-section
+ function references"
+
+This reverts commit 5a5ac65768d124d98a10e8520363a0a4be3f4e38.
+
+(cherry picked from commit ae2638d84b63af89ece7e30f39d435013ce42ee2)
+---
+ llvm/lib/MC/WinCOFFObjectWriter.cpp | 12 +++++-------
+ llvm/test/MC/COFF/diff.s            | 25 ++++++++-----------------
+ 2 files changed, 13 insertions(+), 24 deletions(-)
+
+diff --git a/llvm/lib/MC/WinCOFFObjectWriter.cpp b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+index 646f416821aea..7915d6e843630 100644
+--- a/llvm/lib/MC/WinCOFFObjectWriter.cpp
++++ b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+@@ -698,14 +698,12 @@ void WinCOFFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
+ bool WinCOFFObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
+     const MCAssembler &Asm, const MCSymbol &SymA, const MCFragment &FB,
+     bool InSet, bool IsPCRel) const {
+-  // Don't drop relocations between functions, even if they are in the same text
+-  // section. Multiple Visual C++ linker features depend on having the
+-  // relocations present. The /INCREMENTAL flag will cause these relocations to
+-  // point to thunks, and the /GUARD:CF flag assumes that it can use relocations
+-  // to approximate the set of all address taken functions. LLD's implementation
+-  // of /GUARD:CF also relies on the existance of these relocations.
++  // MS LINK expects to be able to replace all references to a function with a
++  // thunk to implement their /INCREMENTAL feature.  Make sure we don't optimize
++  // away any relocations to functions.
+   uint16_t Type = cast<MCSymbolCOFF>(SymA).getType();
+-  if ((Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
++  if (Asm.isIncrementalLinkerCompatible() &&
++      (Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
+     return false;
+   return MCObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(Asm, SymA, FB,
+                                                                 InSet, IsPCRel);
+diff --git a/llvm/test/MC/COFF/diff.s b/llvm/test/MC/COFF/diff.s
+index 90466b59d0252..640bf8189e039 100644
+--- a/llvm/test/MC/COFF/diff.s
++++ b/llvm/test/MC/COFF/diff.s
+@@ -1,14 +1,19 @@
+ // RUN: llvm-mc -filetype=obj -triple i686-pc-mingw32 %s | llvm-readobj -S --sr --sd - | FileCheck %s
+ 
+-// COFF resolves differences between labels in the same section, unless that
+-// label is declared with function type.
+-
+ .section baz, "xr"
++	.def	X
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	X
+ X:
+ 	mov	Y-X+42,	%eax
+ 	retl
+ 
++	.def	Y
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	Y
+ Y:
+ 	retl
+@@ -25,11 +30,6 @@ _foobar:                                # @foobar
+ # %bb.0:
+ 	ret
+ 
+-	.globl	_baz
+-_baz:
+-	calll	_foobar
+-	retl
+-
+ 	.data
+ 	.globl	_rust_crate             # @rust_crate
+ 	.align	4
+@@ -39,15 +39,6 @@ _rust_crate:
+ 	.long	_foobar-_rust_crate
+ 	.long	_foobar-_rust_crate
+ 
+-// Even though _baz and _foobar are in the same .text section, we keep the
+-// relocation for compatibility with the VC linker's /guard:cf and /incremental
+-// flags, even on mingw.
+-
+-// CHECK:        Name: .text
+-// CHECK:        Relocations [
+-// CHECK-NEXT:     0x12 IMAGE_REL_I386_REL32 _foobar
+-// CHECK-NEXT:   ]
+-
+ // CHECK:        Name: .data
+ // CHECK:        Relocations [
+ // CHECK-NEXT:     0x4 IMAGE_REL_I386_DIR32 _foobar
+
+From 58df73b7d510d59462d56092595cf9c91404c601 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sat, 19 May 2018 11:56:55 -0400
+Subject: [PATCH 02/18] Allow for custom address spaces
+
+Julia uses addressspaces for GC and we want these to be sanitized as well.
+
+(cherry picked from commit 3f53397f402b67341afe2bcb3a3316606b47d15c)
+---
+ llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index 063999a682367..60fa777668b55 100644
+--- a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -431,7 +431,9 @@ static bool shouldInstrumentReadWriteFromAddress(const Module *M, Value *Addr) {
+   // with them.
+   if (Addr) {
+     Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+-    if (PtrTy->getPointerAddressSpace() != 0)
++    auto AS = PtrTy->getPointerAddressSpace();
++    // Allow for custom addresspaces
++    if (AS != 0 && AS < 10)
+       return false;
+   }
+ 
+
+From 9039ce8ab323e8e0bea24323a7231e4c53070def Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Wed, 29 Sep 2021 15:17:47 -0400
+Subject: [PATCH 03/18] [clang/CMake] Respect LLVM_TOOLS_INSTALL_DIR
+
+Otherwise clang installs all of its tools into `bin/` while
+LLVM installs its tools into (LLVM_TOOLS_INSTALL_DIR).
+I could swear this used to work (and in fact the julia build system
+assumes it), but I can't pin down a specific commit that would
+have broken this, and julia has been relying on pre-compiled binaries
+for a while now (that don't use this setting), so it may have been
+broken for quite a while.
+
+Differential Revision: https://reviews.llvm.org/D88630
+
+(cherry picked from commit 6104e14b830c31dffb1b6bce1c6f9a0760993ff1)
+(cherry picked from commit f252e1795b885bf83f76ff4b029b0484aefebb31)
+---
+ clang/cmake/modules/AddClang.cmake | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/clang/cmake/modules/AddClang.cmake b/clang/cmake/modules/AddClang.cmake
+index 5752f4277444e..f21fcc9405a4c 100644
+--- a/clang/cmake/modules/AddClang.cmake
++++ b/clang/cmake/modules/AddClang.cmake
+@@ -159,7 +159,7 @@ macro(add_clang_tool name)
+     get_target_export_arg(${name} Clang export_to_clangtargets)
+     install(TARGETS ${name}
+       ${export_to_clangtargets}
+-      RUNTIME DESTINATION bin
++      RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
+       COMPONENT ${name})
+ 
+     if(NOT LLVM_ENABLE_IDE)
+
+From 2208d33657bbe8b1e25ad3ca580ee7c1c01a6d13 Mon Sep 17 00:00:00 2001
+From: Tim Besard <tim@juliacomputing.com>
+Date: Wed, 29 Sep 2021 15:20:09 -0400
+Subject: [PATCH 04/18] Don't sink ptrtoint/inttoptr sequences into non-noop
+ addrspacecasts.
+
+Differential Revision: https://reviews.llvm.org/D92210
+
+(cherry picked from commit 822b19a512f6939dca7f26c1fea1c847b93d25c0)
+(cherry picked from commit fcdf8f28a963931efce9095f92c5a2eb2fe88cb3)
+---
+ llvm/lib/CodeGen/CodeGenPrepare.cpp           | 32 +++++++++++---
+ .../NVPTX/dont-introduce-addrspacecast.ll     | 43 +++++++++++++++++++
+ 2 files changed, 70 insertions(+), 5 deletions(-)
+ create mode 100644 llvm/test/Transforms/CodeGenPrepare/NVPTX/dont-introduce-addrspacecast.ll
+
+diff --git a/llvm/lib/CodeGen/CodeGenPrepare.cpp b/llvm/lib/CodeGen/CodeGenPrepare.cpp
+index 77ce3d2fb5633..fb869db5e0592 100644
+--- a/llvm/lib/CodeGen/CodeGenPrepare.cpp
++++ b/llvm/lib/CodeGen/CodeGenPrepare.cpp
+@@ -5224,18 +5224,29 @@ bool CodeGenPrepare::optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
+   WeakTrackingVH SunkAddrVH = SunkAddrs[Addr];
+ 
+   Value * SunkAddr = SunkAddrVH.pointsToAliveValue() ? SunkAddrVH : nullptr;
++  Type *IntPtrTy = DL->getIntPtrType(Addr->getType());
+   if (SunkAddr) {
+     LLVM_DEBUG(dbgs() << "CGP: Reusing nonlocal addrmode: " << AddrMode
+                       << " for " << *MemoryInst << "\n");
+-    if (SunkAddr->getType() != Addr->getType())
+-      SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++    if (SunkAddr->getType() != Addr->getType()) {
++      // Even though we only considered no-op addrspacecasts,
++      // semantically-meaningful conversions may still be present due to
++      // ptrtoint/inttoptr sequences.
++      if (SunkAddr->getType()->getPointerAddressSpace() !=
++              Addr->getType()->getPointerAddressSpace() &&
++          !DL->isNonIntegralPointerType(Addr->getType())) {
++        SunkAddr = Builder.CreatePtrToInt(SunkAddr, IntPtrTy, "sunkaddr");
++        SunkAddr =
++            Builder.CreateIntToPtr(SunkAddr, Addr->getType(), "sunkaddr");
++      } else
++        SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++    }
+   } else if (AddrSinkUsingGEPs || (!AddrSinkUsingGEPs.getNumOccurrences() &&
+                                    SubtargetInfo->addrSinkUsingGEPs())) {
+     // By default, we use the GEP-based method when AA is used later. This
+     // prevents new inttoptr/ptrtoint pairs from degrading AA capabilities.
+     LLVM_DEBUG(dbgs() << "CGP: SINKING nonlocal addrmode: " << AddrMode
+                       << " for " << *MemoryInst << "\n");
+-    Type *IntPtrTy = DL->getIntPtrType(Addr->getType());
+     Value *ResultPtr = nullptr, *ResultIndex = nullptr;
+ 
+     // First, find the pointer.
+@@ -5364,8 +5375,19 @@ bool CodeGenPrepare::optimizeMemoryInst(Instruction *MemoryInst, Value *Addr,
+                 : Builder.CreateGEP(I8Ty, ResultPtr, ResultIndex, "sunkaddr");
+       }
+ 
+-      if (SunkAddr->getType() != Addr->getType())
+-        SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++      if (SunkAddr->getType() != Addr->getType()) {
++        // Even though we only considered no-op addrspacecasts,
++        // semantically-meaningful conversions may still be present due to
++        // ptrtoint/inttoptr sequences.
++        if (SunkAddr->getType()->getPointerAddressSpace() !=
++                Addr->getType()->getPointerAddressSpace() &&
++            !DL->isNonIntegralPointerType(Addr->getType())) {
++          SunkAddr = Builder.CreatePtrToInt(SunkAddr, IntPtrTy, "sunkaddr");
++          SunkAddr =
++              Builder.CreateIntToPtr(SunkAddr, Addr->getType(), "sunkaddr");
++        } else
++          SunkAddr = Builder.CreatePointerCast(SunkAddr, Addr->getType());
++      }
+     }
+   } else {
+     // We'd require a ptrtoint/inttoptr down the line, which we can't do for
+diff --git a/llvm/test/Transforms/CodeGenPrepare/NVPTX/dont-introduce-addrspacecast.ll b/llvm/test/Transforms/CodeGenPrepare/NVPTX/dont-introduce-addrspacecast.ll
+new file mode 100644
+index 0000000000000..39e50241c9cc6
+--- /dev/null
++++ b/llvm/test/Transforms/CodeGenPrepare/NVPTX/dont-introduce-addrspacecast.ll
+@@ -0,0 +1,43 @@
++; RUN: opt -S -codegenprepare < %s | FileCheck %s
++
++target datalayout = "e-i64:64-v16:16-v32:32-n16:32:64"
++target triple = "nvptx64-nvidia-cuda"
++
++
++; ptrtoint/inttoptr combinations can introduce semantically-meaningful address space casts
++; which we can't sink into an addrspacecast
++
++; CHECK-LABEL: @test
++define void @test(i8* %input_ptr) {
++  ; CHECK-LABEL: l1:
++  ; CHECK-NOT: addrspacecast
++  %intptr = ptrtoint i8* %input_ptr to i64
++  %ptr = inttoptr i64 %intptr to i32 addrspace(3)*
++
++  br label %l1
++l1:
++
++  store atomic i32 1, i32 addrspace(3)* %ptr unordered, align 4
++  ret void
++}
++
++
++; we still should be able to look through multiple sequences of inttoptr/ptrtoint
++
++; CHECK-LABEL: @test2
++define void @test2(i8* %input_ptr) {
++  ; CHECK-LABEL: l2:
++  ; CHECK: bitcast
++  ; CHECK-NEXT: store
++  %intptr = ptrtoint i8* %input_ptr to i64
++  %ptr = inttoptr i64 %intptr to i32 addrspace(3)*
++
++  %intptr2 = ptrtoint i32 addrspace(3)* %ptr to i64
++  %ptr2 = inttoptr i64 %intptr2 to i32*
++
++  br label %l2
++l2:
++
++  store atomic i32 1, i32* %ptr2 unordered, align 4
++  ret void
++}
+
+From 6411a50404a270fec597f3208167d6c8d4d96abe Mon Sep 17 00:00:00 2001
+From: Jameson Nash <vtjnash@gmail.com>
+Date: Tue, 15 Dec 2020 10:04:08 -0500
+Subject: [PATCH 05/18] GlobalISel: remove assert that memcpy Src and Dst
+ addrspace must be identical
+
+The LangRef does not require these arguments to have the same type.
+
+Differential Revision: https://reviews.llvm.org/D93154
+
+(cherry picked from commit fe53a18840ca5668044a56f536a1669fb684b2d2)
+---
+ .../lib/CodeGen/GlobalISel/CombinerHelper.cpp | 27 +++++++++++--------
+ 1 file changed, 16 insertions(+), 11 deletions(-)
+
+diff --git a/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp b/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp
+index 06d827de2e96b..5acbebf0889b2 100644
+--- a/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp
++++ b/llvm/lib/CodeGen/GlobalISel/CombinerHelper.cpp
+@@ -1430,7 +1430,6 @@ bool CombinerHelper::optimizeMemcpy(MachineInstr &MI, Register Dst,
+   // of that value loaded. This can result in a sequence of loads and stores
+   // mixed types, depending on what the target specifies as good types to use.
+   unsigned CurrOffset = 0;
+-  LLT PtrTy = MRI.getType(Src);
+   unsigned Size = KnownLen;
+   for (auto CopyTy : MemOps) {
+     // Issuing an unaligned load / store pair  that overlaps with the previous
+@@ -1448,15 +1447,20 @@ bool CombinerHelper::optimizeMemcpy(MachineInstr &MI, Register Dst,
+     Register LoadPtr = Src;
+     Register Offset;
+     if (CurrOffset != 0) {
+-      Offset = MIB.buildConstant(LLT::scalar(PtrTy.getSizeInBits()), CurrOffset)
+-                   .getReg(0);
+-      LoadPtr = MIB.buildPtrAdd(PtrTy, Src, Offset).getReg(0);
++      LLT LoadTy = MRI.getType(Src);
++      Offset =
++          MIB.buildConstant(LLT::scalar(LoadTy.getSizeInBits()), CurrOffset)
++              .getReg(0);
++      LoadPtr = MIB.buildPtrAdd(LoadTy, Src, Offset).getReg(0);
+     }
+     auto LdVal = MIB.buildLoad(CopyTy, LoadPtr, *LoadMMO);
+ 
+     // Create the store.
+-    Register StorePtr =
+-        CurrOffset == 0 ? Dst : MIB.buildPtrAdd(PtrTy, Dst, Offset).getReg(0);
++    Register StorePtr = Dst;
++    if (CurrOffset != 0) {
++      LLT StoreTy = MRI.getType(Dst);
++      StorePtr = MIB.buildPtrAdd(StoreTy, Dst, Offset).getReg(0);
++    }
+     MIB.buildStore(LdVal, StorePtr, *StoreMMO);
+     CurrOffset += CopyTy.getSizeInBytes();
+     Size -= CopyTy.getSizeInBytes();
+@@ -1533,7 +1537,6 @@ bool CombinerHelper::optimizeMemmove(MachineInstr &MI, Register Dst,
+   // Apart from that, this loop is pretty much doing the same thing as the
+   // memcpy codegen function.
+   unsigned CurrOffset = 0;
+-  LLT PtrTy = MRI.getType(Src);
+   SmallVector<Register, 16> LoadVals;
+   for (auto CopyTy : MemOps) {
+     // Construct MMO for the load.
+@@ -1543,9 +1546,10 @@ bool CombinerHelper::optimizeMemmove(MachineInstr &MI, Register Dst,
+     // Create the load.
+     Register LoadPtr = Src;
+     if (CurrOffset != 0) {
++      LLT LoadTy = MRI.getType(Src);
+       auto Offset =
+-          MIB.buildConstant(LLT::scalar(PtrTy.getSizeInBits()), CurrOffset);
+-      LoadPtr = MIB.buildPtrAdd(PtrTy, Src, Offset).getReg(0);
++          MIB.buildConstant(LLT::scalar(LoadTy.getSizeInBits()), CurrOffset);
++      LoadPtr = MIB.buildPtrAdd(LoadTy, Src, Offset).getReg(0);
+     }
+     LoadVals.push_back(MIB.buildLoad(CopyTy, LoadPtr, *LoadMMO).getReg(0));
+     CurrOffset += CopyTy.getSizeInBytes();
+@@ -1560,9 +1564,10 @@ bool CombinerHelper::optimizeMemmove(MachineInstr &MI, Register Dst,
+ 
+     Register StorePtr = Dst;
+     if (CurrOffset != 0) {
++      LLT StoreTy = MRI.getType(Dst);
+       auto Offset =
+-          MIB.buildConstant(LLT::scalar(PtrTy.getSizeInBits()), CurrOffset);
+-      StorePtr = MIB.buildPtrAdd(PtrTy, Dst, Offset).getReg(0);
++          MIB.buildConstant(LLT::scalar(StoreTy.getSizeInBits()), CurrOffset);
++      StorePtr = MIB.buildPtrAdd(StoreTy, Dst, Offset).getReg(0);
+     }
+     MIB.buildStore(LoadVals[I], StorePtr, *StoreMMO);
+     CurrOffset += CopyTy.getSizeInBytes();
+
+From aaf2d2763f878f73770ccfdaf40f77a565b24a73 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sat, 16 Jan 2021 17:36:09 -0500
+Subject: [PATCH 06/18] Don't merge icmps derived from pointers with
+ addressspaces
+
+IIUC we can't emit `memcmp` between pointers in addressspaces,
+doing so will trigger an assertion since the signature of the memcmp
+will not match it's arguments (https://bugs.llvm.org/show_bug.cgi?id=48661).
+
+This PR disables the attempt to merge icmps,
+when the pointer is in an addressspace.
+
+Differential Revision: https://reviews.llvm.org/D94813
+
+(cherry picked from commit 458b259600f7efd82387eb7c4e09bdcee328106b)
+---
+ .../Transforms/MergeICmps/addressspaces.ll    | 67 +++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+ create mode 100644 llvm/test/Transforms/MergeICmps/addressspaces.ll
+
+diff --git a/llvm/test/Transforms/MergeICmps/addressspaces.ll b/llvm/test/Transforms/MergeICmps/addressspaces.ll
+new file mode 100644
+index 0000000000000..9a74b4a5b2ca4
+--- /dev/null
++++ b/llvm/test/Transforms/MergeICmps/addressspaces.ll
+@@ -0,0 +1,67 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
++; RUN: opt < %s -mergeicmps -S | FileCheck %s
++
++source_filename = "=="
++target datalayout = "e-m:e-i64:64-n32:64"
++target triple = "powerpc64le-unknown-linux-gnu"
++
++define void @juliaAS([2 x [5 x i64]] addrspace(11)* nocapture nonnull readonly align 8 dereferenceable(80) %0, [2 x [5 x i64]] addrspace(11)* nocapture nonnull readonly align 8 dereferenceable(80) %1) {
++; CHECK-LABEL: @juliaAS(
++; CHECK-NEXT:  top:
++; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0:%.*]], i64 0, i64 1, i64 2
++; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0]], i64 0, i64 1, i64 3
++; CHECK-NEXT:    [[TMP4:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0]], i64 0, i64 1, i64 4
++; CHECK-NEXT:    [[TMP5:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1:%.*]], i64 0, i64 1, i64 2
++; CHECK-NEXT:    [[TMP6:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1]], i64 0, i64 1, i64 3
++; CHECK-NEXT:    [[TMP7:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1]], i64 0, i64 1, i64 4
++; CHECK-NEXT:    [[TMP8:%.*]] = load i64, i64 addrspace(11)* [[TMP2]], align 8
++; CHECK-NEXT:    [[TMP9:%.*]] = load i64, i64 addrspace(11)* [[TMP5]], align 8
++; CHECK-NEXT:    [[DOTNOT17:%.*]] = icmp eq i64 [[TMP8]], [[TMP9]]
++; CHECK-NEXT:    br i1 [[DOTNOT17]], label [[L70:%.*]], label [[L90:%.*]]
++; CHECK:       L70:
++; CHECK-NEXT:    [[TMP10:%.*]] = load i64, i64 addrspace(11)* [[TMP3]], align 8
++; CHECK-NEXT:    [[TMP11:%.*]] = load i64, i64 addrspace(11)* [[TMP6]], align 8
++; CHECK-NEXT:    [[DOTNOT18:%.*]] = icmp eq i64 [[TMP10]], [[TMP11]]
++; CHECK-NEXT:    br i1 [[DOTNOT18]], label [[L74:%.*]], label [[L90]]
++; CHECK:       L74:
++; CHECK-NEXT:    [[TMP12:%.*]] = load i64, i64 addrspace(11)* [[TMP4]], align 8
++; CHECK-NEXT:    [[TMP13:%.*]] = load i64, i64 addrspace(11)* [[TMP7]], align 8
++; CHECK-NEXT:    [[DOTNOT19:%.*]] = icmp eq i64 [[TMP12]], [[TMP13]]
++; CHECK-NEXT:    br label [[L90]]
++; CHECK:       L90:
++; CHECK-NEXT:    [[VALUE_PHI2_OFF0:%.*]] = phi i1 [ false, [[TOP:%.*]] ], [ [[DOTNOT19]], [[L74]] ], [ false, [[L70]] ]
++; CHECK-NEXT:    ret void
++;
++top:
++  %2 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 2
++  %3 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 3
++  %4 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 4
++  %5 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 2
++  %6 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 3
++  %7 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 4
++  %8 = load i64, i64 addrspace(11)* %2, align 8
++  %9 = load i64, i64 addrspace(11)* %5, align 8
++  %.not17 = icmp eq i64 %8, %9
++  br i1 %.not17, label %L70, label %L90
++
++L70:                                              ; preds = %top
++  %10 = load i64, i64 addrspace(11)* %3, align 8
++  %11 = load i64, i64 addrspace(11)* %6, align 8
++  %.not18 = icmp eq i64 %10, %11
++  br i1 %.not18, label %L74, label %L90
++
++L74:                                              ; preds = %L70
++  %12 = load i64, i64 addrspace(11)* %4, align 8
++  %13 = load i64, i64 addrspace(11)* %7, align 8
++  %.not19 = icmp eq i64 %12, %13
++  br label %L90
++
++L90:                                              ; preds = %L74, %L70, %top
++  %value_phi2.off0 = phi i1 [ false, %top ], [ %.not19, %L74 ], [ false, %L70 ]
++  ret void
++}
++
++!llvm.module.flags = !{!0}
++
++!0 = !{i32 1, !"Debug Info Version", i32 3}
++
+
+From 7627d618e0e62cdb6d9394d37198dab2a02252f1 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Mon, 1 Mar 2021 16:42:05 -0500
+Subject: [PATCH 07/18] AArch64: Remove Bad optimization
+
+Removes the code responsible for causing https://bugs.llvm.org/show_bug.cgi?id=49357.
+A fix is in progress upstream, but I don't think it's easy, so this
+fixes the bug in the meantime. The optimization it does is minor.
+
+(cherry picked from commit e4f1085c5c04e106e5a7ee72c9f4dfe1dccb7b94)
+---
+ llvm/lib/Target/AArch64/AArch64FastISel.cpp | 17 -----------------
+ 1 file changed, 17 deletions(-)
+
+diff --git a/llvm/lib/Target/AArch64/AArch64FastISel.cpp b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+index 9acda17b816ff..0d80860b5e775 100644
+--- a/llvm/lib/Target/AArch64/AArch64FastISel.cpp
++++ b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+@@ -4496,23 +4496,6 @@ bool AArch64FastISel::selectIntExt(const Instruction *I) {
+ 
+   // Try to optimize already sign-/zero-extended values from function arguments.
+   bool IsZExt = isa<ZExtInst>(I);
+-  if (const auto *Arg = dyn_cast<Argument>(I->getOperand(0))) {
+-    if ((IsZExt && Arg->hasZExtAttr()) || (!IsZExt && Arg->hasSExtAttr())) {
+-      if (RetVT == MVT::i64 && SrcVT != MVT::i64) {
+-        unsigned ResultReg = createResultReg(&AArch64::GPR64RegClass);
+-        BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
+-                TII.get(AArch64::SUBREG_TO_REG), ResultReg)
+-            .addImm(0)
+-            .addReg(SrcReg)
+-            .addImm(AArch64::sub_32);
+-        SrcReg = ResultReg;
+-      }
+-
+-      updateValueMap(I, SrcReg);
+-      return true;
+-    }
+-  }
+-
+   unsigned ResultReg = emitIntExt(SrcVT, SrcReg, RetVT, IsZExt);
+   if (!ResultReg)
+     return false;
+
+From 04c32136a55b05b358f4c156467484e1ff9ca5f6 Mon Sep 17 00:00:00 2001
+From: Jameson Nash <vtjnash@gmail.com>
+Date: Thu, 22 Jul 2021 19:42:23 -0400
+Subject: [PATCH 08/18] Bad SLPVectorization shufflevector replacement,
+ resulting in write to wrong memory location
+
+We see that it might otherwise do:
+
+  %10 = getelementptr {}**, <2 x {}***> %9, <2 x i32> <i32 10, i32 4>
+  %11 = bitcast <2 x {}***> %10 to <2 x i64*>
+...
+  %27 = extractelement <2 x i64*> %11, i32 0
+  %28 = bitcast i64* %27 to <2 x i64>*
+  store <2 x i64> %22, <2 x i64>* %28, align 4, !tbaa !2
+
+Which is an out-of-bounds store (the extractelement got offset 10
+instead of offset 4 as intended). With the fix, we correctly generate
+extractelement for i32 1 and generate correct code.
+
+Differential Revision: https://reviews.llvm.org/D106613
+
+(cherry picked from commit 980d2f60a8524c5546397db9e8bbb7d6ea56c1b7)
+---
+ .../Transforms/SLPVectorizer/X86/extract_in_tree_user.ll    | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/test/Transforms/SLPVectorizer/X86/extract_in_tree_user.ll b/llvm/test/Transforms/SLPVectorizer/X86/extract_in_tree_user.ll
+index cbf6d8ff4fa95..38b2b97a23cd0 100644
+--- a/llvm/test/Transforms/SLPVectorizer/X86/extract_in_tree_user.ll
++++ b/llvm/test/Transforms/SLPVectorizer/X86/extract_in_tree_user.ll
+@@ -111,9 +111,9 @@ define void @externally_used_ptrs() {
+ ; CHECK-NEXT:    [[TMP5:%.*]] = extractelement <2 x i64*> [[TMP3]], i32 1
+ ; CHECK-NEXT:    [[TMP6:%.*]] = bitcast i64* [[TMP5]] to <2 x i64>*
+ ; CHECK-NEXT:    [[TMP7:%.*]] = load <2 x i64>, <2 x i64>* [[TMP6]], align 8
+-; CHECK-NEXT:    [[TMP9:%.*]] = add <2 x i64> [[TMP4]], [[TMP7]]
+-; CHECK-NEXT:    [[TMP10:%.*]] = bitcast i64* [[TMP5]] to <2 x i64>*
+-; CHECK-NEXT:    store <2 x i64> [[TMP9]], <2 x i64>* [[TMP10]], align 8
++; CHECK-NEXT:    [[TMP8:%.*]] = add <2 x i64> [[TMP4]], [[TMP7]]
++; CHECK-NEXT:    [[TMP9:%.*]] = bitcast i64* [[TMP5]] to <2 x i64>*
++; CHECK-NEXT:    store <2 x i64> [[TMP8]], <2 x i64>* [[TMP9]], align 8
+ ; CHECK-NEXT:    ret void
+ ;
+ entry:
+
+From 5d1831118fa8356b1dbeedad4dc48cda35bb5bae Mon Sep 17 00:00:00 2001
+From: Jameson Nash <vtjnash@gmail.com>
+Date: Sat, 9 Oct 2021 15:38:30 -0400
+Subject: [PATCH 09/18] enable plugins for clang-tidy
+
+Fixes https://bugs.llvm.org//show_bug.cgi?id=32739, so pinging people who previously discussed that issue. This takes advantage of the existing plugin capabilities of llvm to add support for `-load` simply by requesting adding the header file to request it. I've tested out-of-tree something of this form (leaving out a few details of the check logic itself), and confirmed that it seems to load and get called with this patch:
+
+```
+#include "clang/AST/ASTContext.h"
+#include "clang/ASTMatchers/ASTMatchFinder.h"
+#include "clang-tidy/ClangTidy.h"
+#include "clang-tidy/ClangTidyCheck.h"
+#include "clang-tidy/ClangTidyModule.h"
+#include "clang-tidy/ClangTidyModuleRegistry.h"
+
+using namespace clang;
+using namespace clang::tidy;
+using namespace clang::ast_matchers;
+
+class MyTestCheck : public ClangTidyCheck;
+
+namespace {
+class CTTestModule : public ClangTidyModule {
+public:
+  void addCheckFactories(ClangTidyCheckFactories &CheckFactories) override {
+    CheckFactories.registerCheck<MyTestCheck>("mytest");
+  }
+};
+} // namespace
+
+namespace clang {
+namespace tidy {
+
+// Register the CTTestTidyModule using this statically initialized variable.
+static ClangTidyModuleRegistry::Add<::CTTestModule>
+    X("mytest-module", "Adds my checks.");
+
+// This anchor is used to force the linker to link in the generated object file
+// and thus register the CTTestModule.
+volatile int CTTestModuleAnchorSource = 0;
+
+} // namespace tidy
+} // namespace clang
+```
+```
+$ ./bin/clang-tidy --checks=-*,mytest -list-checks -load mytestcheckplugin.so
+Enabled checks:
+    mytest
+```
+
+Differential Revision: https://reviews.llvm.org/D111100
+---
+ clang-tools-extra/clang-tidy/tool/CMakeLists.txt    | 13 +++++++++++--
+ clang-tools-extra/clang-tidy/tool/ClangTidyMain.cpp |  1 +
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/clang-tools-extra/clang-tidy/tool/CMakeLists.txt b/clang-tools-extra/clang-tidy/tool/CMakeLists.txt
+index ad3255b024fc6..8a91e0a9617b6 100644
+--- a/clang-tools-extra/clang-tidy/tool/CMakeLists.txt
++++ b/clang-tools-extra/clang-tidy/tool/CMakeLists.txt
+@@ -29,11 +29,17 @@ clang_target_link_libraries(clangTidyMain
+   clangToolingCore
+   )
+ 
++# Support plugins.
++if(CLANG_PLUGIN_SUPPORT)
++  set(support_plugins SUPPORT_PLUGINS)
++endif()
++
+ add_clang_tool(clang-tidy
+   ClangTidyToolMain.cpp
+-  )
+-add_dependencies(clang-tidy
++
++  DEPENDS
+   clang-resource-headers
++  ${support_plugins}
+   )
+ clang_target_link_libraries(clang-tidy
+   PRIVATE
+@@ -50,6 +56,9 @@ target_link_libraries(clang-tidy
+   ${ALL_CLANG_TIDY_CHECKS}
+   )
+ 
++if(CLANG_PLUGIN_SUPPORT)
++  export_executable_symbols_for_plugins(clang-tidy)
++endif()
+ 
+ install(PROGRAMS clang-tidy-diff.py
+   DESTINATION share/clang
+diff --git a/clang-tools-extra/clang-tidy/tool/ClangTidyMain.cpp b/clang-tools-extra/clang-tidy/tool/ClangTidyMain.cpp
+index 6147d90eb10b9..f98a49cda8236 100644
+--- a/clang-tools-extra/clang-tidy/tool/ClangTidyMain.cpp
++++ b/clang-tools-extra/clang-tidy/tool/ClangTidyMain.cpp
+@@ -20,6 +20,7 @@
+ #include "../GlobList.h"
+ #include "clang/Tooling/CommonOptionsParser.h"
+ #include "llvm/Support/InitLLVM.h"
++#include "llvm/Support/PluginLoader.h"
+ #include "llvm/Support/Process.h"
+ #include "llvm/Support/Signals.h"
+ #include "llvm/Support/TargetSelect.h"
+
+From 0c425ad741178a06d8e484f8ff1c1cfe35c9deb2 Mon Sep 17 00:00:00 2001
+From: Jameson Nash <vtjnash@gmail.com>
+Date: Tue, 30 Nov 2021 14:59:49 -0500
+Subject: [PATCH 10/18] AArch64 GIsel: legalize lshr operands, even if it is
+ poison
+
+Previously, this caused GlobalISel to emit invalid IR (a gpr32 to gpr64
+copy) and fail during verification.
+
+While this shift is not defined (returns poison), it should not crash
+codegen, as it may appear inside dead code (for example, a select
+instruction), and it is legal IR input, as long as the value is unused.
+
+Discovered while trying to build Julia with LLVM v13:
+https://github.com/JuliaLang/julia/pull/42602.
+
+Reviewed By: aemerson
+
+Differential Revision: https://reviews.llvm.org/D114389
+
+(cherry picked from commit 18308e171b5b1dd99627a4d88c7d6c5ff21b8c96)
+---
+ .../GISel/AArch64InstructionSelector.cpp      | 51 ++++++++-----------
+ .../AArch64/GlobalISel/select-binop.mir       | 26 ++++++++++
+ .../GlobalISel/select-scalar-shift-imm.mir    | 44 ++++++++++++++++
+ 3 files changed, 92 insertions(+), 29 deletions(-)
+
+diff --git a/llvm/lib/Target/AArch64/GISel/AArch64InstructionSelector.cpp b/llvm/lib/Target/AArch64/GISel/AArch64InstructionSelector.cpp
+index a17bd1b14f412..b5938e25b17c1 100644
+--- a/llvm/lib/Target/AArch64/GISel/AArch64InstructionSelector.cpp
++++ b/llvm/lib/Target/AArch64/GISel/AArch64InstructionSelector.cpp
+@@ -1908,35 +1908,6 @@ bool AArch64InstructionSelector::preISelLower(MachineInstr &I) {
+   MachineRegisterInfo &MRI = MF.getRegInfo();
+ 
+   switch (I.getOpcode()) {
+-  case TargetOpcode::G_SHL:
+-  case TargetOpcode::G_ASHR:
+-  case TargetOpcode::G_LSHR: {
+-    // These shifts are legalized to have 64 bit shift amounts because we want
+-    // to take advantage of the existing imported selection patterns that assume
+-    // the immediates are s64s. However, if the shifted type is 32 bits and for
+-    // some reason we receive input GMIR that has an s64 shift amount that's not
+-    // a G_CONSTANT, insert a truncate so that we can still select the s32
+-    // register-register variant.
+-    Register SrcReg = I.getOperand(1).getReg();
+-    Register ShiftReg = I.getOperand(2).getReg();
+-    const LLT ShiftTy = MRI.getType(ShiftReg);
+-    const LLT SrcTy = MRI.getType(SrcReg);
+-    if (SrcTy.isVector())
+-      return false;
+-    assert(!ShiftTy.isVector() && "unexpected vector shift ty");
+-    if (SrcTy.getSizeInBits() != 32 || ShiftTy.getSizeInBits() != 64)
+-      return false;
+-    auto *AmtMI = MRI.getVRegDef(ShiftReg);
+-    assert(AmtMI && "could not find a vreg definition for shift amount");
+-    if (AmtMI->getOpcode() != TargetOpcode::G_CONSTANT) {
+-      // Insert a subregister copy to implement a 64->32 trunc
+-      auto Trunc = MIB.buildInstr(TargetOpcode::COPY, {SrcTy}, {})
+-                       .addReg(ShiftReg, 0, AArch64::sub_32);
+-      MRI.setRegBank(Trunc.getReg(0), RBI.getRegBank(AArch64::GPRRegBankID));
+-      I.getOperand(2).setReg(Trunc.getReg(0));
+-    }
+-    return true;
+-  }
+   case TargetOpcode::G_STORE: {
+     bool Changed = contractCrossBankCopyIntoStore(I, MRI);
+     MachineOperand &SrcOp = I.getOperand(0);
+@@ -2860,6 +2831,28 @@ bool AArch64InstructionSelector::select(MachineInstr &I) {
+     if (Opcode == TargetOpcode::G_SHL &&
+         MRI.getType(I.getOperand(0).getReg()).isVector())
+       return selectVectorSHL(I, MRI);
++
++    // These shifts were legalized to have 64 bit shift amounts because we
++    // want to take advantage of the selection patterns that assume the
++    // immediates are s64s, however, selectBinaryOp will assume both operands
++    // will have the same bit size.
++    {
++      Register SrcReg = I.getOperand(1).getReg();
++      Register ShiftReg = I.getOperand(2).getReg();
++      const LLT ShiftTy = MRI.getType(ShiftReg);
++      const LLT SrcTy = MRI.getType(SrcReg);
++      if (!SrcTy.isVector() && SrcTy.getSizeInBits() == 32 &&
++          ShiftTy.getSizeInBits() == 64) {
++        assert(!ShiftTy.isVector() && "unexpected vector shift ty");
++        auto *AmtMI = MRI.getVRegDef(ShiftReg);
++        assert(AmtMI && "could not find a vreg definition for shift amount");
++        // Insert a subregister copy to implement a 64->32 trunc
++        auto Trunc = MIB.buildInstr(TargetOpcode::COPY, {SrcTy}, {})
++                         .addReg(ShiftReg, 0, AArch64::sub_32);
++        MRI.setRegBank(Trunc.getReg(0), RBI.getRegBank(AArch64::GPRRegBankID));
++        I.getOperand(2).setReg(Trunc.getReg(0));
++      }
++    }
+     LLVM_FALLTHROUGH;
+   case TargetOpcode::G_FADD:
+   case TargetOpcode::G_FSUB:
+diff --git a/llvm/test/CodeGen/AArch64/GlobalISel/select-binop.mir b/llvm/test/CodeGen/AArch64/GlobalISel/select-binop.mir
+index da05ea0cea5a1..e56eb581ac601 100644
+--- a/llvm/test/CodeGen/AArch64/GlobalISel/select-binop.mir
++++ b/llvm/test/CodeGen/AArch64/GlobalISel/select-binop.mir
+@@ -491,6 +491,32 @@ body:             |
+     $w0 = COPY %2(s32)
+ ...
+ 
++---
++name:            shl_s32_64_gpr
++legalized:       true
++regBankSelected: true
++
++registers:
++  - { id: 0, class: gpr }
++  - { id: 1, class: gpr }
++  - { id: 2, class: gpr }
++
++body:             |
++  bb.0:
++    liveins: $w0, $x1
++
++    ; CHECK-LABEL: name: shl_s32_64_gpr
++    ; CHECK: [[COPY:%[0-9]+]]:gpr32 = COPY $w0
++    ; CHECK: [[COPY1:%[0-9]+]]:gpr64all = COPY $x1
++    ; CHECK: [[COPY2:%[0-9]+]]:gpr32 = COPY [[COPY1]].sub_32
++    ; CHECK: [[LSLVWr:%[0-9]+]]:gpr32 = LSLVWr [[COPY]], [[COPY2]]
++    ; CHECK: $w0 = COPY [[LSLVWr]]
++    %0(s32) = COPY $w0
++    %1(s64) = COPY $x1
++    %2(s32) = G_SHL %0, %1
++    $w0 = COPY %2(s32)
++...
++
+ ---
+ # Same as add_s64_gpr, for G_SHL operations.
+ name:            shl_s64_gpr
+diff --git a/llvm/test/CodeGen/AArch64/GlobalISel/select-scalar-shift-imm.mir b/llvm/test/CodeGen/AArch64/GlobalISel/select-scalar-shift-imm.mir
+index 76c3fd5bfdadf..f6a7f36fe704e 100644
+--- a/llvm/test/CodeGen/AArch64/GlobalISel/select-scalar-shift-imm.mir
++++ b/llvm/test/CodeGen/AArch64/GlobalISel/select-scalar-shift-imm.mir
+@@ -99,6 +99,50 @@ body:             |
+     $w0 = COPY %2(s32)
+     RET_ReallyLR implicit $w0
+ 
++...
++---
++name:            ashr_cimm_32_64
++legalized:       true
++regBankSelected: true
++body:             |
++  bb.1:
++    liveins: $w0
++
++    ; CHECK-LABEL: name: ashr_cimm_32_64
++    ; CHECK: [[COPY:%[0-9]+]]:gpr32 = COPY $w0
++    ; CHECK: [[MOVi64imm:%[0-9]+]]:gpr64 = MOVi64imm -8
++    ; CHECK: [[COPY1:%[0-9]+]]:gpr32 = COPY [[MOVi64imm]]
++    ; CHECK: [[ASRVWr:%[0-9]+]]:gpr32 = ASRVWr [[COPY]], [[COPY1]]
++    ; CHECK: $w0 = COPY [[ASRVWr]]
++    ; CHECK: RET_ReallyLR implicit $w0
++    %0:gpr(s32) = COPY $w0
++    %3:gpr(s64) = G_CONSTANT i64 -8
++    %2:gpr(s32) = G_ASHR %0, %3(s64)
++    $w0 = COPY %2(s32)
++    RET_ReallyLR implicit $w0
++
++...
++---
++name:            lshr_cimm_32_64
++legalized:       true
++regBankSelected: true
++body:             |
++  bb.1:
++    liveins: $w0
++
++    ; CHECK-LABEL: name: lshr_cimm_32_64
++    ; CHECK: [[COPY:%[0-9]+]]:gpr32 = COPY $w0
++    ; CHECK: [[MOVi64imm:%[0-9]+]]:gpr64 = MOVi64imm -8
++    ; CHECK: [[COPY1:%[0-9]+]]:gpr32 = COPY [[MOVi64imm]]
++    ; CHECK: [[LSRVWr:%[0-9]+]]:gpr32 = LSRVWr [[COPY]], [[COPY1]]
++    ; CHECK: $w0 = COPY [[LSRVWr]]
++    ; CHECK: RET_ReallyLR implicit $w0
++    %0:gpr(s32) = COPY $w0
++    %3:gpr(s64) = G_CONSTANT i64 -8
++    %2:gpr(s32) = G_LSHR %0, %3(s64)
++    $w0 = COPY %2(s32)
++    RET_ReallyLR implicit $w0
++
+ ...
+ ---
+ name:            ashr_cimm_64
+
+From 42d932f46c9f6b317114e79e5fe9f2c4ca16769c Mon Sep 17 00:00:00 2001
+From: Cody Tapscott <cody+github@tapscott.me>
+Date: Mon, 24 May 2021 16:36:06 -0700
+Subject: [PATCH 11/18] Force `.eh_frame` emission on AArch64
+
+We need to force the emission of the EH Frame section (currently done via SupportsCompactUnwindWithoutEHFrame in the MCObjectFileInfo for the target), since libunwind doesn't yet support dynamically registering compact unwind information at run-time.
+
+(cherry picked from commit 60e041894288848e37870c42749a1aabcc2c2274)
+---
+ llvm/lib/MC/MCObjectFileInfo.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/lib/MC/MCObjectFileInfo.cpp b/llvm/lib/MC/MCObjectFileInfo.cpp
+index 7ea1106068b74..cf79bb2baf09c 100644
+--- a/llvm/lib/MC/MCObjectFileInfo.cpp
++++ b/llvm/lib/MC/MCObjectFileInfo.cpp
+@@ -58,9 +58,10 @@ void MCObjectFileInfo::initMachOMCObjectFileInfo(const Triple &T) {
+           MachO::S_ATTR_STRIP_STATIC_SYMS | MachO::S_ATTR_LIVE_SUPPORT,
+       SectionKind::getReadOnly());
+ 
+-  if (T.isOSDarwin() &&
+-      (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32))
+-    SupportsCompactUnwindWithoutEHFrame = true;
++  // Disabled for now, since we need to emit EH Frames for stack unwinding in the JIT
++  // if (T.isOSDarwin() &&
++  //     (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32))
++  //   SupportsCompactUnwindWithoutEHFrame = true;
+ 
+   if (T.isWatchABI())
+     OmitDwarfIfHaveCompactUnwind = true;
+
+From 593820ddbdafc310729fe7b8595c42bc3a1ee82a Mon Sep 17 00:00:00 2001
+From: Lang Hames <lhames@gmail.com>
+Date: Tue, 26 Oct 2021 18:32:06 -0700
+Subject: [PATCH 12/18] [JITLink] Fix element-present check in
+ MachOLinkGraphParser.
+
+Not all symbols are added to the index-to-symbol map, so we shouldn't use the
+size of the map as a proxy for the highest valid index.
+
+(cherry-picked from 91434d44699642075378c888bf61715ff2d9e23f)
+---
+ llvm/lib/ExecutionEngine/JITLink/MachOLinkGraphBuilder.h | 9 ++++-----
+ 1 file changed, 4 insertions(+), 5 deletions(-)
+
+diff --git a/llvm/lib/ExecutionEngine/JITLink/MachOLinkGraphBuilder.h b/llvm/lib/ExecutionEngine/JITLink/MachOLinkGraphBuilder.h
+index 90b14c44ff8a8..33fa84821ceba 100644
+--- a/llvm/lib/ExecutionEngine/JITLink/MachOLinkGraphBuilder.h
++++ b/llvm/lib/ExecutionEngine/JITLink/MachOLinkGraphBuilder.h
+@@ -125,13 +125,12 @@ class MachOLinkGraphBuilder {
+   /// given index is out of range, or if no symbol has been added for the given
+   /// index.
+   Expected<NormalizedSymbol &> findSymbolByIndex(uint64_t Index) {
+-    if (Index >= IndexToSymbol.size())
+-      return make_error<JITLinkError>("Symbol index out of range");
+-    auto *Sym = IndexToSymbol[Index];
+-    if (!Sym)
++    auto I = IndexToSymbol.find(Index);
++    if (I == IndexToSymbol.end())
+       return make_error<JITLinkError>("No symbol at index " +
+                                       formatv("{0:d}", Index));
+-    return *Sym;
++    assert(I->second && "Null symbol at index");
++    return *I->second;
+   }
+ 
+   /// Returns the symbol with the highest address not greater than the search
+
+From d45bcc00529ec9fc74db49e88c934e255afee17a Mon Sep 17 00:00:00 2001
+From: David Nadlinger <code@klickverbot.at>
+Date: Thu, 30 Dec 2021 04:23:23 +0100
+Subject: [PATCH 13/18] [JITLink] Also include EHFrame* passes on MachO_arm64
+
+Without the non-compact unwind info there is no way to register
+the EH frames with libunwind (e.g. for backtrace generation).
+---
+ llvm/lib/ExecutionEngine/JITLink/MachO_arm64.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/llvm/lib/ExecutionEngine/JITLink/MachO_arm64.cpp b/llvm/lib/ExecutionEngine/JITLink/MachO_arm64.cpp
+index 169e20a1d1d32..06bd1d3d0346c 100644
+--- a/llvm/lib/ExecutionEngine/JITLink/MachO_arm64.cpp
++++ b/llvm/lib/ExecutionEngine/JITLink/MachO_arm64.cpp
+@@ -683,6 +683,10 @@ void link_MachO_arm64(std::unique_ptr<LinkGraph> G,
+     else
+       Config.PrePrunePasses.push_back(markAllSymbolsLive);
+ 
++    Config.PrePrunePasses.push_back(EHFrameSplitter("__TEXT,__eh_frame"));
++    Config.PrePrunePasses.push_back(EHFrameEdgeFixer("__TEXT,__eh_frame",
++        8, Delta64, Delta32, NegDelta32));
++
+     // Add an in-place GOT/Stubs pass.
+     Config.PostPrunePasses.push_back(
+         PerGraphGOTAndPLTStubsBuilder_MachO_arm64::asPass);
+
+From a0defe021cee2076dc161eceeaab70297b386b91 Mon Sep 17 00:00:00 2001
+From: Julian P Samaroo <jpsamaroo@jpsamaroo.me>
+Date: Tue, 18 Jan 2022 13:32:28 -0600
+Subject: [PATCH 14/18] [LLD] Respect LLVM_TOOLS_INSTALL_DIR
+
+Co-authored-by: Valentin Churavy <v.churavy@gmail.com>
+Co-authored-by: Julian P Samaroo <jpsamaroo@jpsamaroo.me>
+---
+ lld/cmake/modules/AddLLD.cmake | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/lld/cmake/modules/AddLLD.cmake b/lld/cmake/modules/AddLLD.cmake
+index 9883475d1aa58..485b54f88bba6 100644
+--- a/lld/cmake/modules/AddLLD.cmake
++++ b/lld/cmake/modules/AddLLD.cmake
+@@ -19,7 +19,7 @@ macro(add_lld_library name)
+       ${export_to_lldtargets}
+       LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX}
+       ARCHIVE DESTINATION lib${LLVM_LIBDIR_SUFFIX}
+-      RUNTIME DESTINATION bin)
++      RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR})
+ 
+     if (${ARG_SHARED} AND NOT CMAKE_CONFIGURATION_TYPES)
+       add_llvm_install_targets(install-${name}
+@@ -46,7 +46,7 @@ macro(add_lld_tool name)
+     get_target_export_arg(${name} LLD export_to_lldtargets)
+     install(TARGETS ${name}
+       ${export_to_lldtargets}
+-      RUNTIME DESTINATION bin
++      RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
+       COMPONENT ${name})
+ 
+     if(NOT CMAKE_CONFIGURATION_TYPES)
+
+From 4743f8ded72e15f916fa1d4cc198bdfd7bfb2193 Mon Sep 17 00:00:00 2001
+From: Stephen Neuendorffer <stephen.neuendorffer@xilinx.com>
+Date: Mon, 31 Jan 2022 17:56:42 -0800
+Subject: [PATCH 15/18] [cmake][NFC] Configuration for libLLVM.so symbol
+ versioning
+
+Symbol versioning can prevent unintented install-time conflicts
+between different llvm versions.  Users may need to override this
+for particular products (e.g. Julia), but this requires carrying
+a source code patch.  This patch moves this ability to a
+configuration option.  NFC for existing usage.
+
+Differential Revision: https://reviews.llvm.org/D118672
+---
+ llvm/CMakeLists.txt                                | 5 +++++
+ llvm/tools/llvm-shlib/simple_version_script.map.in | 2 +-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/CMakeLists.txt b/llvm/CMakeLists.txt
+index 08daf53a5b724..19e100f6f493b 100644
+--- a/llvm/CMakeLists.txt
++++ b/llvm/CMakeLists.txt
+@@ -28,6 +28,11 @@ if (NOT PACKAGE_VERSION)
+     "${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}.${LLVM_VERSION_PATCH}${LLVM_VERSION_SUFFIX}")
+ endif()
+ 
++if(NOT DEFINED LLVM_SHLIB_SYMBOL_VERSION)
++  # "Symbol version prefix for libLLVM.so"
++  set(LLVM_SHLIB_SYMBOL_VERSION "LLVM_${LLVM_VERSION_MAJOR}")
++endif()
++
+ if ((CMAKE_GENERATOR MATCHES "Visual Studio") AND (CMAKE_GENERATOR_TOOLSET STREQUAL ""))
+   message(WARNING "Visual Studio generators use the x86 host compiler by "
+                   "default, even for 64-bit targets. This can result in linker "
+diff --git a/llvm/tools/llvm-shlib/simple_version_script.map.in b/llvm/tools/llvm-shlib/simple_version_script.map.in
+index d58a8b3abcd3f..cb2306d1f5968 100644
+--- a/llvm/tools/llvm-shlib/simple_version_script.map.in
++++ b/llvm/tools/llvm-shlib/simple_version_script.map.in
+@@ -1 +1 @@
+-LLVM_@LLVM_VERSION_MAJOR@ { global: *; };
++@LLVM_SHLIB_SYMBOL_VERSION@ { global: *; };
+
+From 814d51acf134d7c13b1cdb92a5da33dce450d9bc Mon Sep 17 00:00:00 2001
+From: Stephen Neuendorffer <stephen.neuendorffer@xilinx.com>
+Date: Sun, 9 Jan 2022 22:16:58 -0800
+Subject: [PATCH 16/18] Fix exported MLIR_TABLEGEN_EXE
+
+LLVM_OPTIMIZED_TABLEGEN results in MLIR_TABLEGEN_EXE pointing to
+an absolute path in the build directory.  This doesn't work
+when exporting to an install directory.  This patch fixes the exported
+information for an install directory to refer to the installed
+mlir-tblgen.  (Note that this is probably a debug version if
+LLVM_OPTIMIZED_TABLEGEN is set)
+
+(cherry picked from commit 3523876873b25bbb8225fed45e4db79e7d250a4f)
+---
+ mlir/cmake/modules/CMakeLists.txt      | 7 +++++++
+ mlir/cmake/modules/MLIRConfig.cmake.in | 2 +-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/mlir/cmake/modules/CMakeLists.txt b/mlir/cmake/modules/CMakeLists.txt
+index 65efc4a149874..9b088a9f1d025 100644
+--- a/mlir/cmake/modules/CMakeLists.txt
++++ b/mlir/cmake/modules/CMakeLists.txt
+@@ -26,6 +26,9 @@ set(MLIR_CONFIG_INCLUDE_DIRS
+   "${MLIR_SOURCE_DIR}/include"
+   "${MLIR_BINARY_DIR}/include"
+   )
++# Refer to the best host mlir-tbgen, which might be a host-optimized version
++set(MLIR_CONFIG_TABLEGEN_EXE "${MLIR_TABLEGEN_EXE}")
++
+ configure_file(
+   ${CMAKE_CURRENT_SOURCE_DIR}/MLIRConfig.cmake.in
+   ${mlir_cmake_builddir}/MLIRConfig.cmake
+@@ -60,6 +63,10 @@ get_config_exports_includes(MLIR MLIR_CONFIG_INCLUDE_EXPORTS)
+ set(MLIR_CONFIG_INCLUDE_DIRS
+   "\${MLIR_INSTALL_PREFIX}/include"
+   )
++# Ensure that we are using the installed mlir-tblgen. This might not be MLIR_TABLEGEN_EXE
++# if we're building with a host-optimized mlir-tblgen (with LLVM_OPTIMIZED_TABLEGEN).
++set(MLIR_CONFIG_TABLEGEN_EXE mlir-tblgen)
++
+ configure_file(
+   ${CMAKE_CURRENT_SOURCE_DIR}/MLIRConfig.cmake.in
+   ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/MLIRConfig.cmake
+diff --git a/mlir/cmake/modules/MLIRConfig.cmake.in b/mlir/cmake/modules/MLIRConfig.cmake.in
+index 2a71629567514..14024ef815ee8 100644
+--- a/mlir/cmake/modules/MLIRConfig.cmake.in
++++ b/mlir/cmake/modules/MLIRConfig.cmake.in
+@@ -8,7 +8,7 @@ find_package(LLVM REQUIRED CONFIG
+ set(MLIR_EXPORTED_TARGETS "@MLIR_EXPORTS@")
+ set(MLIR_CMAKE_DIR "@MLIR_CONFIG_CMAKE_DIR@")
+ set(MLIR_INCLUDE_DIRS "@MLIR_CONFIG_INCLUDE_DIRS@")
+-set(MLIR_TABLEGEN_EXE "@MLIR_TABLEGEN_EXE@")
++set(MLIR_TABLEGEN_EXE "@MLIR_CONFIG_TABLEGEN_EXE@")
+ 
+ # For mlir_tablegen()
+ set(MLIR_INCLUDE_DIR "@MLIR_INCLUDE_DIR@")
+
+From 5393efbd8a4c7555b9f9fdf185c486c6b05f0c19 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <kfischer@college.harvard.edu>
+Date: Sat, 30 Apr 2022 19:00:11 +0100
+Subject: [PATCH 17/18] Add support for unwinding during prologue/epilogue
+
+---
+ libunwind/src/CompactUnwinder.hpp | 156 ++++++++++++++++++++++++++++++
+ 1 file changed, 156 insertions(+)
+
+diff --git a/libunwind/src/CompactUnwinder.hpp b/libunwind/src/CompactUnwinder.hpp
+index 1c3175dff50a4..78a658ccbc279 100644
+--- a/libunwind/src/CompactUnwinder.hpp
++++ b/libunwind/src/CompactUnwinder.hpp
+@@ -310,6 +310,50 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingRBPFrame(
+   uint32_t savedRegistersLocations =
+       EXTRACT_BITS(compactEncoding, UNWIND_X86_64_RBP_FRAME_REGISTERS);
+ 
++  // If we have not stored EBP yet
++  if (functionStart == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp+8);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp));
++
++    return UNW_STEP_SUCCESS;
++  } else if (functionStart + 1 == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  // If we're about to return, we've already popped the base pointer
++  uint8_t b = addressSpace.get8(registers.getIP());
++
++  // This is a hack to detect VZEROUPPER but in between popq rbp and ret
++  // It's not pretty but it works
++  if (b == 0xC5) {
++    if ((b = addressSpace.get8(registers.getIP() + 1)) == 0xF8 &&
++        (b = addressSpace.get8(registers.getIP() + 2)) == 0x77)
++      b = addressSpace.get8(registers.getIP() + 3);
++    else
++      goto skip_ret;
++  }
++
++  if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++    uint64_t rbp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rbp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rbp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  skip_ret:
++
+   uint64_t savedRegisters = registers.getRBP() - 8 * savedRegistersOffset;
+   for (int i = 0; i < 5; ++i) {
+     switch (savedRegistersLocations & 0x7) {
+@@ -430,6 +474,118 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingFrameless(
+       }
+     }
+   }
++
++  // Note that the order of these registers is so that
++  // registersSaved[0] is the one that will be pushed onto the stack last.
++  // Thus, if we want to walk this from the top, we need to go in reverse.
++  assert(regCount <= 6);
++
++  // check whether we are still in the prologue
++  uint64_t curAddr = functionStart;
++  if (regCount > 0) {
++    for (int8_t i = (int8_t)(regCount) - 1; i >= 0; --i) {
++      if (registers.getIP() == curAddr) {
++        // None of the registers have been modified yet, so we don't need to reload them
++        framelessUnwind(addressSpace, registers.getSP() + 8 * (regCount - (uint64_t)(i + 1)), registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        assert(curAddr < registers.getIP());
++      }
++
++
++      // pushq %rbp and pushq %rbx is 1 byte. Everything else 2
++      if ((UNWIND_X86_64_REG_RBP == registersSaved[i]) ||
++          (UNWIND_X86_64_REG_RBX == registersSaved[i]))
++        curAddr += 1;
++      else
++        curAddr += 2;
++    }
++  }
++  if (registers.getIP() == curAddr) {
++    // None of the registers have been modified yet, so we don't need to reload them
++    framelessUnwind(addressSpace, registers.getSP() + 8*regCount, registers);
++    return UNW_STEP_SUCCESS;
++  } else {
++    assert(curAddr < registers.getIP());
++  }
++
++
++  // And now for the epilogue
++  {
++    uint8_t  i  = 0;
++    uint64_t p  = registers.getIP();
++    uint8_t  b  = 0;
++
++    while (true) {
++      b = addressSpace.get8(p++);
++      // This is a hack to detect VZEROUPPER but in between the popq's and ret
++      // It's not pretty but it works
++      if (b == 0xC5) {
++        if ((b = addressSpace.get8(p++)) == 0xF8 && (b = addressSpace.get8(p++)) == 0x77)
++          b = addressSpace.get8(p++);
++        else
++          break;
++      }
++      //  popq %rbx    popq %rbp
++      if (b == 0x5B || b == 0x5D) {
++        i++;
++      } else if (b == 0x41) {
++        b = addressSpace.get8(p++);
++        if (b == 0x5C || b == 0x5D || b == 0x5E || b == 0x5F)
++          i++;
++        else
++          break;
++      } else if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++        // i pop's haven't happened yet
++        uint64_t savedRegisters = registers.getSP() + 8 * i;
++        if (regCount > 0) {
++          for (int8_t j = (int8_t)(regCount) - 1; j >= (int8_t)(regCount) - i; --j) {
++            uint64_t addr = savedRegisters - 8 * (regCount - (uint64_t)(j));
++            switch (registersSaved[j]) {
++              case UNWIND_X86_64_REG_RBX:
++                registers.setRBX(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R12:
++                registers.setR12(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R13:
++                registers.setR13(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R14:
++                registers.setR14(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R15:
++                registers.setR15(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_RBP:
++                registers.setRBP(addressSpace.get64(addr));
++                break;
++              default:
++                _LIBUNWIND_DEBUG_LOG("bad register for frameless, encoding=%08X for "
++                             "function starting at 0x%llX",
++                              encoding, functionStart);
++                _LIBUNWIND_ABORT("invalid compact unwind encoding");
++            }
++          }
++        }
++        framelessUnwind(addressSpace, savedRegisters, registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        break;
++      }
++    }
++  }
++
++  /*
++   0x10fe2733a:  5b                             popq   %rbx
++   0x10fe2733b:  41 5c                          popq   %r12
++   0x10fe2733d:  41 5d                          popq   %r13
++   0x10fe2733f:  41 5e                          popq   %r14
++   0x10fe27341:  41 5f                          popq   %r15
++   0x10fe27343:  5d                             popq   %rbp
++   */
++
++
+   uint64_t savedRegisters = registers.getSP() + stackSize - 8 - 8 * regCount;
+   for (uint32_t i = 0; i < regCount; ++i) {
+     switch (registersSaved[i]) {
+
+From 2f4460bd46aa80d4fe0d80c3dabcb10379e8d61b Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Fri, 17 Jun 2022 13:49:53 -0400
+Subject: [PATCH 18/18] [PowerPC] Allow llvm.ppc.cfence to accept pointer types
+
+Backport https://reviews.llvm.org/D127554
+---
+ llvm/include/llvm/IR/IntrinsicsPowerPC.td     |  6 +-
+ llvm/test/CodeGen/PowerPC/issue55983.ll       | 66 +++++++++++++++++
+ .../AtomicExpand/PowerPC/issue55983.ll        | 71 +++++++++++++++++++
+ 3 files changed, 142 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/test/CodeGen/PowerPC/issue55983.ll
+ create mode 100644 llvm/test/Transforms/AtomicExpand/PowerPC/issue55983.ll
+
+diff --git a/llvm/include/llvm/IR/IntrinsicsPowerPC.td b/llvm/include/llvm/IR/IntrinsicsPowerPC.td
+index 92d3bdea37edf..5368214329a80 100644
+--- a/llvm/include/llvm/IR/IntrinsicsPowerPC.td
++++ b/llvm/include/llvm/IR/IntrinsicsPowerPC.td
+@@ -1427,7 +1427,11 @@ def int_ppc_tsuspend : GCCBuiltin<"__builtin_tsuspend">,
+ def int_ppc_ttest : GCCBuiltin<"__builtin_ttest">,
+       Intrinsic<[llvm_i64_ty], [], []>;
+ 
+-def int_ppc_cfence : Intrinsic<[], [llvm_anyint_ty], []>;
++// We currently use llvm.ppc.cfence in the context of atomic load which
++// in LLVM IR requires its type to be one of integer, pointer and
++// float point type. So llvm_any_ty here refers to type mentioned above.
++// Backend is supposed to lower these types to appropriate MVTs.
++def int_ppc_cfence : Intrinsic<[], [llvm_any_ty], []>;
+ 
+ // PowerPC set FPSCR Intrinsic Definitions.
+ def int_ppc_setrnd : GCCBuiltin<"__builtin_setrnd">,
+diff --git a/llvm/test/CodeGen/PowerPC/issue55983.ll b/llvm/test/CodeGen/PowerPC/issue55983.ll
+new file mode 100644
+index 0000000000000..7ebde001ada7f
+--- /dev/null
++++ b/llvm/test/CodeGen/PowerPC/issue55983.ll
+@@ -0,0 +1,66 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
++; RUN: llc -opaque-pointers -mtriple=powerpc64le-unknown-unknown < %s | FileCheck %s
++; RUN: llc -opaque-pointers -mtriple=powerpc64-unknown-unknown < %s | FileCheck %s
++
++define void @foo() #0 {
++; CHECK-LABEL: foo:
++; CHECK:       # %bb.0: # %bb0
++; CHECK-NEXT:    bc 12, 20, .LBB0_2
++; CHECK-NEXT:  # %bb.1: # %bb1
++; CHECK-NEXT:    ld 3, 0(3)
++; CHECK-NEXT:    cmpd 7, 3, 3
++; CHECK-NEXT:    bne- 7, .+4
++; CHECK-NEXT:    isync
++; CHECK-NEXT:  .LBB0_2: # %bb2
++bb0:
++  br i1 undef, label %bb1, label %bb2
++
++bb1:
++  %0 = load atomic {}*, {}** undef acquire, align 8
++  unreachable
++
++bb2:
++  unreachable
++}
++
++define void @bar() #0 {
++; CHECK-LABEL: bar:
++; CHECK:       # %bb.0: # %bb0
++; CHECK-NEXT:    bc 12, 20, .LBB1_2
++; CHECK-NEXT:  # %bb.1: # %bb1
++; CHECK-NEXT:    ld 3, 0(3)
++; CHECK-NEXT:    cmpd 7, 3, 3
++; CHECK-NEXT:    bne- 7, .+4
++; CHECK-NEXT:    isync
++; CHECK-NEXT:  .LBB1_2: # %bb2
++bb0:
++  br i1 undef, label %bb1, label %bb2
++
++bb1:
++  %0 = load atomic ptr, ptr undef acquire, align 8
++  unreachable
++
++bb2:
++  unreachable
++}
++
++define void @foobar() {
++; CHECK-LABEL: foobar:
++; CHECK:       # %bb.0: # %top
++; CHECK-NEXT:    bc 4, 20, .LBB2_2
++; CHECK-NEXT:  # %bb.1: # %err86
++; CHECK-NEXT:  .LBB2_2: # %pass9
++; CHECK-NEXT:    ld 3, 0(3)
++; CHECK-NEXT:    cmpd 7, 3, 3
++; CHECK-NEXT:    bne- 7, .+4
++; CHECK-NEXT:    isync
++top:
++  br i1 undef, label %err86, label %pass9
++
++pass9:                                            ; preds = %top
++  %0 = load atomic {} addrspace(10)*, {} addrspace(10)* addrspace(11)* undef acquire, align 8
++  unreachable
++
++err86:                                            ; preds = %top
++  unreachable
++}
+diff --git a/llvm/test/Transforms/AtomicExpand/PowerPC/issue55983.ll b/llvm/test/Transforms/AtomicExpand/PowerPC/issue55983.ll
+new file mode 100644
+index 0000000000000..50f222a2b7431
+--- /dev/null
++++ b/llvm/test/Transforms/AtomicExpand/PowerPC/issue55983.ll
+@@ -0,0 +1,71 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
++; RUN: opt -opaque-pointers -atomic-expand -S -mtriple=powerpc64le-unknown-unknown \
++; RUN:   %s | FileCheck %s
++; RUN: opt -opaque-pointers -atomic-expand -S -mtriple=powerpc64-unknown-unknown \
++; RUN:   %s | FileCheck %s
++
++define void @foo() #0 {
++; CHECK-LABEL: @foo(
++; CHECK-NEXT:  bb0:
++; CHECK-NEXT:    br i1 undef, label [[BB1:%.*]], label [[BB2:%.*]]
++; CHECK:       bb1:
++; CHECK-NEXT:    [[TMP0:%.*]] = load atomic ptr, ptr undef monotonic, align 8
++; CHECK-NEXT:    call void @llvm.ppc.cfence.p0(ptr [[TMP0]])
++; CHECK-NEXT:    unreachable
++; CHECK:       bb2:
++; CHECK-NEXT:    unreachable
++;
++bb0:
++  br i1 undef, label %bb1, label %bb2
++
++bb1:
++  %0 = load atomic {}*, {}** undef acquire, align 8
++  unreachable
++
++bb2:
++  unreachable
++}
++
++define void @bar() #0 {
++; CHECK-LABEL: @bar(
++; CHECK-NEXT:  bb0:
++; CHECK-NEXT:    br i1 undef, label [[BB1:%.*]], label [[BB2:%.*]]
++; CHECK:       bb1:
++; CHECK-NEXT:    [[TMP0:%.*]] = load atomic ptr, ptr undef monotonic, align 8
++; CHECK-NEXT:    call void @llvm.ppc.cfence.p0(ptr [[TMP0]])
++; CHECK-NEXT:    unreachable
++; CHECK:       bb2:
++; CHECK-NEXT:    unreachable
++;
++bb0:
++  br i1 undef, label %bb1, label %bb2
++
++bb1:
++  %0 = load atomic ptr, ptr undef acquire, align 8
++  unreachable
++
++bb2:
++  unreachable
++}
++
++define void @foobar() {
++; CHECK-LABEL: @foobar(
++; CHECK-NEXT:  top:
++; CHECK-NEXT:    br i1 undef, label [[ERR86:%.*]], label [[PASS9:%.*]]
++; CHECK:       pass9:
++; CHECK-NEXT:    [[TMP0:%.*]] = load atomic ptr addrspace(10), ptr addrspace(11) undef monotonic, align 8
++; CHECK-NEXT:    call void @llvm.ppc.cfence.p10(ptr addrspace(10) [[TMP0]])
++; CHECK-NEXT:    unreachable
++; CHECK:       err86:
++; CHECK-NEXT:    unreachable
++;
++top:
++  br i1 undef, label %err86, label %pass9
++
++pass9:                                            ; preds = %top
++  %0 = load atomic {} addrspace(10)*, {} addrspace(10)* addrspace(11)* undef acquire, align 8
++  unreachable
++
++err86:                                            ; preds = %top
++  unreachable
++}
