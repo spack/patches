@@ -1,0 +1,3926 @@
+From 6dda333befee1774d32e81dd554a07e2b07fb887 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Fri, 1 Oct 2021 19:45:59 -0400
+Subject: [PATCH 01/27] Revert "[MC] Always emit relocations for same-section
+ function references"
+
+This reverts commit 5a5ac65768d124d98a10e8520363a0a4be3f4e38.
+
+(cherry picked from commit ae2638d84b63af89ece7e30f39d435013ce42ee2)
+(cherry picked from commit 05848b6d4d8ccc212f3ba9d9f58af42f26983e2c)
+---
+ llvm/lib/MC/WinCOFFObjectWriter.cpp | 12 +++++-------
+ llvm/test/MC/COFF/diff.s            | 25 ++++++++-----------------
+ 2 files changed, 13 insertions(+), 24 deletions(-)
+
+diff --git a/llvm/lib/MC/WinCOFFObjectWriter.cpp b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+index 809ac37c3442f..8a5e621732999 100644
+--- a/llvm/lib/MC/WinCOFFObjectWriter.cpp
++++ b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+@@ -679,14 +679,12 @@ void WinCOFFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
+ bool WinCOFFObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
+     const MCAssembler &Asm, const MCSymbol &SymA, const MCFragment &FB,
+     bool InSet, bool IsPCRel) const {
+-  // Don't drop relocations between functions, even if they are in the same text
+-  // section. Multiple Visual C++ linker features depend on having the
+-  // relocations present. The /INCREMENTAL flag will cause these relocations to
+-  // point to thunks, and the /GUARD:CF flag assumes that it can use relocations
+-  // to approximate the set of all address taken functions. LLD's implementation
+-  // of /GUARD:CF also relies on the existance of these relocations.
++  // MS LINK expects to be able to replace all references to a function with a
++  // thunk to implement their /INCREMENTAL feature.  Make sure we don't optimize
++  // away any relocations to functions.
+   uint16_t Type = cast<MCSymbolCOFF>(SymA).getType();
+-  if ((Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
++  if (Asm.isIncrementalLinkerCompatible() &&
++      (Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
+     return false;
+   return MCObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(Asm, SymA, FB,
+                                                                 InSet, IsPCRel);
+diff --git a/llvm/test/MC/COFF/diff.s b/llvm/test/MC/COFF/diff.s
+index 90466b59d0252..640bf8189e039 100644
+--- a/llvm/test/MC/COFF/diff.s
++++ b/llvm/test/MC/COFF/diff.s
+@@ -1,14 +1,19 @@
+ // RUN: llvm-mc -filetype=obj -triple i686-pc-mingw32 %s | llvm-readobj -S --sr --sd - | FileCheck %s
+ 
+-// COFF resolves differences between labels in the same section, unless that
+-// label is declared with function type.
+-
+ .section baz, "xr"
++	.def	X
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	X
+ X:
+ 	mov	Y-X+42,	%eax
+ 	retl
+ 
++	.def	Y
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	Y
+ Y:
+ 	retl
+@@ -25,11 +30,6 @@ _foobar:                                # @foobar
+ # %bb.0:
+ 	ret
+ 
+-	.globl	_baz
+-_baz:
+-	calll	_foobar
+-	retl
+-
+ 	.data
+ 	.globl	_rust_crate             # @rust_crate
+ 	.align	4
+@@ -39,15 +39,6 @@ _rust_crate:
+ 	.long	_foobar-_rust_crate
+ 	.long	_foobar-_rust_crate
+ 
+-// Even though _baz and _foobar are in the same .text section, we keep the
+-// relocation for compatibility with the VC linker's /guard:cf and /incremental
+-// flags, even on mingw.
+-
+-// CHECK:        Name: .text
+-// CHECK:        Relocations [
+-// CHECK-NEXT:     0x12 IMAGE_REL_I386_REL32 _foobar
+-// CHECK-NEXT:   ]
+-
+ // CHECK:        Name: .data
+ // CHECK:        Relocations [
+ // CHECK-NEXT:     0x4 IMAGE_REL_I386_DIR32 _foobar
+
+From 630bca0939f8050d428dc291cc9c527371cd10b9 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sat, 19 May 2018 11:56:55 -0400
+Subject: [PATCH 02/27] Allow for custom address spaces
+
+Julia uses addressspaces for GC and we want these to be sanitized as well.
+
+(cherry picked from commit 3f53397f402b67341afe2bcb3a3316606b47d15c)
+(cherry picked from commit 58df73b7d510d59462d56092595cf9c91404c601)
+---
+ llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index d4aa31db8337b..be95324456dd8 100644
+--- a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -383,7 +383,9 @@ static bool shouldInstrumentReadWriteFromAddress(const Module *M, Value *Addr) {
+   // with them.
+   if (Addr) {
+     Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+-    if (PtrTy->getPointerAddressSpace() != 0)
++    auto AS = PtrTy->getPointerAddressSpace();
++    // Allow for custom addresspaces
++    if (AS != 0 && AS < 10)
+       return false;
+   }
+ 
+
+From 485618de6fb93f78a4e23c9e860185540ab17d8e Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Wed, 29 Sep 2021 15:17:47 -0400
+Subject: [PATCH 03/27] [clang/CMake] Respect LLVM_TOOLS_INSTALL_DIR
+
+Otherwise clang installs all of its tools into `bin/` while
+LLVM installs its tools into (LLVM_TOOLS_INSTALL_DIR).
+I could swear this used to work (and in fact the julia build system
+assumes it), but I can't pin down a specific commit that would
+have broken this, and julia has been relying on pre-compiled binaries
+for a while now (that don't use this setting), so it may have been
+broken for quite a while.
+
+Differential Revision: https://reviews.llvm.org/D88630
+
+(cherry picked from commit 6104e14b830c31dffb1b6bce1c6f9a0760993ff1)
+(cherry picked from commit f252e1795b885bf83f76ff4b029b0484aefebb31)
+(cherry picked from commit 9039ce8ab323e8e0bea24323a7231e4c53070def)
+---
+ clang/cmake/modules/AddClang.cmake | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/clang/cmake/modules/AddClang.cmake b/clang/cmake/modules/AddClang.cmake
+index 21ac332e4f5fc..1aaf785bdc992 100644
+--- a/clang/cmake/modules/AddClang.cmake
++++ b/clang/cmake/modules/AddClang.cmake
+@@ -166,7 +166,7 @@ macro(add_clang_tool name)
+       get_target_export_arg(${name} Clang export_to_clangtargets)
+       install(TARGETS ${name}
+         ${export_to_clangtargets}
+-        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
++        RUNTIME DESTINATION "${LLVM_TOOLS_INSTALL_DIR}"
+         COMPONENT ${name})
+ 
+       if(NOT LLVM_ENABLE_IDE)
+
+From 88aa19dcdeaf49733ba5d05e3c8bb9e149c705c6 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sat, 16 Jan 2021 17:36:09 -0500
+Subject: [PATCH 04/27] Don't merge icmps derived from pointers with
+ addressspaces
+
+IIUC we can't emit `memcmp` between pointers in addressspaces,
+doing so will trigger an assertion since the signature of the memcmp
+will not match it's arguments (https://bugs.llvm.org/show_bug.cgi?id=48661).
+
+This PR disables the attempt to merge icmps,
+when the pointer is in an addressspace.
+
+Differential Revision: https://reviews.llvm.org/D94813
+
+(cherry picked from commit 458b259600f7efd82387eb7c4e09bdcee328106b)
+(cherry picked from commit aaf2d2763f878f73770ccfdaf40f77a565b24a73)
+---
+ .../Transforms/MergeICmps/addressspaces.ll    | 67 +++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+ create mode 100644 llvm/test/Transforms/MergeICmps/addressspaces.ll
+
+diff --git a/llvm/test/Transforms/MergeICmps/addressspaces.ll b/llvm/test/Transforms/MergeICmps/addressspaces.ll
+new file mode 100644
+index 0000000000000..9a74b4a5b2ca4
+--- /dev/null
++++ b/llvm/test/Transforms/MergeICmps/addressspaces.ll
+@@ -0,0 +1,67 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
++; RUN: opt < %s -mergeicmps -S | FileCheck %s
++
++source_filename = "=="
++target datalayout = "e-m:e-i64:64-n32:64"
++target triple = "powerpc64le-unknown-linux-gnu"
++
++define void @juliaAS([2 x [5 x i64]] addrspace(11)* nocapture nonnull readonly align 8 dereferenceable(80) %0, [2 x [5 x i64]] addrspace(11)* nocapture nonnull readonly align 8 dereferenceable(80) %1) {
++; CHECK-LABEL: @juliaAS(
++; CHECK-NEXT:  top:
++; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0:%.*]], i64 0, i64 1, i64 2
++; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0]], i64 0, i64 1, i64 3
++; CHECK-NEXT:    [[TMP4:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0]], i64 0, i64 1, i64 4
++; CHECK-NEXT:    [[TMP5:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1:%.*]], i64 0, i64 1, i64 2
++; CHECK-NEXT:    [[TMP6:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1]], i64 0, i64 1, i64 3
++; CHECK-NEXT:    [[TMP7:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1]], i64 0, i64 1, i64 4
++; CHECK-NEXT:    [[TMP8:%.*]] = load i64, i64 addrspace(11)* [[TMP2]], align 8
++; CHECK-NEXT:    [[TMP9:%.*]] = load i64, i64 addrspace(11)* [[TMP5]], align 8
++; CHECK-NEXT:    [[DOTNOT17:%.*]] = icmp eq i64 [[TMP8]], [[TMP9]]
++; CHECK-NEXT:    br i1 [[DOTNOT17]], label [[L70:%.*]], label [[L90:%.*]]
++; CHECK:       L70:
++; CHECK-NEXT:    [[TMP10:%.*]] = load i64, i64 addrspace(11)* [[TMP3]], align 8
++; CHECK-NEXT:    [[TMP11:%.*]] = load i64, i64 addrspace(11)* [[TMP6]], align 8
++; CHECK-NEXT:    [[DOTNOT18:%.*]] = icmp eq i64 [[TMP10]], [[TMP11]]
++; CHECK-NEXT:    br i1 [[DOTNOT18]], label [[L74:%.*]], label [[L90]]
++; CHECK:       L74:
++; CHECK-NEXT:    [[TMP12:%.*]] = load i64, i64 addrspace(11)* [[TMP4]], align 8
++; CHECK-NEXT:    [[TMP13:%.*]] = load i64, i64 addrspace(11)* [[TMP7]], align 8
++; CHECK-NEXT:    [[DOTNOT19:%.*]] = icmp eq i64 [[TMP12]], [[TMP13]]
++; CHECK-NEXT:    br label [[L90]]
++; CHECK:       L90:
++; CHECK-NEXT:    [[VALUE_PHI2_OFF0:%.*]] = phi i1 [ false, [[TOP:%.*]] ], [ [[DOTNOT19]], [[L74]] ], [ false, [[L70]] ]
++; CHECK-NEXT:    ret void
++;
++top:
++  %2 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 2
++  %3 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 3
++  %4 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 4
++  %5 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 2
++  %6 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 3
++  %7 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 4
++  %8 = load i64, i64 addrspace(11)* %2, align 8
++  %9 = load i64, i64 addrspace(11)* %5, align 8
++  %.not17 = icmp eq i64 %8, %9
++  br i1 %.not17, label %L70, label %L90
++
++L70:                                              ; preds = %top
++  %10 = load i64, i64 addrspace(11)* %3, align 8
++  %11 = load i64, i64 addrspace(11)* %6, align 8
++  %.not18 = icmp eq i64 %10, %11
++  br i1 %.not18, label %L74, label %L90
++
++L74:                                              ; preds = %L70
++  %12 = load i64, i64 addrspace(11)* %4, align 8
++  %13 = load i64, i64 addrspace(11)* %7, align 8
++  %.not19 = icmp eq i64 %12, %13
++  br label %L90
++
++L90:                                              ; preds = %L74, %L70, %top
++  %value_phi2.off0 = phi i1 [ false, %top ], [ %.not19, %L74 ], [ false, %L70 ]
++  ret void
++}
++
++!llvm.module.flags = !{!0}
++
++!0 = !{i32 1, !"Debug Info Version", i32 3}
++
+
+From d174fde13ef758046b9b94028127c5a6d1dc3f91 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Mon, 1 Mar 2021 16:42:05 -0500
+Subject: [PATCH 05/27] AArch64: Remove Bad optimization
+
+Removes the code responsible for causing https://bugs.llvm.org/show_bug.cgi?id=49357.
+A fix is in progress upstream, but I don't think it's easy, so this
+fixes the bug in the meantime. The optimization it does is minor.
+
+(cherry picked from commit e4f1085c5c04e106e5a7ee72c9f4dfe1dccb7b94)
+(cherry picked from commit 7627d618e0e62cdb6d9394d37198dab2a02252f1)
+---
+ llvm/lib/Target/AArch64/AArch64FastISel.cpp | 17 -----------------
+ 1 file changed, 17 deletions(-)
+
+diff --git a/llvm/lib/Target/AArch64/AArch64FastISel.cpp b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+index 49fffa01a974d..5769e561c4ce7 100644
+--- a/llvm/lib/Target/AArch64/AArch64FastISel.cpp
++++ b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+@@ -4503,23 +4503,6 @@ bool AArch64FastISel::selectIntExt(const Instruction *I) {
+ 
+   // Try to optimize already sign-/zero-extended values from function arguments.
+   bool IsZExt = isa<ZExtInst>(I);
+-  if (const auto *Arg = dyn_cast<Argument>(I->getOperand(0))) {
+-    if ((IsZExt && Arg->hasZExtAttr()) || (!IsZExt && Arg->hasSExtAttr())) {
+-      if (RetVT == MVT::i64 && SrcVT != MVT::i64) {
+-        Register ResultReg = createResultReg(&AArch64::GPR64RegClass);
+-        BuildMI(*FuncInfo.MBB, FuncInfo.InsertPt, DbgLoc,
+-                TII.get(AArch64::SUBREG_TO_REG), ResultReg)
+-            .addImm(0)
+-            .addReg(SrcReg)
+-            .addImm(AArch64::sub_32);
+-        SrcReg = ResultReg;
+-      }
+-
+-      updateValueMap(I, SrcReg);
+-      return true;
+-    }
+-  }
+-
+   unsigned ResultReg = emitIntExt(SrcVT, SrcReg, RetVT, IsZExt);
+   if (!ResultReg)
+     return false;
+
+From 2a46debe589a1b3f913c0e2f7578e3625d624918 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <kfischer@college.harvard.edu>
+Date: Sat, 30 Apr 2022 19:00:11 +0100
+Subject: [PATCH 06/27] Add support for unwinding during prologue/epilogue
+
+(cherry picked from commit 5393efbd8a4c7555b9f9fdf185c486c6b05f0c19)
+---
+ libunwind/src/CompactUnwinder.hpp | 156 ++++++++++++++++++++++++++++++
+ 1 file changed, 156 insertions(+)
+
+diff --git a/libunwind/src/CompactUnwinder.hpp b/libunwind/src/CompactUnwinder.hpp
+index 0b2b5e111bfc2..ad0e042cb6ba1 100644
+--- a/libunwind/src/CompactUnwinder.hpp
++++ b/libunwind/src/CompactUnwinder.hpp
+@@ -310,6 +310,50 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingRBPFrame(
+   uint32_t savedRegistersLocations =
+       EXTRACT_BITS(compactEncoding, UNWIND_X86_64_RBP_FRAME_REGISTERS);
+ 
++  // If we have not stored EBP yet
++  if (functionStart == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp+8);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp));
++
++    return UNW_STEP_SUCCESS;
++  } else if (functionStart + 1 == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  // If we're about to return, we've already popped the base pointer
++  uint8_t b = addressSpace.get8(registers.getIP());
++
++  // This is a hack to detect VZEROUPPER but in between popq rbp and ret
++  // It's not pretty but it works
++  if (b == 0xC5) {
++    if ((b = addressSpace.get8(registers.getIP() + 1)) == 0xF8 &&
++        (b = addressSpace.get8(registers.getIP() + 2)) == 0x77)
++      b = addressSpace.get8(registers.getIP() + 3);
++    else
++      goto skip_ret;
++  }
++
++  if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++    uint64_t rbp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rbp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rbp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  skip_ret:
++
+   uint64_t savedRegisters = registers.getRBP() - 8 * savedRegistersOffset;
+   for (int i = 0; i < 5; ++i) {
+     switch (savedRegistersLocations & 0x7) {
+@@ -430,6 +474,118 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingFrameless(
+       }
+     }
+   }
++
++  // Note that the order of these registers is so that
++  // registersSaved[0] is the one that will be pushed onto the stack last.
++  // Thus, if we want to walk this from the top, we need to go in reverse.
++  assert(regCount <= 6);
++
++  // check whether we are still in the prologue
++  uint64_t curAddr = functionStart;
++  if (regCount > 0) {
++    for (int8_t i = (int8_t)(regCount) - 1; i >= 0; --i) {
++      if (registers.getIP() == curAddr) {
++        // None of the registers have been modified yet, so we don't need to reload them
++        framelessUnwind(addressSpace, registers.getSP() + 8 * (regCount - (uint64_t)(i + 1)), registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        assert(curAddr < registers.getIP());
++      }
++
++
++      // pushq %rbp and pushq %rbx is 1 byte. Everything else 2
++      if ((UNWIND_X86_64_REG_RBP == registersSaved[i]) ||
++          (UNWIND_X86_64_REG_RBX == registersSaved[i]))
++        curAddr += 1;
++      else
++        curAddr += 2;
++    }
++  }
++  if (registers.getIP() == curAddr) {
++    // None of the registers have been modified yet, so we don't need to reload them
++    framelessUnwind(addressSpace, registers.getSP() + 8*regCount, registers);
++    return UNW_STEP_SUCCESS;
++  } else {
++    assert(curAddr < registers.getIP());
++  }
++
++
++  // And now for the epilogue
++  {
++    uint8_t  i  = 0;
++    uint64_t p  = registers.getIP();
++    uint8_t  b  = 0;
++
++    while (true) {
++      b = addressSpace.get8(p++);
++      // This is a hack to detect VZEROUPPER but in between the popq's and ret
++      // It's not pretty but it works
++      if (b == 0xC5) {
++        if ((b = addressSpace.get8(p++)) == 0xF8 && (b = addressSpace.get8(p++)) == 0x77)
++          b = addressSpace.get8(p++);
++        else
++          break;
++      }
++      //  popq %rbx    popq %rbp
++      if (b == 0x5B || b == 0x5D) {
++        i++;
++      } else if (b == 0x41) {
++        b = addressSpace.get8(p++);
++        if (b == 0x5C || b == 0x5D || b == 0x5E || b == 0x5F)
++          i++;
++        else
++          break;
++      } else if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++        // i pop's haven't happened yet
++        uint64_t savedRegisters = registers.getSP() + 8 * i;
++        if (regCount > 0) {
++          for (int8_t j = (int8_t)(regCount) - 1; j >= (int8_t)(regCount) - i; --j) {
++            uint64_t addr = savedRegisters - 8 * (regCount - (uint64_t)(j));
++            switch (registersSaved[j]) {
++              case UNWIND_X86_64_REG_RBX:
++                registers.setRBX(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R12:
++                registers.setR12(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R13:
++                registers.setR13(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R14:
++                registers.setR14(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R15:
++                registers.setR15(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_RBP:
++                registers.setRBP(addressSpace.get64(addr));
++                break;
++              default:
++                _LIBUNWIND_DEBUG_LOG("bad register for frameless, encoding=%08X for "
++                             "function starting at 0x%llX",
++                              encoding, functionStart);
++                _LIBUNWIND_ABORT("invalid compact unwind encoding");
++            }
++          }
++        }
++        framelessUnwind(addressSpace, savedRegisters, registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        break;
++      }
++    }
++  }
++
++  /*
++   0x10fe2733a:  5b                             popq   %rbx
++   0x10fe2733b:  41 5c                          popq   %r12
++   0x10fe2733d:  41 5d                          popq   %r13
++   0x10fe2733f:  41 5e                          popq   %r14
++   0x10fe27341:  41 5f                          popq   %r15
++   0x10fe27343:  5d                             popq   %rbp
++   */
++
++
+   uint64_t savedRegisters = registers.getSP() + stackSize - 8 - 8 * regCount;
+   for (uint32_t i = 0; i < regCount; ++i) {
+     switch (registersSaved[i]) {
+
+From 8482aa12a3fcbfd4a1ca69aba58b20a6af111497 Mon Sep 17 00:00:00 2001
+From: Julian P Samaroo <jpsamaroo@jpsamaroo.me>
+Date: Tue, 18 Jan 2022 13:32:28 -0600
+Subject: [PATCH 07/27] [LLD] Respect LLVM_TOOLS_INSTALL_DIR
+
+Co-authored-by: Valentin Churavy <v.churavy@gmail.com>
+Co-authored-by: Julian P Samaroo <jpsamaroo@jpsamaroo.me>
+(cherry picked from commit a0defe021cee2076dc161eceeaab70297b386b91)
+---
+ lld/cmake/modules/AddLLD.cmake | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/lld/cmake/modules/AddLLD.cmake b/lld/cmake/modules/AddLLD.cmake
+index d3924f7243d40..01b4fe65a45ac 100644
+--- a/lld/cmake/modules/AddLLD.cmake
++++ b/lld/cmake/modules/AddLLD.cmake
+@@ -20,7 +20,7 @@ macro(add_lld_library name)
+       ${export_to_lldtargets}
+       LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX}
+       ARCHIVE DESTINATION lib${LLVM_LIBDIR_SUFFIX}
+-      RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
++      RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR})
+ 
+     if (${ARG_SHARED} AND NOT CMAKE_CONFIGURATION_TYPES)
+       add_llvm_install_targets(install-${name}
+@@ -47,7 +47,7 @@ macro(add_lld_tool name)
+     get_target_export_arg(${name} LLD export_to_lldtargets)
+     install(TARGETS ${name}
+       ${export_to_lldtargets}
+-      RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
++      RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
+       COMPONENT ${name})
+ 
+     if(NOT CMAKE_CONFIGURATION_TYPES)
+
+From e74c41e9d2391523d0e4174c2fb096dbddb7622a Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Mon, 2 May 2022 10:04:47 -0400
+Subject: [PATCH 08/27] [Sanitizers] Guard FP_XSTATE_MAGIC1 usage by GLIBC
+ version
+
+Follow-up on https://reviews.llvm.org/D118970 FP_XSTATE_MAGIC1 is only available on glibc 2.27 and upwards
+
+Differential Revision: https://reviews.llvm.org/D124770
+---
+ .../lib/sanitizer_common/sanitizer_platform_limits_posix.cpp    | 2 +-
+ compiler-rt/test/msan/Linux/signal_mcontext.cpp                 | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+index c85cf1626a75b..e648b829a0372 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+@@ -223,7 +223,7 @@ namespace __sanitizer {
+   unsigned struct_sockaddr_sz = sizeof(struct sockaddr);
+ 
+   unsigned ucontext_t_sz(void *ctx) {
+-#    if SANITIZER_GLIBC && SANITIZER_X64
++#    if SANITIZER_GLIBC && SANITIZER_X64 &&  __GLIBC_PREREQ (2, 27)
+     // Added in Linux kernel 3.4.0, merged to glibc in 2.16
+ #      ifndef FP_XSTATE_MAGIC1
+ #        define FP_XSTATE_MAGIC1 0x46505853U
+diff --git a/compiler-rt/test/msan/Linux/signal_mcontext.cpp b/compiler-rt/test/msan/Linux/signal_mcontext.cpp
+index b49451fbb730b..11ef74e7462bb 100644
+--- a/compiler-rt/test/msan/Linux/signal_mcontext.cpp
++++ b/compiler-rt/test/msan/Linux/signal_mcontext.cpp
+@@ -10,7 +10,7 @@
+ 
+ void handler(int sig, siginfo_t *info, void *uctx) {
+   __msan_check_mem_is_initialized(uctx, sizeof(ucontext_t));
+-#if defined(__GLIBC__) && defined(__x86_64__)
++#if defined(__GLIBC__) && defined(__x86_64__) && __GLIBC_PREREQ(2, 27)
+   auto *mctx = &static_cast<ucontext_t *>(uctx)->uc_mcontext;
+   if (auto *fpregs = mctx->fpregs) {
+     // The member names differ across header versions, but the actual layout
+
+From 425cad85181bc0fcc2e6ebf75f3a183445909953 Mon Sep 17 00:00:00 2001
+From: Cody Tapscott <cody+github@tapscott.me>
+Date: Mon, 24 May 2021 16:36:06 -0700
+Subject: [PATCH 09/27] Force `.eh_frame` emission on AArch64
+
+We need to force the emission of the EH Frame section (currently done via SupportsCompactUnwindWithoutEHFrame in the MCObjectFileInfo for the target), since libunwind doesn't yet support dynamically registering compact unwind information at run-time.
+
+(cherry picked from commit 60e041894288848e37870c42749a1aabcc2c2274)
+(cherry picked from commit 6275013da5e8cd5e552bd5bb7d85c7b0524ca69d)
+---
+ llvm/lib/MC/MCObjectFileInfo.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/llvm/lib/MC/MCObjectFileInfo.cpp b/llvm/lib/MC/MCObjectFileInfo.cpp
+index d6fe952c0c1d8..6d422efc7fbcc 100644
+--- a/llvm/lib/MC/MCObjectFileInfo.cpp
++++ b/llvm/lib/MC/MCObjectFileInfo.cpp
+@@ -61,9 +61,10 @@ void MCObjectFileInfo::initMachOMCObjectFileInfo(const Triple &T) {
+           MachO::S_ATTR_STRIP_STATIC_SYMS | MachO::S_ATTR_LIVE_SUPPORT,
+       SectionKind::getReadOnly());
+ 
+-  if (T.isOSDarwin() &&
+-      (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32))
+-    SupportsCompactUnwindWithoutEHFrame = true;
++  // Disabled for now, since we need to emit EH Frames for stack unwinding in the JIT
++  // if (T.isOSDarwin() &&
++  //     (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32))
++  //   SupportsCompactUnwindWithoutEHFrame = true;
+ 
+   switch (Ctx->emitDwarfUnwindInfo()) {
+   case EmitDwarfUnwindType::Always:
+
+From 2e0d8422b279c7d2363ff199e5fb1970d1c6950d Mon Sep 17 00:00:00 2001
+From: Jameson Nash <vtjnash@gmail.com>
+Date: Thu, 30 Jun 2022 17:25:48 -0400
+Subject: [PATCH 10/27] [SimplifyCFG] teach simplifycfg not to introduce
+ ptrtoint for NI pointers
+
+SimplifyCFG expects to be able to cast both sides to an int, if either side can be case to an int, but this is not desirable or legal, in general, per D104547.
+
+Spotted in https://github.com/JuliaLang/julia/issues/45702
+
+Differential Revision: https://reviews.llvm.org/D128670
+
+(cherry picked from commit b904e7e94c5cc9d86762b32211cd0e35670534cb)
+---
+ llvm/lib/Transforms/Utils/SimplifyCFG.cpp     |  3 +-
+ .../Transforms/SimplifyCFG/nonintegral.ll     | 29 +++++++++++++++++++
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+ create mode 100644 llvm/test/Transforms/SimplifyCFG/nonintegral.ll
+
+diff --git a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp
+index 1806081678a86..74eaf228c9417 100644
+--- a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp
++++ b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp
+@@ -472,7 +472,8 @@ static bool dominatesMergePoint(Value *V, BasicBlock *BB,
+ static ConstantInt *GetConstantInt(Value *V, const DataLayout &DL) {
+   // Normal constant int.
+   ConstantInt *CI = dyn_cast<ConstantInt>(V);
+-  if (CI || !isa<Constant>(V) || !V->getType()->isPointerTy())
++  if (CI || !isa<Constant>(V) || !V->getType()->isPointerTy() ||
++      DL.isNonIntegralPointerType(V->getType()))
+     return CI;
+ 
+   // This is some kind of pointer constant. Turn it into a pointer-sized
+diff --git a/llvm/test/Transforms/SimplifyCFG/nonintegral.ll b/llvm/test/Transforms/SimplifyCFG/nonintegral.ll
+new file mode 100644
+index 0000000000000..00c295ddc5c6d
+--- /dev/null
++++ b/llvm/test/Transforms/SimplifyCFG/nonintegral.ll
+@@ -0,0 +1,29 @@
++; RUN: opt -simplifycfg -verify -S < %s | FileCheck %s
++; RUN: opt -passes=simplifycfg,verify -S < %s | FileCheck %s
++
++target datalayout = "ni:1"
++
++define void @test_01(i64 addrspace(1)* align 8 %ptr) local_unnamed_addr #0 {
++; CHECK-LABEL: @test_01(
++; CHECK-NOT:   ptrtoint
++; CHECK-NEXT:  icmp eq i64 addrspace(1)* %ptr, null
++; CHECK-NOT:   ptrtoint
++  %cond1 = icmp eq i64 addrspace(1)* %ptr, null
++  %cond2 = icmp eq i64 addrspace(1)* %ptr, null
++  br i1 %cond1, label %true1, label %false1
++
++true1:
++  br i1 %cond2, label %true2, label %false2
++
++false1:
++  store i64 1, i64 addrspace(1)* %ptr, align 8
++  br label %true1
++
++true2:
++  store i64 2, i64 addrspace(1)* %ptr, align 8
++  ret void
++
++false2:
++  store i64 3, i64 addrspace(1)* %ptr, align 8
++  ret void
++}
+
+From 0deac677ceabe1b285a8a741ea6f319a2a0fbb06 Mon Sep 17 00:00:00 2001
+From: Chen Zheng <czhengsz@cn.ibm.com>
+Date: Tue, 19 Jul 2022 04:24:49 -0400
+Subject: [PATCH 11/27] [NFC] add test cases for D123366
+
+(cherry picked from commit 13016f1f1be5864dacdc8e15b920465dcec2b49a)
+---
+ llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll | 449 +++++++++++++++++++
+ 1 file changed, 449 insertions(+)
+ create mode 100644 llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll
+
+diff --git a/llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll b/llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll
+new file mode 100644
+index 0000000000000..39f33d9e849a0
+--- /dev/null
++++ b/llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll
+@@ -0,0 +1,449 @@
++; NOTE: Assertions have been autogenerated by utils/update_mir_test_checks.py
++; RUN: llc -verify-machineinstrs -stop-after=finalize-isel -mtriple=powerpc64-ibm-aix-xcoff \
++; RUN:   -mcpu=pwr4 < %s | FileCheck -check-prefix=AIX64 %s
++; RUN: llc -verify-machineinstrs -stop-after=finalize-isel -mtriple=powerpc-ibm-aix-xcoff \
++; RUN:   -mcpu=pwr4 < %s | FileCheck -check-prefix=AIX32 %s
++; RUN: llc -verify-machineinstrs -stop-after=finalize-isel -mtriple=powerpc64le-unknown-linux-gnu \
++; RUN:   -mcpu=pwr8 < %s | FileCheck -check-prefix=LE64 %s
++
++;; This file is copied from test/CodeGen/PowerPC/ctrloops.ll.
++;; In this file, we are testing the CTR loops form after ISEL.
++
++@a = common global i32 0, align 4
++
++define void @test1(i32 %c) nounwind {
++  ; AIX64-LABEL: name: test1
++  ; AIX64: bb.0.entry:
++  ; AIX64-NEXT:   successors: %bb.1(0x80000000)
++  ; AIX64-NEXT:   liveins: $x3
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   [[COPY:%[0-9]+]]:g8rc = COPY $x3
++  ; AIX64-NEXT:   [[COPY1:%[0-9]+]]:gprc = COPY [[COPY]].sub_32
++  ; AIX64-NEXT:   [[LI8_:%[0-9]+]]:g8rc = LI8 2048
++  ; AIX64-NEXT:   MTCTR8loop killed [[LI8_]], implicit-def dead $ctr8
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.1.for.body:
++  ; AIX64-NEXT:   successors: %bb.1(0x7c000000), %bb.2(0x04000000)
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   [[LDtoc:%[0-9]+]]:g8rc_and_g8rc_nox0 = LDtoc @a, $x2 :: (load (s64) from got)
++  ; AIX64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtoc]] :: (volatile dereferenceable load (s32) from @a)
++  ; AIX64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY1]]
++  ; AIX64-NEXT:   STW killed [[ADD4_]], 0, [[LDtoc]] :: (volatile store (s32) into @a)
++  ; AIX64-NEXT:   BDNZ8 %bb.1, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   B %bb.2
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.2.for.end:
++  ; AIX64-NEXT:   BLR8 implicit $lr8, implicit $rm
++  ; AIX32-LABEL: name: test1
++  ; AIX32: bb.0.entry:
++  ; AIX32-NEXT:   successors: %bb.1(0x80000000)
++  ; AIX32-NEXT:   liveins: $r3
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   [[COPY:%[0-9]+]]:gprc = COPY $r3
++  ; AIX32-NEXT:   [[LI:%[0-9]+]]:gprc = LI 2048
++  ; AIX32-NEXT:   MTCTRloop killed [[LI]], implicit-def dead $ctr
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.1.for.body:
++  ; AIX32-NEXT:   successors: %bb.1(0x7c000000), %bb.2(0x04000000)
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   [[LWZtoc:%[0-9]+]]:gprc_and_gprc_nor0 = LWZtoc @a, $r2 :: (load (s32) from got)
++  ; AIX32-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LWZtoc]] :: (volatile dereferenceable load (s32) from @a)
++  ; AIX32-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY]]
++  ; AIX32-NEXT:   STW killed [[ADD4_]], 0, [[LWZtoc]] :: (volatile store (s32) into @a)
++  ; AIX32-NEXT:   BDNZ %bb.1, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   B %bb.2
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.2.for.end:
++  ; AIX32-NEXT:   BLR implicit $lr, implicit $rm
++  ; LE64-LABEL: name: test1
++  ; LE64: bb.0.entry:
++  ; LE64-NEXT:   successors: %bb.1(0x80000000)
++  ; LE64-NEXT:   liveins: $x3
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   [[COPY:%[0-9]+]]:g8rc = COPY $x3
++  ; LE64-NEXT:   [[COPY1:%[0-9]+]]:gprc = COPY [[COPY]].sub_32
++  ; LE64-NEXT:   [[LI8_:%[0-9]+]]:g8rc = LI8 2048
++  ; LE64-NEXT:   MTCTR8loop killed [[LI8_]], implicit-def dead $ctr8
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.1.for.body:
++  ; LE64-NEXT:   successors: %bb.1(0x7c000000), %bb.2(0x04000000)
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   [[ADDIStocHA8_:%[0-9]+]]:g8rc_and_g8rc_nox0 = ADDIStocHA8 $x2, @a
++  ; LE64-NEXT:   [[LDtocL:%[0-9]+]]:g8rc_and_g8rc_nox0 = LDtocL @a, killed [[ADDIStocHA8_]] :: (load (s64) from got)
++  ; LE64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtocL]] :: (volatile dereferenceable load (s32) from @a)
++  ; LE64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY1]]
++  ; LE64-NEXT:   STW killed [[ADD4_]], 0, [[LDtocL]] :: (volatile store (s32) into @a)
++  ; LE64-NEXT:   BDNZ8 %bb.1, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   B %bb.2
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.2.for.end:
++  ; LE64-NEXT:   BLR8 implicit $lr8, implicit $rm
++entry:
++  br label %for.body
++
++for.body:                                         ; preds = %for.body, %entry
++  %i.01 = phi i32 [ 0, %entry ], [ %inc, %for.body ]
++  %0 = load volatile i32, i32* @a, align 4
++  %add = add nsw i32 %0, %c
++  store volatile i32 %add, i32* @a, align 4
++  %inc = add nsw i32 %i.01, 1
++  %exitcond = icmp eq i32 %inc, 2048
++  br i1 %exitcond, label %for.end, label %for.body
++
++for.end:                                          ; preds = %for.body
++  ret void
++}
++
++define void @test2(i32 %c, i32 %d) nounwind {
++  ; AIX64-LABEL: name: test2
++  ; AIX64: bb.0.entry:
++  ; AIX64-NEXT:   successors: %bb.1(0x50000000), %bb.3(0x30000000)
++  ; AIX64-NEXT:   liveins: $x3, $x4
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   [[COPY:%[0-9]+]]:g8rc = COPY $x4
++  ; AIX64-NEXT:   [[COPY1:%[0-9]+]]:g8rc = COPY $x3
++  ; AIX64-NEXT:   [[COPY2:%[0-9]+]]:gprc = COPY [[COPY1]].sub_32
++  ; AIX64-NEXT:   [[COPY3:%[0-9]+]]:gprc_and_gprc_nor0 = COPY [[COPY]].sub_32
++  ; AIX64-NEXT:   [[CMPWI:%[0-9]+]]:crrc = CMPWI [[COPY3]], 1
++  ; AIX64-NEXT:   BCC 12, killed [[CMPWI]], %bb.3
++  ; AIX64-NEXT:   B %bb.1
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.1.for.body.preheader:
++  ; AIX64-NEXT:   successors: %bb.2(0x80000000)
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   [[ADDI:%[0-9]+]]:gprc = ADDI [[COPY3]], -1
++  ; AIX64-NEXT:   [[DEF:%[0-9]+]]:g8rc = IMPLICIT_DEF
++  ; AIX64-NEXT:   [[INSERT_SUBREG:%[0-9]+]]:g8rc = INSERT_SUBREG [[DEF]], killed [[ADDI]], %subreg.sub_32
++  ; AIX64-NEXT:   [[RLDICL:%[0-9]+]]:g8rc_and_g8rc_nox0 = RLDICL killed [[INSERT_SUBREG]], 0, 32
++  ; AIX64-NEXT:   [[ADDI8_:%[0-9]+]]:g8rc = nuw nsw ADDI8 killed [[RLDICL]], 1
++  ; AIX64-NEXT:   MTCTR8loop killed [[ADDI8_]], implicit-def dead $ctr8
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.2.for.body:
++  ; AIX64-NEXT:   successors: %bb.2(0x7c000000), %bb.3(0x04000000)
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   [[LDtoc:%[0-9]+]]:g8rc_and_g8rc_nox0 = LDtoc @a, $x2 :: (load (s64) from got)
++  ; AIX64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtoc]] :: (volatile dereferenceable load (s32) from @a)
++  ; AIX64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY2]]
++  ; AIX64-NEXT:   STW killed [[ADD4_]], 0, [[LDtoc]] :: (volatile store (s32) into @a)
++  ; AIX64-NEXT:   BDNZ8 %bb.2, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   B %bb.3
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.3.for.end:
++  ; AIX64-NEXT:   BLR8 implicit $lr8, implicit $rm
++  ; AIX32-LABEL: name: test2
++  ; AIX32: bb.0.entry:
++  ; AIX32-NEXT:   successors: %bb.1(0x50000000), %bb.3(0x30000000)
++  ; AIX32-NEXT:   liveins: $r3, $r4
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   [[COPY:%[0-9]+]]:gprc = COPY $r4
++  ; AIX32-NEXT:   [[COPY1:%[0-9]+]]:gprc = COPY $r3
++  ; AIX32-NEXT:   [[CMPWI:%[0-9]+]]:crrc = CMPWI [[COPY]], 1
++  ; AIX32-NEXT:   BCC 12, killed [[CMPWI]], %bb.3
++  ; AIX32-NEXT:   B %bb.1
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.1.for.body.preheader:
++  ; AIX32-NEXT:   successors: %bb.2(0x80000000)
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   MTCTRloop [[COPY]], implicit-def dead $ctr
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.2.for.body:
++  ; AIX32-NEXT:   successors: %bb.2(0x7c000000), %bb.3(0x04000000)
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   [[LWZtoc:%[0-9]+]]:gprc_and_gprc_nor0 = LWZtoc @a, $r2 :: (load (s32) from got)
++  ; AIX32-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LWZtoc]] :: (volatile dereferenceable load (s32) from @a)
++  ; AIX32-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY1]]
++  ; AIX32-NEXT:   STW killed [[ADD4_]], 0, [[LWZtoc]] :: (volatile store (s32) into @a)
++  ; AIX32-NEXT:   BDNZ %bb.2, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   B %bb.3
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.3.for.end:
++  ; AIX32-NEXT:   BLR implicit $lr, implicit $rm
++  ; LE64-LABEL: name: test2
++  ; LE64: bb.0.entry:
++  ; LE64-NEXT:   successors: %bb.1(0x50000000), %bb.3(0x30000000)
++  ; LE64-NEXT:   liveins: $x3, $x4
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   [[COPY:%[0-9]+]]:g8rc = COPY $x4
++  ; LE64-NEXT:   [[COPY1:%[0-9]+]]:g8rc = COPY $x3
++  ; LE64-NEXT:   [[COPY2:%[0-9]+]]:gprc = COPY [[COPY1]].sub_32
++  ; LE64-NEXT:   [[COPY3:%[0-9]+]]:gprc_and_gprc_nor0 = COPY [[COPY]].sub_32
++  ; LE64-NEXT:   [[CMPWI:%[0-9]+]]:crrc = CMPWI [[COPY3]], 1
++  ; LE64-NEXT:   BCC 12, killed [[CMPWI]], %bb.3
++  ; LE64-NEXT:   B %bb.1
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.1.for.body.preheader:
++  ; LE64-NEXT:   successors: %bb.2(0x80000000)
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   [[ADDI:%[0-9]+]]:gprc = ADDI [[COPY3]], -1
++  ; LE64-NEXT:   [[DEF:%[0-9]+]]:g8rc = IMPLICIT_DEF
++  ; LE64-NEXT:   [[INSERT_SUBREG:%[0-9]+]]:g8rc = INSERT_SUBREG [[DEF]], killed [[ADDI]], %subreg.sub_32
++  ; LE64-NEXT:   [[RLDICL:%[0-9]+]]:g8rc_and_g8rc_nox0 = RLDICL killed [[INSERT_SUBREG]], 0, 32
++  ; LE64-NEXT:   [[ADDI8_:%[0-9]+]]:g8rc = nuw nsw ADDI8 killed [[RLDICL]], 1
++  ; LE64-NEXT:   MTCTR8loop killed [[ADDI8_]], implicit-def dead $ctr8
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.2.for.body:
++  ; LE64-NEXT:   successors: %bb.2(0x7c000000), %bb.3(0x04000000)
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   [[ADDIStocHA8_:%[0-9]+]]:g8rc_and_g8rc_nox0 = ADDIStocHA8 $x2, @a
++  ; LE64-NEXT:   [[LDtocL:%[0-9]+]]:g8rc_and_g8rc_nox0 = LDtocL @a, killed [[ADDIStocHA8_]] :: (load (s64) from got)
++  ; LE64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtocL]] :: (volatile dereferenceable load (s32) from @a)
++  ; LE64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY2]]
++  ; LE64-NEXT:   STW killed [[ADD4_]], 0, [[LDtocL]] :: (volatile store (s32) into @a)
++  ; LE64-NEXT:   BDNZ8 %bb.2, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   B %bb.3
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.3.for.end:
++  ; LE64-NEXT:   BLR8 implicit $lr8, implicit $rm
++entry:
++  %cmp1 = icmp sgt i32 %d, 0
++  br i1 %cmp1, label %for.body, label %for.end
++
++for.body:                                         ; preds = %entry, %for.body
++  %i.02 = phi i32 [ %inc, %for.body ], [ 0, %entry ]
++  %0 = load volatile i32, i32* @a, align 4
++  %add = add nsw i32 %0, %c
++  store volatile i32 %add, i32* @a, align 4
++  %inc = add nsw i32 %i.02, 1
++  %exitcond = icmp eq i32 %inc, %d
++  br i1 %exitcond, label %for.end, label %for.body
++
++for.end:                                          ; preds = %for.body, %entry
++  ret void
++}
++
++define void @test3(i32 %c, i32 %d) nounwind {
++  ; AIX64-LABEL: name: test3
++  ; AIX64: bb.0.entry:
++  ; AIX64-NEXT:   successors: %bb.1(0x50000000), %bb.3(0x30000000)
++  ; AIX64-NEXT:   liveins: $x3, $x4
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   [[COPY:%[0-9]+]]:g8rc = COPY $x4
++  ; AIX64-NEXT:   [[COPY1:%[0-9]+]]:g8rc = COPY $x3
++  ; AIX64-NEXT:   [[COPY2:%[0-9]+]]:gprc = COPY [[COPY1]].sub_32
++  ; AIX64-NEXT:   [[COPY3:%[0-9]+]]:gprc_and_gprc_nor0 = COPY [[COPY]].sub_32
++  ; AIX64-NEXT:   [[CMPWI:%[0-9]+]]:crrc = CMPWI [[COPY3]], 1
++  ; AIX64-NEXT:   BCC 12, killed [[CMPWI]], %bb.3
++  ; AIX64-NEXT:   B %bb.1
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.1.for.body.preheader:
++  ; AIX64-NEXT:   successors: %bb.2(0x80000000)
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   [[ADDI:%[0-9]+]]:gprc = ADDI [[COPY3]], -1
++  ; AIX64-NEXT:   [[DEF:%[0-9]+]]:g8rc = IMPLICIT_DEF
++  ; AIX64-NEXT:   [[INSERT_SUBREG:%[0-9]+]]:g8rc = INSERT_SUBREG [[DEF]], killed [[ADDI]], %subreg.sub_32
++  ; AIX64-NEXT:   [[RLDICL:%[0-9]+]]:g8rc_and_g8rc_nox0 = RLDICL killed [[INSERT_SUBREG]], 0, 32
++  ; AIX64-NEXT:   [[ADDI8_:%[0-9]+]]:g8rc = nuw nsw ADDI8 killed [[RLDICL]], 1
++  ; AIX64-NEXT:   MTCTR8loop killed [[ADDI8_]], implicit-def dead $ctr8
++  ; AIX64-NEXT:   [[LI:%[0-9]+]]:gprc = LI 0
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.2.for.body:
++  ; AIX64-NEXT:   successors: %bb.2(0x7c000000), %bb.3(0x04000000)
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   [[PHI:%[0-9]+]]:gprc = PHI [[LI]], %bb.1, %1, %bb.2
++  ; AIX64-NEXT:   [[LDtoc:%[0-9]+]]:g8rc_and_g8rc_nox0 = LDtoc @a, $x2 :: (load (s64) from got)
++  ; AIX64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtoc]] :: (volatile dereferenceable load (s32) from @a)
++  ; AIX64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = ADD4 [[PHI]], killed [[LWZ]]
++  ; AIX64-NEXT:   STW killed [[ADD4_]], 0, [[LDtoc]] :: (volatile store (s32) into @a)
++  ; AIX64-NEXT:   [[ADD4_1:%[0-9]+]]:gprc = ADD4 [[PHI]], [[COPY2]]
++  ; AIX64-NEXT:   BDNZ8 %bb.2, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   B %bb.3
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.3.for.end:
++  ; AIX64-NEXT:   BLR8 implicit $lr8, implicit $rm
++  ; AIX32-LABEL: name: test3
++  ; AIX32: bb.0.entry:
++  ; AIX32-NEXT:   successors: %bb.1(0x50000000), %bb.3(0x30000000)
++  ; AIX32-NEXT:   liveins: $r3, $r4
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   [[COPY:%[0-9]+]]:gprc = COPY $r4
++  ; AIX32-NEXT:   [[COPY1:%[0-9]+]]:gprc = COPY $r3
++  ; AIX32-NEXT:   [[CMPWI:%[0-9]+]]:crrc = CMPWI [[COPY]], 1
++  ; AIX32-NEXT:   BCC 12, killed [[CMPWI]], %bb.3
++  ; AIX32-NEXT:   B %bb.1
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.1.for.body.preheader:
++  ; AIX32-NEXT:   successors: %bb.2(0x80000000)
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   MTCTRloop [[COPY]], implicit-def dead $ctr
++  ; AIX32-NEXT:   [[LI:%[0-9]+]]:gprc = LI 0
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.2.for.body:
++  ; AIX32-NEXT:   successors: %bb.2(0x7c000000), %bb.3(0x04000000)
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   [[PHI:%[0-9]+]]:gprc = PHI [[LI]], %bb.1, %1, %bb.2
++  ; AIX32-NEXT:   [[LWZtoc:%[0-9]+]]:gprc_and_gprc_nor0 = LWZtoc @a, $r2 :: (load (s32) from got)
++  ; AIX32-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LWZtoc]] :: (volatile dereferenceable load (s32) from @a)
++  ; AIX32-NEXT:   [[ADD4_:%[0-9]+]]:gprc = ADD4 [[PHI]], killed [[LWZ]]
++  ; AIX32-NEXT:   STW killed [[ADD4_]], 0, [[LWZtoc]] :: (volatile store (s32) into @a)
++  ; AIX32-NEXT:   [[ADD4_1:%[0-9]+]]:gprc = ADD4 [[PHI]], [[COPY1]]
++  ; AIX32-NEXT:   BDNZ %bb.2, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   B %bb.3
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.3.for.end:
++  ; AIX32-NEXT:   BLR implicit $lr, implicit $rm
++  ; LE64-LABEL: name: test3
++  ; LE64: bb.0.entry:
++  ; LE64-NEXT:   successors: %bb.1(0x50000000), %bb.3(0x30000000)
++  ; LE64-NEXT:   liveins: $x3, $x4
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   [[COPY:%[0-9]+]]:g8rc = COPY $x4
++  ; LE64-NEXT:   [[COPY1:%[0-9]+]]:g8rc = COPY $x3
++  ; LE64-NEXT:   [[COPY2:%[0-9]+]]:gprc = COPY [[COPY1]].sub_32
++  ; LE64-NEXT:   [[COPY3:%[0-9]+]]:gprc_and_gprc_nor0 = COPY [[COPY]].sub_32
++  ; LE64-NEXT:   [[CMPWI:%[0-9]+]]:crrc = CMPWI [[COPY3]], 1
++  ; LE64-NEXT:   BCC 12, killed [[CMPWI]], %bb.3
++  ; LE64-NEXT:   B %bb.1
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.1.for.body.preheader:
++  ; LE64-NEXT:   successors: %bb.2(0x80000000)
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   [[ADDI:%[0-9]+]]:gprc = ADDI [[COPY3]], -1
++  ; LE64-NEXT:   [[DEF:%[0-9]+]]:g8rc = IMPLICIT_DEF
++  ; LE64-NEXT:   [[INSERT_SUBREG:%[0-9]+]]:g8rc = INSERT_SUBREG [[DEF]], killed [[ADDI]], %subreg.sub_32
++  ; LE64-NEXT:   [[RLDICL:%[0-9]+]]:g8rc_and_g8rc_nox0 = RLDICL killed [[INSERT_SUBREG]], 0, 32
++  ; LE64-NEXT:   [[ADDI8_:%[0-9]+]]:g8rc = nuw nsw ADDI8 killed [[RLDICL]], 1
++  ; LE64-NEXT:   MTCTR8loop killed [[ADDI8_]], implicit-def dead $ctr8
++  ; LE64-NEXT:   [[LI:%[0-9]+]]:gprc = LI 0
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.2.for.body:
++  ; LE64-NEXT:   successors: %bb.2(0x7c000000), %bb.3(0x04000000)
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   [[PHI:%[0-9]+]]:gprc = PHI [[LI]], %bb.1, %1, %bb.2
++  ; LE64-NEXT:   [[ADDIStocHA8_:%[0-9]+]]:g8rc_and_g8rc_nox0 = ADDIStocHA8 $x2, @a
++  ; LE64-NEXT:   [[LDtocL:%[0-9]+]]:g8rc_and_g8rc_nox0 = LDtocL @a, killed [[ADDIStocHA8_]] :: (load (s64) from got)
++  ; LE64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtocL]] :: (volatile dereferenceable load (s32) from @a)
++  ; LE64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = ADD4 [[PHI]], killed [[LWZ]]
++  ; LE64-NEXT:   STW killed [[ADD4_]], 0, [[LDtocL]] :: (volatile store (s32) into @a)
++  ; LE64-NEXT:   [[ADD4_1:%[0-9]+]]:gprc = ADD4 [[PHI]], [[COPY2]]
++  ; LE64-NEXT:   BDNZ8 %bb.2, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   B %bb.3
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.3.for.end:
++  ; LE64-NEXT:   BLR8 implicit $lr8, implicit $rm
++entry:
++  %cmp1 = icmp sgt i32 %d, 0
++  br i1 %cmp1, label %for.body, label %for.end
++
++for.body:                                         ; preds = %entry, %for.body
++  %i.02 = phi i32 [ %inc, %for.body ], [ 0, %entry ]
++  %mul = mul nsw i32 %i.02, %c
++  %0 = load volatile i32, i32* @a, align 4
++  %add = add nsw i32 %0, %mul
++  store volatile i32 %add, i32* @a, align 4
++  %inc = add nsw i32 %i.02, 1
++  %exitcond = icmp eq i32 %inc, %d
++  br i1 %exitcond, label %for.end, label %for.body
++
++for.end:                                          ; preds = %for.body, %entry
++  ret void
++}
++
++@tls_var = external thread_local global i8
++
++define i32 @test4(i32 %inp) {
++  ; AIX64-LABEL: name: test4
++  ; AIX64: bb.0.entry:
++  ; AIX64-NEXT:   successors: %bb.1(0x80000000)
++  ; AIX64-NEXT:   liveins: $x3
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   [[COPY:%[0-9]+]]:g8rc = COPY $x3
++  ; AIX64-NEXT:   [[COPY1:%[0-9]+]]:gprc_and_gprc_nor0 = COPY [[COPY]].sub_32
++  ; AIX64-NEXT:   [[CMPWI:%[0-9]+]]:crrc = CMPWI [[COPY1]], 1
++  ; AIX64-NEXT:   [[LI:%[0-9]+]]:gprc_and_gprc_nor0 = LI 1
++  ; AIX64-NEXT:   [[ISEL:%[0-9]+]]:gprc = ISEL [[COPY1]], [[LI]], [[CMPWI]].sub_lt
++  ; AIX64-NEXT:   [[SUBF:%[0-9]+]]:gprc = SUBF [[ISEL]], [[COPY1]]
++  ; AIX64-NEXT:   [[DEF:%[0-9]+]]:g8rc = IMPLICIT_DEF
++  ; AIX64-NEXT:   [[INSERT_SUBREG:%[0-9]+]]:g8rc = INSERT_SUBREG [[DEF]], killed [[SUBF]], %subreg.sub_32
++  ; AIX64-NEXT:   [[RLDICL:%[0-9]+]]:g8rc_and_g8rc_nox0 = RLDICL killed [[INSERT_SUBREG]], 0, 32
++  ; AIX64-NEXT:   [[ADDI8_:%[0-9]+]]:g8rc = nuw nsw ADDI8 killed [[RLDICL]], 1
++  ; AIX64-NEXT:   MTCTR8loop killed [[ADDI8_]], implicit-def dead $ctr8
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.1.for.body:
++  ; AIX64-NEXT:   successors: %bb.1(0x7c000000), %bb.2(0x04000000)
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT:   BDNZ8 %bb.1, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   B %bb.2
++  ; AIX64-NEXT: {{  $}}
++  ; AIX64-NEXT: bb.2.return:
++  ; AIX64-NEXT:   [[LDtoc:%[0-9]+]]:g8rc = LDtoc target-flags(ppc-lo) @tls_var, $x2 :: (load (s64) from got)
++  ; AIX64-NEXT:   [[LDtoc1:%[0-9]+]]:g8rc = LDtoc target-flags(ppc-tlsgd) @tls_var, $x2 :: (load (s64) from got)
++  ; AIX64-NEXT:   [[TLSGDAIX8_:%[0-9]+]]:g8rc = TLSGDAIX8 killed [[LDtoc1]], killed [[LDtoc]]
++  ; AIX64-NEXT:   [[COPY2:%[0-9]+]]:gprc = COPY [[TLSGDAIX8_]].sub_32
++  ; AIX64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = ADD4 killed [[COPY2]], [[ISEL]]
++  ; AIX64-NEXT:   [[DEF1:%[0-9]+]]:g8rc = IMPLICIT_DEF
++  ; AIX64-NEXT:   [[INSERT_SUBREG1:%[0-9]+]]:g8rc = INSERT_SUBREG [[DEF1]], killed [[ADD4_]], %subreg.sub_32
++  ; AIX64-NEXT:   $x3 = COPY [[INSERT_SUBREG1]]
++  ; AIX64-NEXT:   BLR8 implicit $lr8, implicit $rm, implicit $x3
++  ; AIX32-LABEL: name: test4
++  ; AIX32: bb.0.entry:
++  ; AIX32-NEXT:   successors: %bb.1(0x80000000)
++  ; AIX32-NEXT:   liveins: $r3
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   [[COPY:%[0-9]+]]:gprc_and_gprc_nor0 = COPY $r3
++  ; AIX32-NEXT:   [[CMPWI:%[0-9]+]]:crrc = CMPWI [[COPY]], 1
++  ; AIX32-NEXT:   [[LI:%[0-9]+]]:gprc_and_gprc_nor0 = LI 1
++  ; AIX32-NEXT:   [[ISEL:%[0-9]+]]:gprc = ISEL [[COPY]], [[LI]], [[CMPWI]].sub_lt
++  ; AIX32-NEXT:   [[SUBF:%[0-9]+]]:gprc_and_gprc_nor0 = SUBF [[ISEL]], [[COPY]]
++  ; AIX32-NEXT:   [[ADDI:%[0-9]+]]:gprc = ADDI killed [[SUBF]], 1
++  ; AIX32-NEXT:   MTCTRloop killed [[ADDI]], implicit-def dead $ctr
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.1.for.body:
++  ; AIX32-NEXT:   successors: %bb.1(0x7c000000), %bb.2(0x04000000)
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT:   BDNZ %bb.1, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   B %bb.2
++  ; AIX32-NEXT: {{  $}}
++  ; AIX32-NEXT: bb.2.return:
++  ; AIX32-NEXT:   [[LWZtoc:%[0-9]+]]:gprc = LWZtoc target-flags(ppc-lo) @tls_var, $r2 :: (load (s32) from got)
++  ; AIX32-NEXT:   [[LWZtoc1:%[0-9]+]]:gprc = LWZtoc target-flags(ppc-tlsgd) @tls_var, $r2 :: (load (s32) from got)
++  ; AIX32-NEXT:   [[TLSGDAIX:%[0-9]+]]:gprc = TLSGDAIX killed [[LWZtoc1]], killed [[LWZtoc]]
++  ; AIX32-NEXT:   [[ADD4_:%[0-9]+]]:gprc = ADD4 killed [[TLSGDAIX]], [[ISEL]]
++  ; AIX32-NEXT:   $r3 = COPY [[ADD4_]]
++  ; AIX32-NEXT:   BLR implicit $lr, implicit $rm, implicit $r3
++  ; LE64-LABEL: name: test4
++  ; LE64: bb.0.entry:
++  ; LE64-NEXT:   successors: %bb.1(0x80000000)
++  ; LE64-NEXT:   liveins: $x3
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   [[COPY:%[0-9]+]]:g8rc = COPY $x3
++  ; LE64-NEXT:   [[COPY1:%[0-9]+]]:gprc_and_gprc_nor0 = COPY [[COPY]].sub_32
++  ; LE64-NEXT:   [[CMPWI:%[0-9]+]]:crrc = CMPWI [[COPY1]], 1
++  ; LE64-NEXT:   [[LI:%[0-9]+]]:gprc_and_gprc_nor0 = LI 1
++  ; LE64-NEXT:   [[ISEL:%[0-9]+]]:gprc = ISEL [[COPY1]], [[LI]], [[CMPWI]].sub_lt
++  ; LE64-NEXT:   [[SUBF:%[0-9]+]]:gprc = SUBF [[ISEL]], [[COPY1]]
++  ; LE64-NEXT:   [[DEF:%[0-9]+]]:g8rc = IMPLICIT_DEF
++  ; LE64-NEXT:   [[INSERT_SUBREG:%[0-9]+]]:g8rc = INSERT_SUBREG [[DEF]], killed [[SUBF]], %subreg.sub_32
++  ; LE64-NEXT:   [[RLDICL:%[0-9]+]]:g8rc_and_g8rc_nox0 = RLDICL killed [[INSERT_SUBREG]], 0, 32
++  ; LE64-NEXT:   [[ADDI8_:%[0-9]+]]:g8rc = nuw nsw ADDI8 killed [[RLDICL]], 1
++  ; LE64-NEXT:   MTCTR8loop killed [[ADDI8_]], implicit-def dead $ctr8
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.1.for.body:
++  ; LE64-NEXT:   successors: %bb.1(0x7c000000), %bb.2(0x04000000)
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT:   BDNZ8 %bb.1, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   B %bb.2
++  ; LE64-NEXT: {{  $}}
++  ; LE64-NEXT: bb.2.return:
++  ; LE64-NEXT:   [[ADDISgotTprelHA:%[0-9]+]]:g8rc_and_g8rc_nox0 = ADDISgotTprelHA $x2, @tls_var
++  ; LE64-NEXT:   [[LDgotTprelL:%[0-9]+]]:g8rc_and_g8rc_nox0 = LDgotTprelL @tls_var, killed [[ADDISgotTprelHA]]
++  ; LE64-NEXT:   [[ADD8TLS:%[0-9]+]]:g8rc = ADD8TLS killed [[LDgotTprelL]], target-flags(ppc-tls) @tls_var
++  ; LE64-NEXT:   [[COPY2:%[0-9]+]]:gprc = COPY [[ADD8TLS]].sub_32
++  ; LE64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = ADD4 killed [[COPY2]], [[ISEL]]
++  ; LE64-NEXT:   [[DEF1:%[0-9]+]]:g8rc = IMPLICIT_DEF
++  ; LE64-NEXT:   [[INSERT_SUBREG1:%[0-9]+]]:g8rc = INSERT_SUBREG [[DEF1]], killed [[ADD4_]], %subreg.sub_32
++  ; LE64-NEXT:   $x3 = COPY [[INSERT_SUBREG1]]
++  ; LE64-NEXT:   BLR8 implicit $lr8, implicit $rm, implicit $x3
++entry:
++  br label %for.body
++
++for.body:                                         ; preds = %for.body, %entry
++  %phi = phi i32 [ %dec, %for.body ], [ %inp, %entry ]
++  %load = ptrtoint i8* @tls_var to i32
++  %val = add i32 %load, %phi
++  %dec = add i32 %phi, -1
++  %cmp = icmp sgt i32 %phi, 1
++  br i1 %cmp, label %for.body, label %return
++
++return:                                           ; preds = %for.body
++  ret i32 %val
++}
+
+From e31bbef2536cc110e073a91f7829f506c77670f2 Mon Sep 17 00:00:00 2001
+From: Chen Zheng <czhengsz@cn.ibm.com>
+Date: Fri, 8 Apr 2022 03:24:46 -0400
+Subject: [PATCH 12/27] [PowerPC] mapping hardward loop intrinsics to powerpc
+ pseudo
+
+Map hardware loop intrinsics loop_decrement and set_loop_iteration
+to the new PowerPC pseudo instructions, so that the hardware loop
+intrinsics will be expanded to normal cmp+branch form or ctrloop
+form based on the CTR register usage on MIR level.
+
+Reviewed By: lkail
+
+Differential Revision: https://reviews.llvm.org/D123366
+
+(cherry picked from commit d9004dfbabc62887f09775297436792077ce4496)
+---
+ llvm/lib/Target/PowerPC/PPCCTRLoops.cpp      | 31 ++++-----
+ llvm/lib/Target/PowerPC/PPCISelDAGToDAG.cpp  | 56 ++++++++++++++++
+ llvm/lib/Target/PowerPC/PPCISelLowering.cpp  | 50 --------------
+ llvm/lib/Target/PowerPC/PPCInstr64Bit.td     | 10 +--
+ llvm/lib/Target/PowerPC/PPCInstrInfo.td      |  9 +--
+ llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll | 36 ++++++----
+ llvm/test/CodeGen/PowerPC/ctrloops32.mir     | 70 ++++++++++----------
+ llvm/test/CodeGen/PowerPC/ctrloops64.mir     | 70 ++++++++++----------
+ llvm/test/CodeGen/PowerPC/sms-phi.ll         |  8 +--
+ 9 files changed, 172 insertions(+), 168 deletions(-)
+
+diff --git a/llvm/lib/Target/PowerPC/PPCCTRLoops.cpp b/llvm/lib/Target/PowerPC/PPCCTRLoops.cpp
+index 48167c3dc9ca8..cb0519c8fe7bb 100644
+--- a/llvm/lib/Target/PowerPC/PPCCTRLoops.cpp
++++ b/llvm/lib/Target/PowerPC/PPCCTRLoops.cpp
+@@ -7,21 +7,21 @@
+ //===----------------------------------------------------------------------===//
+ //
+ // This pass generates machine instructions for the CTR loops related pseudos:
+-// 1: MTCTRPseudo/DecreaseCTRPseudo
+-// 2: MTCTR8Pseudo/DecreaseCTR8Pseudo
++// 1: MTCTRloop/DecreaseCTRloop
++// 2: MTCTR8loop/DecreaseCTR8loop
+ //
+ // If a CTR loop can be generated:
+-// 1: MTCTRPseudo/MTCTR8Pseudo will be converted to "mtctr"
+-// 2: DecreaseCTRPseudo/DecreaseCTR8Pseudo will be converted to "bdnz/bdz" and
++// 1: MTCTRloop/MTCTR8loop will be converted to "mtctr"
++// 2: DecreaseCTRloop/DecreaseCTR8loop will be converted to "bdnz/bdz" and
+ //    its user branch instruction can be deleted.
+ //
+ // If a CTR loop can not be generated due to clobber of CTR:
+-// 1: MTCTRPseudo/MTCTR8Pseudo can be deleted.
+-// 2: DecreaseCTRPseudo/DecreaseCTR8Pseudo will be converted to "addi -1" and
++// 1: MTCTRloop/MTCTR8loop can be deleted.
++// 2: DecreaseCTRloop/DecreaseCTR8loop will be converted to "addi -1" and
+ //    a "cmplwi/cmpldi".
+ //
+ // This pass runs just before register allocation, because we don't want
+-// register allocator to allocate register for DecreaseCTRPseudo if a CTR can be
++// register allocator to allocate register for DecreaseCTRloop if a CTR can be
+ // generated or if a CTR loop can not be generated, we don't have any condition
+ // register for the new added "cmplwi/cmpldi".
+ //
+@@ -148,8 +148,8 @@ bool PPCCTRLoops::processLoop(MachineLoop *ML) {
+     return true;
+ 
+   auto IsLoopStart = [](MachineInstr &MI) {
+-    return MI.getOpcode() == PPC::MTCTRPseudo ||
+-           MI.getOpcode() == PPC::MTCTR8Pseudo;
++    return MI.getOpcode() == PPC::MTCTRloop ||
++           MI.getOpcode() == PPC::MTCTR8loop;
+   };
+ 
+   auto SearchForStart =
+@@ -166,7 +166,7 @@ bool PPCCTRLoops::processLoop(MachineLoop *ML) {
+   bool InvalidCTRLoop = false;
+ 
+   MachineBasicBlock *Preheader = ML->getLoopPreheader();
+-  // If there is no preheader for this loop, there must be no MTCTRPseudo
++  // If there is no preheader for this loop, there must be no MTCTRloop
+   // either.
+   if (!Preheader)
+     return false;
+@@ -205,8 +205,8 @@ bool PPCCTRLoops::processLoop(MachineLoop *ML) {
+   // normal loop.
+   for (auto *MBB : reverse(ML->getBlocks())) {
+     for (auto &MI : *MBB) {
+-      if (MI.getOpcode() == PPC::DecreaseCTRPseudo ||
+-          MI.getOpcode() == PPC::DecreaseCTR8Pseudo)
++      if (MI.getOpcode() == PPC::DecreaseCTRloop ||
++          MI.getOpcode() == PPC::DecreaseCTR8loop)
+         Dec = &MI;
+       else if (!InvalidCTRLoop)
+         // If any instruction clobber CTR, then we can not generate a CTR loop.
+@@ -341,18 +341,11 @@ void PPCCTRLoops::expandCTRLoops(MachineLoop *ML, MachineInstr *Start,
+     llvm_unreachable("Unhandled branch user for DecreaseCTRloop.");
+   }
+ 
+-  unsigned MTCTROpcode = Is64Bit ? PPC::MTCTR8 : PPC::MTCTR;
+-
+-  // Generate "mtctr" in the loop preheader.
+-  BuildMI(*Preheader, Start, Start->getDebugLoc(), TII->get(MTCTROpcode))
+-      .addReg(Start->getOperand(0).getReg());
+-
+   // Generate "bdnz/bdz" in the exiting block just before the terminator.
+   BuildMI(*Exiting, &*BrInstr, BrInstr->getDebugLoc(), TII->get(Opcode))
+       .addMBB(BrInstr->getOperand(1).getMBB());
+ 
+   // Remove the pseudo instructions.
+-  Start->eraseFromParent();
+   BrInstr->eraseFromParent();
+   Dec->eraseFromParent();
+ }
+diff --git a/llvm/lib/Target/PowerPC/PPCISelDAGToDAG.cpp b/llvm/lib/Target/PowerPC/PPCISelDAGToDAG.cpp
+index 14c4fd3a9ffad..cdab2184b33c9 100644
+--- a/llvm/lib/Target/PowerPC/PPCISelDAGToDAG.cpp
++++ b/llvm/lib/Target/PowerPC/PPCISelDAGToDAG.cpp
+@@ -417,6 +417,7 @@ namespace {
+ private:
+     bool trySETCC(SDNode *N);
+     bool tryFoldSWTestBRCC(SDNode *N);
++    bool trySelectLoopCountIntrinsic(SDNode *N);
+     bool tryAsSingleRLDICL(SDNode *N);
+     bool tryAsSingleRLDICR(SDNode *N);
+     bool tryAsSingleRLWINM(SDNode *N);
+@@ -4718,6 +4719,59 @@ bool PPCDAGToDAGISel::tryFoldSWTestBRCC(SDNode *N) {
+   return false;
+ }
+ 
++bool PPCDAGToDAGISel::trySelectLoopCountIntrinsic(SDNode *N) {
++  // Sometimes the promoted value of the intrinsic is ANDed by some non-zero
++  // value, for example when crbits is disabled. If so, select the
++  // loop_decrement intrinsics now.
++  ISD::CondCode CC = cast<CondCodeSDNode>(N->getOperand(1))->get();
++  SDValue LHS = N->getOperand(2), RHS = N->getOperand(3);
++
++  if (LHS.getOpcode() != ISD::AND || !isa<ConstantSDNode>(LHS.getOperand(1)) ||
++      isNullConstant(LHS.getOperand(1)))
++    return false;
++
++  if (LHS.getOperand(0).getOpcode() != ISD::INTRINSIC_W_CHAIN ||
++      cast<ConstantSDNode>(LHS.getOperand(0).getOperand(1))->getZExtValue() !=
++          Intrinsic::loop_decrement)
++    return false;
++
++  if (!isa<ConstantSDNode>(RHS))
++    return false;
++
++  assert((CC == ISD::SETEQ || CC == ISD::SETNE) &&
++         "Counter decrement comparison is not EQ or NE");
++
++  SDValue OldDecrement = LHS.getOperand(0);
++  assert(OldDecrement.hasOneUse() && "loop decrement has more than one use!");
++
++  SDLoc DecrementLoc(OldDecrement);
++  SDValue ChainInput = OldDecrement.getOperand(0);
++  SDValue DecrementOps[] = {Subtarget->isPPC64() ? getI64Imm(1, DecrementLoc)
++                                                 : getI32Imm(1, DecrementLoc)};
++  unsigned DecrementOpcode =
++      Subtarget->isPPC64() ? PPC::DecreaseCTR8loop : PPC::DecreaseCTRloop;
++  SDNode *NewDecrement = CurDAG->getMachineNode(DecrementOpcode, DecrementLoc,
++                                                MVT::i1, DecrementOps);
++
++  unsigned Val = cast<ConstantSDNode>(RHS)->getZExtValue();
++  bool IsBranchOnTrue = (CC == ISD::SETEQ && Val) || (CC == ISD::SETNE && !Val);
++  unsigned Opcode = IsBranchOnTrue ? PPC::BC : PPC::BCn;
++
++  ReplaceUses(LHS.getValue(0), LHS.getOperand(1));
++  CurDAG->RemoveDeadNode(LHS.getNode());
++
++  // Mark the old loop_decrement intrinsic as dead.
++  ReplaceUses(OldDecrement.getValue(1), ChainInput);
++  CurDAG->RemoveDeadNode(OldDecrement.getNode());
++
++  SDValue Chain = CurDAG->getNode(ISD::TokenFactor, SDLoc(N), MVT::Other,
++                                  ChainInput, N->getOperand(0));
++
++  CurDAG->SelectNodeTo(N, Opcode, MVT::Other, SDValue(NewDecrement, 0),
++                       N->getOperand(4), Chain);
++  return true;
++}
++
+ bool PPCDAGToDAGISel::tryAsSingleRLWINM(SDNode *N) {
+   assert(N->getOpcode() == ISD::AND && "ISD::AND SDNode expected");
+   unsigned Imm;
+@@ -5739,6 +5793,8 @@ void PPCDAGToDAGISel::Select(SDNode *N) {
+   case ISD::BR_CC: {
+     if (tryFoldSWTestBRCC(N))
+       return;
++    if (trySelectLoopCountIntrinsic(N))
++      return;
+     ISD::CondCode CC = cast<CondCodeSDNode>(N->getOperand(1))->get();
+     unsigned PCC =
+         getPredicateForSetCC(CC, N->getOperand(2).getValueType(), Subtarget);
+diff --git a/llvm/lib/Target/PowerPC/PPCISelLowering.cpp b/llvm/lib/Target/PowerPC/PPCISelLowering.cpp
+index 3c461a627d61c..086fbbe82ed3e 100644
+--- a/llvm/lib/Target/PowerPC/PPCISelLowering.cpp
++++ b/llvm/lib/Target/PowerPC/PPCISelLowering.cpp
+@@ -15719,25 +15719,6 @@ SDValue PPCTargetLowering::PerformDAGCombine(SDNode *N,
+         return SDValue(VCMPrecNode, 0);
+     }
+     break;
+-  case ISD::BRCOND: {
+-    SDValue Cond = N->getOperand(1);
+-    SDValue Target = N->getOperand(2);
+-
+-    if (Cond.getOpcode() == ISD::INTRINSIC_W_CHAIN &&
+-        cast<ConstantSDNode>(Cond.getOperand(1))->getZExtValue() ==
+-          Intrinsic::loop_decrement) {
+-
+-      // We now need to make the intrinsic dead (it cannot be instruction
+-      // selected).
+-      DAG.ReplaceAllUsesOfValueWith(Cond.getValue(1), Cond.getOperand(0));
+-      assert(Cond.getNode()->hasOneUse() &&
+-             "Counter decrement has more than one use");
+-
+-      return DAG.getNode(PPCISD::BDNZ, dl, MVT::Other,
+-                         N->getOperand(0), Target);
+-    }
+-  }
+-  break;
+   case ISD::BR_CC: {
+     // If this is a branch on an altivec predicate comparison, lower this so
+     // that we don't have to do a MFOCRF: instead, branch directly on CR6.  This
+@@ -15746,37 +15727,6 @@ SDValue PPCTargetLowering::PerformDAGCombine(SDNode *N,
+     ISD::CondCode CC = cast<CondCodeSDNode>(N->getOperand(1))->get();
+     SDValue LHS = N->getOperand(2), RHS = N->getOperand(3);
+ 
+-    // Sometimes the promoted value of the intrinsic is ANDed by some non-zero
+-    // value. If so, pass-through the AND to get to the intrinsic.
+-    if (LHS.getOpcode() == ISD::AND &&
+-        LHS.getOperand(0).getOpcode() == ISD::INTRINSIC_W_CHAIN &&
+-        cast<ConstantSDNode>(LHS.getOperand(0).getOperand(1))->getZExtValue() ==
+-          Intrinsic::loop_decrement &&
+-        isa<ConstantSDNode>(LHS.getOperand(1)) &&
+-        !isNullConstant(LHS.getOperand(1)))
+-      LHS = LHS.getOperand(0);
+-
+-    if (LHS.getOpcode() == ISD::INTRINSIC_W_CHAIN &&
+-        cast<ConstantSDNode>(LHS.getOperand(1))->getZExtValue() ==
+-          Intrinsic::loop_decrement &&
+-        isa<ConstantSDNode>(RHS)) {
+-      assert((CC == ISD::SETEQ || CC == ISD::SETNE) &&
+-             "Counter decrement comparison is not EQ or NE");
+-
+-      unsigned Val = cast<ConstantSDNode>(RHS)->getZExtValue();
+-      bool isBDNZ = (CC == ISD::SETEQ && Val) ||
+-                    (CC == ISD::SETNE && !Val);
+-
+-      // We now need to make the intrinsic dead (it cannot be instruction
+-      // selected).
+-      DAG.ReplaceAllUsesOfValueWith(LHS.getValue(1), LHS.getOperand(0));
+-      assert(LHS.getNode()->hasOneUse() &&
+-             "Counter decrement has more than one use");
+-
+-      return DAG.getNode(isBDNZ ? PPCISD::BDNZ : PPCISD::BDZ, dl, MVT::Other,
+-                         N->getOperand(0), N->getOperand(4));
+-    }
+-
+     int CompareOpc;
+     bool isDot;
+ 
+diff --git a/llvm/lib/Target/PowerPC/PPCInstr64Bit.td b/llvm/lib/Target/PowerPC/PPCInstr64Bit.td
+index dbe7a7805c617..7d648b1429bee 100644
+--- a/llvm/lib/Target/PowerPC/PPCInstr64Bit.td
++++ b/llvm/lib/Target/PowerPC/PPCInstr64Bit.td
+@@ -580,13 +580,9 @@ def MTCTR8loop : XFXForm_7_ext<31, 467, 9, (outs), (ins g8rc:$rS),
+                  PPC970_DGroup_First, PPC970_Unit_FXU;
+ }
+ 
+-
+-let hasSideEffects = 1, Defs = [CTR8] in
+-def MTCTR8Pseudo : PPCEmitTimePseudo<(outs), (ins g8rc:$rS), "#MTCTR8Pseudo", []>;
+-
+-let hasSideEffects = 1, Uses = [CTR8], Defs = [CTR8] in
+-def DecreaseCTR8Pseudo : PPCEmitTimePseudo<(outs crbitrc:$rT), (ins i64imm:$stride),
+-                                          "#DecreaseCTR8Pseudo", []>;
++let hasSideEffects = 1, hasNoSchedulingInfo = 1, Uses = [CTR8], Defs = [CTR8] in
++def DecreaseCTR8loop : PPCEmitTimePseudo<(outs crbitrc:$rT), (ins i64imm:$stride),
++                                        "#DecreaseCTR8loop", [(set i1:$rT, (int_loop_decrement (i64 imm:$stride)))]>;
+ 
+ let Pattern = [(set i64:$rT, readcyclecounter)] in
+ def MFTB8 : XFXForm_1_ext<31, 339, 268, (outs g8rc:$rT), (ins),
+diff --git a/llvm/lib/Target/PowerPC/PPCInstrInfo.td b/llvm/lib/Target/PowerPC/PPCInstrInfo.td
+index f651b51d26845..046d3b24541cb 100644
+--- a/llvm/lib/Target/PowerPC/PPCInstrInfo.td
++++ b/llvm/lib/Target/PowerPC/PPCInstrInfo.td
+@@ -2549,12 +2549,9 @@ def MTCTRloop : XFXForm_7_ext<31, 467, 9, (outs), (ins gprc:$rS),
+                 PPC970_DGroup_First, PPC970_Unit_FXU;
+ }
+ 
+-let hasSideEffects = 1, Defs = [CTR] in
+-def MTCTRPseudo : PPCEmitTimePseudo<(outs), (ins gprc:$rS), "#MTCTRPseudo", []>;
+-
+-let hasSideEffects = 1, Uses = [CTR], Defs = [CTR] in
+-def DecreaseCTRPseudo : PPCEmitTimePseudo<(outs crbitrc:$rT), (ins i32imm:$stride),
+-                                          "#DecreaseCTRPseudo", []>;
++let hasSideEffects = 1, hasNoSchedulingInfo = 1, Uses = [CTR], Defs = [CTR] in
++def DecreaseCTRloop : PPCEmitTimePseudo<(outs crbitrc:$rT), (ins i32imm:$stride),
++                                       "#DecreaseCTRloop", [(set i1:$rT, (int_loop_decrement (i32 imm:$stride)))]>;
+ 
+ let hasSideEffects = 0 in {
+ let Defs = [LR] in {
+diff --git a/llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll b/llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll
+index 39f33d9e849a0..9890830194e22 100644
+--- a/llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll
++++ b/llvm/test/CodeGen/PowerPC/ctrloops-pseudo.ll
+@@ -29,7 +29,8 @@ define void @test1(i32 %c) nounwind {
+   ; AIX64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtoc]] :: (volatile dereferenceable load (s32) from @a)
+   ; AIX64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY1]]
+   ; AIX64-NEXT:   STW killed [[ADD4_]], 0, [[LDtoc]] :: (volatile store (s32) into @a)
+-  ; AIX64-NEXT:   BDNZ8 %bb.1, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   [[DecreaseCTR8loop:%[0-9]+]]:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   BC killed [[DecreaseCTR8loop]], %bb.1
+   ; AIX64-NEXT:   B %bb.2
+   ; AIX64-NEXT: {{  $}}
+   ; AIX64-NEXT: bb.2.for.end:
+@@ -50,7 +51,8 @@ define void @test1(i32 %c) nounwind {
+   ; AIX32-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LWZtoc]] :: (volatile dereferenceable load (s32) from @a)
+   ; AIX32-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY]]
+   ; AIX32-NEXT:   STW killed [[ADD4_]], 0, [[LWZtoc]] :: (volatile store (s32) into @a)
+-  ; AIX32-NEXT:   BDNZ %bb.1, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   [[DecreaseCTRloop:%[0-9]+]]:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   BC killed [[DecreaseCTRloop]], %bb.1
+   ; AIX32-NEXT:   B %bb.2
+   ; AIX32-NEXT: {{  $}}
+   ; AIX32-NEXT: bb.2.for.end:
+@@ -73,7 +75,8 @@ define void @test1(i32 %c) nounwind {
+   ; LE64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtocL]] :: (volatile dereferenceable load (s32) from @a)
+   ; LE64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY1]]
+   ; LE64-NEXT:   STW killed [[ADD4_]], 0, [[LDtocL]] :: (volatile store (s32) into @a)
+-  ; LE64-NEXT:   BDNZ8 %bb.1, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   [[DecreaseCTR8loop:%[0-9]+]]:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   BC killed [[DecreaseCTR8loop]], %bb.1
+   ; LE64-NEXT:   B %bb.2
+   ; LE64-NEXT: {{  $}}
+   ; LE64-NEXT: bb.2.for.end:
+@@ -125,7 +128,8 @@ define void @test2(i32 %c, i32 %d) nounwind {
+   ; AIX64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtoc]] :: (volatile dereferenceable load (s32) from @a)
+   ; AIX64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY2]]
+   ; AIX64-NEXT:   STW killed [[ADD4_]], 0, [[LDtoc]] :: (volatile store (s32) into @a)
+-  ; AIX64-NEXT:   BDNZ8 %bb.2, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   [[DecreaseCTR8loop:%[0-9]+]]:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   BC killed [[DecreaseCTR8loop]], %bb.2
+   ; AIX64-NEXT:   B %bb.3
+   ; AIX64-NEXT: {{  $}}
+   ; AIX64-NEXT: bb.3.for.end:
+@@ -153,7 +157,8 @@ define void @test2(i32 %c, i32 %d) nounwind {
+   ; AIX32-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LWZtoc]] :: (volatile dereferenceable load (s32) from @a)
+   ; AIX32-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY1]]
+   ; AIX32-NEXT:   STW killed [[ADD4_]], 0, [[LWZtoc]] :: (volatile store (s32) into @a)
+-  ; AIX32-NEXT:   BDNZ %bb.2, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   [[DecreaseCTRloop:%[0-9]+]]:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   BC killed [[DecreaseCTRloop]], %bb.2
+   ; AIX32-NEXT:   B %bb.3
+   ; AIX32-NEXT: {{  $}}
+   ; AIX32-NEXT: bb.3.for.end:
+@@ -189,7 +194,8 @@ define void @test2(i32 %c, i32 %d) nounwind {
+   ; LE64-NEXT:   [[LWZ:%[0-9]+]]:gprc = LWZ 0, [[LDtocL]] :: (volatile dereferenceable load (s32) from @a)
+   ; LE64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = nsw ADD4 killed [[LWZ]], [[COPY2]]
+   ; LE64-NEXT:   STW killed [[ADD4_]], 0, [[LDtocL]] :: (volatile store (s32) into @a)
+-  ; LE64-NEXT:   BDNZ8 %bb.2, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   [[DecreaseCTR8loop:%[0-9]+]]:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   BC killed [[DecreaseCTR8loop]], %bb.2
+   ; LE64-NEXT:   B %bb.3
+   ; LE64-NEXT: {{  $}}
+   ; LE64-NEXT: bb.3.for.end:
+@@ -245,7 +251,8 @@ define void @test3(i32 %c, i32 %d) nounwind {
+   ; AIX64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = ADD4 [[PHI]], killed [[LWZ]]
+   ; AIX64-NEXT:   STW killed [[ADD4_]], 0, [[LDtoc]] :: (volatile store (s32) into @a)
+   ; AIX64-NEXT:   [[ADD4_1:%[0-9]+]]:gprc = ADD4 [[PHI]], [[COPY2]]
+-  ; AIX64-NEXT:   BDNZ8 %bb.2, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   [[DecreaseCTR8loop:%[0-9]+]]:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   BC killed [[DecreaseCTR8loop]], %bb.2
+   ; AIX64-NEXT:   B %bb.3
+   ; AIX64-NEXT: {{  $}}
+   ; AIX64-NEXT: bb.3.for.end:
+@@ -276,7 +283,8 @@ define void @test3(i32 %c, i32 %d) nounwind {
+   ; AIX32-NEXT:   [[ADD4_:%[0-9]+]]:gprc = ADD4 [[PHI]], killed [[LWZ]]
+   ; AIX32-NEXT:   STW killed [[ADD4_]], 0, [[LWZtoc]] :: (volatile store (s32) into @a)
+   ; AIX32-NEXT:   [[ADD4_1:%[0-9]+]]:gprc = ADD4 [[PHI]], [[COPY1]]
+-  ; AIX32-NEXT:   BDNZ %bb.2, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   [[DecreaseCTRloop:%[0-9]+]]:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   BC killed [[DecreaseCTRloop]], %bb.2
+   ; AIX32-NEXT:   B %bb.3
+   ; AIX32-NEXT: {{  $}}
+   ; AIX32-NEXT: bb.3.for.end:
+@@ -315,7 +323,8 @@ define void @test3(i32 %c, i32 %d) nounwind {
+   ; LE64-NEXT:   [[ADD4_:%[0-9]+]]:gprc = ADD4 [[PHI]], killed [[LWZ]]
+   ; LE64-NEXT:   STW killed [[ADD4_]], 0, [[LDtocL]] :: (volatile store (s32) into @a)
+   ; LE64-NEXT:   [[ADD4_1:%[0-9]+]]:gprc = ADD4 [[PHI]], [[COPY2]]
+-  ; LE64-NEXT:   BDNZ8 %bb.2, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   [[DecreaseCTR8loop:%[0-9]+]]:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   BC killed [[DecreaseCTR8loop]], %bb.2
+   ; LE64-NEXT:   B %bb.3
+   ; LE64-NEXT: {{  $}}
+   ; LE64-NEXT: bb.3.for.end:
+@@ -361,7 +370,8 @@ define i32 @test4(i32 %inp) {
+   ; AIX64-NEXT: bb.1.for.body:
+   ; AIX64-NEXT:   successors: %bb.1(0x7c000000), %bb.2(0x04000000)
+   ; AIX64-NEXT: {{  $}}
+-  ; AIX64-NEXT:   BDNZ8 %bb.1, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   [[DecreaseCTR8loop:%[0-9]+]]:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
++  ; AIX64-NEXT:   BC killed [[DecreaseCTR8loop]], %bb.1
+   ; AIX64-NEXT:   B %bb.2
+   ; AIX64-NEXT: {{  $}}
+   ; AIX64-NEXT: bb.2.return:
+@@ -390,7 +400,8 @@ define i32 @test4(i32 %inp) {
+   ; AIX32-NEXT: bb.1.for.body:
+   ; AIX32-NEXT:   successors: %bb.1(0x7c000000), %bb.2(0x04000000)
+   ; AIX32-NEXT: {{  $}}
+-  ; AIX32-NEXT:   BDNZ %bb.1, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   [[DecreaseCTRloop:%[0-9]+]]:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
++  ; AIX32-NEXT:   BC killed [[DecreaseCTRloop]], %bb.1
+   ; AIX32-NEXT:   B %bb.2
+   ; AIX32-NEXT: {{  $}}
+   ; AIX32-NEXT: bb.2.return:
+@@ -420,7 +431,8 @@ define i32 @test4(i32 %inp) {
+   ; LE64-NEXT: bb.1.for.body:
+   ; LE64-NEXT:   successors: %bb.1(0x7c000000), %bb.2(0x04000000)
+   ; LE64-NEXT: {{  $}}
+-  ; LE64-NEXT:   BDNZ8 %bb.1, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   [[DecreaseCTR8loop:%[0-9]+]]:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
++  ; LE64-NEXT:   BC killed [[DecreaseCTR8loop]], %bb.1
+   ; LE64-NEXT:   B %bb.2
+   ; LE64-NEXT: {{  $}}
+   ; LE64-NEXT: bb.2.return:
+diff --git a/llvm/test/CodeGen/PowerPC/ctrloops32.mir b/llvm/test/CodeGen/PowerPC/ctrloops32.mir
+index 90ee800042c3e..ffe62cf6a2f75 100644
+--- a/llvm/test/CodeGen/PowerPC/ctrloops32.mir
++++ b/llvm/test/CodeGen/PowerPC/ctrloops32.mir
+@@ -10,16 +10,16 @@ body:             |
+   bb.0.entry:
+ 
+     %0:gprc = LI 2048
+-    ; CHECK: MTCTR
++    ; CHECK: MTCTRloop
+     ; CHECK: BDNZ
+     ; CHECK-NOT: ADDI
+     ; CHECK-NOT: CMPLWI
+     ; CHECK-NOT: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %1:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -35,17 +35,17 @@ body:             |
+   bb.0.entry:
+ 
+     %0:gprc = LI 2048
+-    ; CHECK-NOT: MTCTR
++    ; CHECK-NOT: MTCTRloop
+     ; CHECK-NOT: BDNZ
+     ; CHECK: ADDI
+     ; CHECK: CMPLWI
+     ; CHECK: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+     INLINEASM &"", 1 /* sideeffect attdialect */, 12 /* clobber */, implicit-def early-clobber $ctr
+-    %1:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %1:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -61,17 +61,17 @@ body:             |
+   bb.0.entry:
+ 
+     %0:gprc = LI 2048
+-    ; CHECK-NOT: MTCTR
++    ; CHECK-NOT: MTCTRloop
+     ; CHECK-NOT: BDNZ
+     ; CHECK: ADDI
+     ; CHECK: CMPLWI
+     ; CHECK: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+     %1:gprc = MFCTR implicit $ctr
+-    %2:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %2:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -92,12 +92,12 @@ body:             |
+     ; CHECK: ADDI
+     ; CHECK: CMPLWI
+     ; CHECK: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+     BL @test_fail_use_in_loop, csr_aix32, implicit-def dead $lr, implicit $rm
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %1:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -119,11 +119,11 @@ body:             |
+     ; CHECK-NOT: ADDI
+     ; CHECK-NOT: CMPLWI
+     ; CHECK-NOT: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %1:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -144,12 +144,12 @@ body:             |
+     ; CHECK: ADDI
+     ; CHECK: CMPLWI
+     ; CHECK: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+     BL @test_fail_use_in_loop, csr_aix32, implicit-def dead $lr, implicit $rm
+-    %1:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %1:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -174,12 +174,12 @@ body:             |
+     renamable %1:crrc = CMPLW killed renamable $r3, killed renamable $r4
+     renamable %2:crbitrc = COPY %1.sub_gt
+     MTLR %0:gprc, implicit-def $lr
+-    MTCTRPseudo %0:gprc, implicit-def dead $ctr
++    MTCTRloop %0:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+     BCLRL renamable %2, implicit $lr, implicit $rm
+-    %3:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %3:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %3:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -196,16 +196,16 @@ body:             |
+     liveins: $ctr
+ 
+     %0:gprc = LI 2048
+-    ; CHECK-NOT: MTCTR
++    ; CHECK-NOT: MTCTRloop
+     ; CHECK-NOT: BDNZ
+     ; CHECK: ADDI
+     ; CHECK: CMPLWI
+     ; CHECK: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %1:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -222,16 +222,16 @@ body:             |
+ 
+     INLINEASM &"", 1 /* sideeffect attdialect */, 12 /* clobber */, implicit-def early-clobber $ctr
+     %0:gprc = LI 2048
+-    ; CHECK2-NOT: MTCTR
++    ; CHECK-NOT: MTCTRloop
+     ; CHECK-NOT: BDNZ
+     ; CHECK: ADDI
+     ; CHECK: CMPLWI
+     ; CHECK: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %1:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -248,16 +248,16 @@ body:             |
+ 
+     %0:gprc = MFCTR implicit $ctr
+     %1:gprc = LI 2048
+-    ; CHECK: MTCTR
++    ; CHECK: MTCTRloop
+     ; CHECK: BDNZ
+     ; CHECK-NOT: ADDI
+     ; CHECK-NOT: CMPLWI
+     ; CHECK-NOT: BC
+-    MTCTRPseudo killed %1:gprc, implicit-def dead $ctr
++    MTCTRloop killed %1:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+-    %2:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %2:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -273,17 +273,17 @@ body:             |
+   bb.0.entry:
+ 
+     %0:gprc = LI 2048
+-    ; CHECK-NOT: MTCTR
++    ; CHECK-NOT: MTCTRloop
+     ; CHECK-NOT: BDNZ
+     ; CHECK: ADDI
+     ; CHECK: CMPLWI
+     ; CHECK: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+     %1:gprc = MFCTR implicit $ctr
+ 
+   bb.1:
+ 
+-    %2:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %2:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -299,17 +299,17 @@ body:             |
+   bb.0.entry:
+ 
+     %0:gprc = LI 2048
+-    ; CHECK-NOT: MTCTR
++    ; CHECK-NOT: MTCTRloop
+     ; CHECK-NOT: BDNZ
+     ; CHECK: ADDI
+     ; CHECK: CMPLWI
+     ; CHECK: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+     INLINEASM &"", 1 /* sideeffect attdialect */, 12 /* clobber */, implicit-def early-clobber $ctr
+ 
+   bb.1:
+ 
+-    %2:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %2:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -325,16 +325,16 @@ body:             |
+   bb.0.entry:
+ 
+     %0:gprc = LI 2048
+-    ; CHECK: MTCTR
++    ; CHECK: MTCTRloop
+     ; CHECK: BDNZ
+     ; CHECK-NOT: ADDI
+     ; CHECK-NOT: CMPLWI
+     ; CHECK-NOT: BC
+-    MTCTRPseudo killed %0:gprc, implicit-def dead $ctr
++    MTCTRloop killed %0:gprc, implicit-def dead $ctr
+ 
+   bb.1:
+ 
+-    %2:crbitrc = DecreaseCTRPseudo 1, implicit-def dead $ctr, implicit $ctr
++    %2:crbitrc = DecreaseCTRloop 1, implicit-def dead $ctr, implicit $ctr
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+diff --git a/llvm/test/CodeGen/PowerPC/ctrloops64.mir b/llvm/test/CodeGen/PowerPC/ctrloops64.mir
+index 1d4ed84cdd6b5..8e50c555195b1 100644
+--- a/llvm/test/CodeGen/PowerPC/ctrloops64.mir
++++ b/llvm/test/CodeGen/PowerPC/ctrloops64.mir
+@@ -12,16 +12,16 @@ body:             |
+   bb.0.entry:
+ 
+     %0:g8rc = LI8 2048
+-    ; CHECK: MTCTR8
++    ; CHECK: MTCTR8loop
+     ; CHECK: BDNZ8
+     ; CHECK-NOT: ADDI8
+     ; CHECK-NOT: CMPLDI
+     ; CHECK-NOT: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %1:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -37,17 +37,17 @@ body:             |
+   bb.0.entry:
+ 
+     %0:g8rc = LI8 2048
+-    ; CHECK-NOT: MTCTR8
++    ; CHECK-NOT: MTCTR8loop
+     ; CHECK-NOT: BDNZ8
+     ; CHECK: ADDI8
+     ; CHECK: CMPLDI
+     ; CHECK: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+     INLINEASM &"", 1 /* sideeffect attdialect */, 12 /* clobber */, implicit-def early-clobber $ctr8
+-    %1:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %1:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -63,17 +63,17 @@ body:             |
+   bb.0.entry:
+ 
+     %0:g8rc = LI8 2048
+-    ; CHECK-NOT: MTCTR8
++    ; CHECK-NOT: MTCTR8loop
+     ; CHECK-NOT: BDNZ8
+     ; CHECK: ADDI8
+     ; CHECK: CMPLDI
+     ; CHECK: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+     %1:g8rc = MFCTR8 implicit $ctr8
+-    %2:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %2:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -94,12 +94,12 @@ body:             |
+     ; CHECK: ADDI8
+     ; CHECK: CMPLDI
+     ; CHECK: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+     BL8 @test_fail_use_in_loop, csr_ppc64, implicit-def dead $lr8, implicit $rm
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %1:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -121,11 +121,11 @@ body:             |
+     ; CHECK-NOT: ADDI8
+     ; CHECK-NOT: CMPLDI
+     ; CHECK-NOT: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %1:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -146,12 +146,12 @@ body:             |
+     ; CHECK: ADDI8
+     ; CHECK: CMPLDI
+     ; CHECK: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+     BL8 @test_fail_use_in_loop, csr_ppc64, implicit-def dead $lr8, implicit $rm
+-    %1:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %1:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -176,12 +176,12 @@ body:             |
+     renamable %1:crrc = CMPLD killed renamable $x3, killed renamable $x4
+     renamable %2:crbitrc = COPY %1.sub_gt
+     MTLR8 %0:g8rc, implicit-def $lr8
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+     BCLRL renamable %2, implicit $lr, implicit $rm
+-    %3:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %3:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %3:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -198,16 +198,16 @@ body:             |
+     liveins: $ctr8
+ 
+     %0:g8rc = LI8 2048
+-    ; CHECK-NOT: MTCTR8
++    ; CHECK-NOT: MTCTR8loop
+     ; CHECK-NOT: BDNZ8
+     ; CHECK: ADDI8
+     ; CHECK: CMPLDI
+     ; CHECK: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %1:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -224,16 +224,16 @@ body:             |
+ 
+     INLINEASM &"", 1 /* sideeffect attdialect */, 12 /* clobber */, implicit-def early-clobber $ctr8
+     %0:g8rc = LI8 2048
+-    ; CHECK-NOT: MTCTR8
++    ; CHECK-NOT: MTCTR8loop
+     ; CHECK-NOT: BDNZ8
+     ; CHECK: ADDI8
+     ; CHECK: CMPLDI
+     ; CHECK: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+-    %1:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %1:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %1:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -250,16 +250,16 @@ body:             |
+ 
+     %0:g8rc = MFCTR8 implicit $ctr8
+     %1:g8rc = LI8 2048
+-    ; CHECK: MTCTR8
++    ; CHECK: MTCTR8loop
+     ; CHECK: BDNZ8
+     ; CHECK-NOT: ADDI8
+     ; CHECK-NOT: CMPLDI
+     ; CHECK-NOT: BC
+-    MTCTR8Pseudo killed %1:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %1:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+-    %2:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %2:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -275,17 +275,17 @@ body:             |
+   bb.0.entry:
+ 
+     %0:g8rc = LI8 2048
+-    ; CHECK-NOT: MTCTR8
++    ; CHECK-NOT: MTCTR8loop
+     ; CHECK-NOT: BDNZ8
+     ; CHECK: ADDI8
+     ; CHECK: CMPLDI
+     ; CHECK: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+     %1:g8rc = MFCTR8 implicit $ctr8
+ 
+   bb.1:
+ 
+-    %2:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %2:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -301,17 +301,17 @@ body:             |
+   bb.0.entry:
+ 
+     %0:g8rc = LI8 2048
+-    ; CHECK-NOT: MTCTR8
++    ; CHECK-NOT: MTCTR8loop
+     ; CHECK-NOT: BDNZ8
+     ; CHECK: ADDI8
+     ; CHECK: CMPLDI
+     ; CHECK: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+     INLINEASM &"", 1 /* sideeffect attdialect */, 12 /* clobber */, implicit-def early-clobber $ctr8
+ 
+   bb.1:
+ 
+-    %2:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %2:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+@@ -327,16 +327,16 @@ body:             |
+   bb.0.entry:
+ 
+     %0:g8rc = LI8 2048
+-    ; CHECK: MTCTR8
++    ; CHECK: MTCTR8loop
+     ; CHECK: BDNZ8
+     ; CHECK-NOT: ADDI8
+     ; CHECK-NOT: CMPLDI
+     ; CHECK-NOT: BC
+-    MTCTR8Pseudo killed %0:g8rc, implicit-def dead $ctr8
++    MTCTR8loop killed %0:g8rc, implicit-def dead $ctr8
+ 
+   bb.1:
+ 
+-    %2:crbitrc = DecreaseCTR8Pseudo 1, implicit-def dead $ctr8, implicit $ctr8
++    %2:crbitrc = DecreaseCTR8loop 1, implicit-def dead $ctr8, implicit $ctr8
+     BC killed %2:crbitrc, %bb.1
+     B %bb.2
+ 
+diff --git a/llvm/test/CodeGen/PowerPC/sms-phi.ll b/llvm/test/CodeGen/PowerPC/sms-phi.ll
+index 3ddf78157d716..4e9031bced6f4 100644
+--- a/llvm/test/CodeGen/PowerPC/sms-phi.ll
++++ b/llvm/test/CodeGen/PowerPC/sms-phi.ll
+@@ -4,11 +4,11 @@
+ ; RUN:       >/dev/null | FileCheck %s
+ define dso_local void @sha512() #0 {
+ ;CHECK: prolog:
+-;CHECK:        %18:g8rc = ADD8 %24:g8rc, %23:g8rc
++;CHECK:        %{{[0-9]+}}:g8rc = ADD8 %{{[0-9]+}}:g8rc, %{{[0-9]+}}:g8rc
+ ;CHECK: epilog:
+-;CHECK:        %28:g8rc_and_g8rc_nox0 = PHI %6:g8rc_and_g8rc_nox0, %bb.3, %22:g8rc_and_g8rc_nox0, %bb.4
+-;CHECK-NEXT:   %29:g8rc = PHI %12:g8rc, %bb.3, %16:g8rc, %bb.4
+-;CHECK-NEXT:   %30:g8rc = PHI %15:g8rc, %bb.3, %19:g8rc, %bb.4
++;CHECK:        %{{[0-9]+}}:g8rc_and_g8rc_nox0 = PHI %{{[0-9]+}}:g8rc_and_g8rc_nox0, %bb.3, %{{[0-9]+}}:g8rc_and_g8rc_nox0, %bb.4
++;CHECK-NEXT:   %{{[0-9]+}}:g8rc = PHI %{{[0-9]+}}:g8rc, %bb.3, %{{[0-9]+}}:g8rc, %bb.4
++;CHECK-NEXT:   %{{[0-9]+}}:g8rc = PHI %{{[0-9]+}}:g8rc, %bb.3, %{{[0-9]+}}:g8rc, %bb.4
+   br label %1
+ 
+ 1:                                                ; preds = %1, %0
+
+From aee61d4601a8f09afd9d851aeb7952aea0fe3986 Mon Sep 17 00:00:00 2001
+From: Gabriel Baraldi <baraldigabriel@gmail.com>
+Date: Mon, 22 Aug 2022 13:17:12 -0300
+Subject: [PATCH 13/27] Add patches for msan
+
+---
+ .../Instrumentation/MemorySanitizer.cpp       |  5 ++--
+ .../Instrumentation/MemorySanitizer/alloca.ll | 30 +++++++++++++++++++
+ .../MemorySanitizer/atomics.ll                | 14 +++++++++
+ 3 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp b/llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp
+index 4606bd5de6c30..6a4397967f010 100644
+--- a/llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp
++++ b/llvm/lib/Transforms/Instrumentation/MemorySanitizer.cpp
+@@ -1940,7 +1940,7 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
+     IRBuilder<> IRB(&I);
+     Value *Addr = I.getOperand(0);
+     Value *Val = I.getOperand(1);
+-    Value *ShadowPtr = getShadowOriginPtr(Addr, IRB, Val->getType(), Align(1),
++    Value *ShadowPtr = getShadowOriginPtr(Addr, IRB, getShadowTy(Val), Align(1),
+                                           /*isStore*/ true)
+                            .first;
+ 
+@@ -3922,7 +3922,8 @@ struct MemorySanitizerVisitor : public InstVisitor<MemorySanitizerVisitor> {
+     uint64_t TypeSize = DL.getTypeAllocSize(I.getAllocatedType());
+     Value *Len = ConstantInt::get(MS.IntptrTy, TypeSize);
+     if (I.isArrayAllocation())
+-      Len = IRB.CreateMul(Len, I.getArraySize());
++      Len = IRB.CreateMul(Len,
++                          IRB.CreateZExtOrTrunc(I.getArraySize(), MS.IntptrTy));
+ 
+     if (MS.CompileKernel)
+       poisonAllocaKmsan(I, IRB, Len);
+diff --git a/llvm/test/Instrumentation/MemorySanitizer/alloca.ll b/llvm/test/Instrumentation/MemorySanitizer/alloca.ll
+index 10c1796ac6047..53f8879a944c1 100644
+--- a/llvm/test/Instrumentation/MemorySanitizer/alloca.ll
++++ b/llvm/test/Instrumentation/MemorySanitizer/alloca.ll
+@@ -56,6 +56,20 @@ entry:
+ ; KMSAN: call void @__msan_poison_alloca(i8* {{.*}}, i64 20,
+ ; CHECK: ret void
+ 
++define void @array32() sanitize_memory {
++entry:
++  %x = alloca i32, i32 5, align 4
++  ret void
++}
++
++; CHECK-LABEL: define void @array32(
++; INLINE: call void @llvm.memset.p0i8.i64(i8* align 4 {{.*}}, i8 -1, i64 20, i1 false)
++; CALL: call void @__msan_poison_stack(i8* {{.*}}, i64 20)
++; ORIGIN: call void @__msan_set_alloca_origin_with_descr(i8* {{.*}}, i64 20,
++; ORIGIN-LEAN: call void @__msan_set_alloca_origin_no_descr(i8* {{.*}}, i64 20,
++; KMSAN: call void @__msan_poison_alloca(i8* {{.*}}, i64 20,
++; CHECK: ret void
++
+ define void @array_non_const(i64 %cnt) sanitize_memory {
+ entry:
+   %x = alloca i32, i64 %cnt, align 4
+@@ -70,6 +84,22 @@ entry:
+ ; KMSAN: call void @__msan_poison_alloca(i8* {{.*}}, i64 %[[A]],
+ ; CHECK: ret void
+ 
++define void @array_non_const32(i32 %cnt) sanitize_memory {
++entry:
++  %x = alloca i32, i32 %cnt, align 4
++  ret void
++}
++
++; CHECK-LABEL: define void @array_non_const32(
++; CHECK: %[[Z:.*]] = zext i32 %cnt to i64
++; CHECK: %[[A:.*]] = mul i64 4, %[[Z]]
++; INLINE: call void @llvm.memset.p0i8.i64(i8* align 4 {{.*}}, i8 -1, i64 %[[A]], i1 false)
++; CALL: call void @__msan_poison_stack(i8* {{.*}}, i64 %[[A]])
++; ORIGIN: call void @__msan_set_alloca_origin_with_descr(i8* {{.*}}, i64 %[[A]],
++; ORIGIN-LEAN: call void @__msan_set_alloca_origin_no_descr(i8* {{.*}}, i64 %[[A]],
++; KMSAN: call void @__msan_poison_alloca(i8* {{.*}}, i64 %[[A]],
++; CHECK: ret void
++
+ ; Check that the local is unpoisoned in the absence of sanitize_memory
+ define void @unpoison_local() {
+ entry:
+diff --git a/llvm/test/Instrumentation/MemorySanitizer/atomics.ll b/llvm/test/Instrumentation/MemorySanitizer/atomics.ll
+index 4fff90ea788b9..196f67f03fad4 100644
+--- a/llvm/test/Instrumentation/MemorySanitizer/atomics.ll
++++ b/llvm/test/Instrumentation/MemorySanitizer/atomics.ll
+@@ -22,6 +22,20 @@ entry:
+ ; CHECK: store i32 0, {{.*}} @__msan_retval_tls
+ ; CHECK: ret i32
+ 
++; atomicrmw xchg ptr: exactly the same as above
++
++define i32* @AtomicRmwXchgPtr(i32** %p, i32* %x) sanitize_memory {
++entry:
++  %0 = atomicrmw xchg i32** %p, i32* %x seq_cst
++  ret i32* %0
++}
++
++; CHECK-LABEL: @AtomicRmwXchgPtr
++; CHECK: store i64 0,
++; CHECK: atomicrmw xchg {{.*}} seq_cst
++; CHECK: store i64 0, {{.*}} @__msan_retval_tls
++; CHECK: ret i32*
++
+ 
+ ; atomicrmw max: exactly the same as above
+ 
+
+From 6f13c5b9c31e50ad2a8742a8108836d587897f6c Mon Sep 17 00:00:00 2001
+From: Gabriel Baraldi <baraldigabriel@gmail.com>
+Date: Mon, 22 Aug 2022 13:18:19 -0300
+Subject: [PATCH 14/27] Try keno's tentative TLS fix
+
+---
+ compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
+index b13e2dc9e3327..e4bbba74cd7fc 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
+@@ -16,6 +16,8 @@
+ #include "sanitizer_flags.h"
+ #include "sanitizer_platform_interceptors.h"
+ 
++#include <malloc.h>
++
+ namespace __sanitizer {
+ #if SANITIZER_INTERCEPT_TLS_GET_ADDR
+ 
+@@ -139,6 +141,8 @@ DTLS::DTV *DTLS_on_tls_get_addr(void *arg_void, void *res,
+     tls_beg = header->start;
+     VReport(2, "__tls_get_addr: glibc >=2.19 suspected; tls={0x%zx 0x%zx}\n",
+             tls_beg, tls_size);
++  } else if (uptr size = malloc_usable_size((void *)tls_beg)) {
++    tls_size = size;
+   } else {
+     VReport(2, "__tls_get_addr: Can't guess glibc version\n");
+     // This may happen inside the DTOR of main thread, so just ignore it.
+
+From 15b2b0317ee63b470d6c44712fc3f17f9922bf3f Mon Sep 17 00:00:00 2001
+From: Gabriel Baraldi <baraldigabriel@gmail.com>
+Date: Wed, 31 Aug 2022 20:06:40 -0300
+Subject: [PATCH 15/27] Make include conditional to macos
+
+---
+ compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
+index e4bbba74cd7fc..45c52763cebfe 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
+@@ -16,7 +16,9 @@
+ #include "sanitizer_flags.h"
+ #include "sanitizer_platform_interceptors.h"
+ 
++#if !defined(__APPLE__)
+ #include <malloc.h>
++#endif
+ 
+ namespace __sanitizer {
+ #if SANITIZER_INTERCEPT_TLS_GET_ADDR
+
+From 90e1c629f21fe3a8d66d06ebdc5dde62aa6203be Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliacomputing.com>
+Date: Wed, 4 Jan 2023 01:49:17 +0000
+Subject: [PATCH 16/27] [LVI] Look through negations when evaluating conditions
+
+This teaches LVI (and thus CVP) to extract range information
+from branches whose condition is negated using (`xor %c, true`).
+On the implementation side, we switch the cache to additionally
+track whether we're looking for the inverted value or not and
+otherwise using the existing support for computing inverted
+conditions.
+
+I think the biggest question here is why this negation shows up
+here at all. After all, it should always be possible for some
+other pass to fold such a negation into a branch, comparison or
+some other logical operation. Indeed, instcombine does just that.
+However, these negations can be otherwise fairly persistent, e.g.
+instsimplify is not able to exchange branch conditions from
+negations. In addition, jumpthreading, which sits at the same
+point in default pass pipeline also handles this pattern, which
+adds further evidence that we might expect these negations to
+not have been canonicalized away yet at this point in the pass
+pipeline.
+
+In the particular case I was looking at there was a bit of a
+circular dependency where flags computed by cvp were needed
+by instcombine, and incstombine's folding of the negation was
+needed for cvp. Adding a second instombine pass would have
+worked of course, but instcombine can be somewhat expensive,
+so it appeared desirable to not require it to have run
+before cvp (as is the case in the default pass pipeline).
+
+Reviewed By: nikic
+
+Differential Revision: https://reviews.llvm.org/D140933
+
+(cherry picked from commit 1436a9232b10487a097f62bf85025fc6b6b66fde)
+---
+ llvm/lib/Analysis/LazyValueInfo.cpp           | 50 ++++++++++------
+ .../CorrelatedValuePropagation/basic.ll       | 57 +++++++++++++++++++
+ 2 files changed, 91 insertions(+), 16 deletions(-)
+
+diff --git a/llvm/lib/Analysis/LazyValueInfo.cpp b/llvm/lib/Analysis/LazyValueInfo.cpp
+index 2fae260e0d8fe..7b7f7c6bb64b0 100644
+--- a/llvm/lib/Analysis/LazyValueInfo.cpp
++++ b/llvm/lib/Analysis/LazyValueInfo.cpp
+@@ -1161,11 +1161,17 @@ static ValueLatticeElement getValueFromOverflowCondition(
+   return ValueLatticeElement::getRange(NWR);
+ }
+ 
++// Tracks a Value * condition and whether we're interested in it or its inverse
++typedef PointerIntPair<Value *, 1, bool> CondValue;
++
+ static Optional<ValueLatticeElement>
+-getValueFromConditionImpl(Value *Val, Value *Cond, bool isTrueDest,
+-                          bool isRevisit,
+-                          SmallDenseMap<Value *, ValueLatticeElement> &Visited,
+-                          SmallVectorImpl<Value *> &Worklist) {
++getValueFromConditionImpl(
++    Value *Val, CondValue CondVal, bool isRevisit,
++    SmallDenseMap<CondValue, ValueLatticeElement> &Visited,
++    SmallVectorImpl<CondValue> &Worklist) {
++
++  Value *Cond = CondVal.getPointer();
++  bool isTrueDest = CondVal.getInt();
+   if (!isRevisit) {
+     if (ICmpInst *ICI = dyn_cast<ICmpInst>(Cond))
+       return getValueFromICmpCondition(Val, ICI, isTrueDest);
+@@ -1176,6 +1182,17 @@ getValueFromConditionImpl(Value *Val, Value *Cond, bool isTrueDest,
+           return getValueFromOverflowCondition(Val, WO, isTrueDest);
+   }
+ 
++  Value *N;
++  if (match(Cond, m_Not(m_Value(N)))) {
++    CondValue NKey(N, !isTrueDest);
++    auto NV = Visited.find(NKey);
++    if (NV == Visited.end()) {
++      Worklist.push_back(NKey);
++      return None;
++    }
++    return NV->second;
++  }
++
+   Value *L, *R;
+   bool IsAnd;
+   if (match(Cond, m_LogicalAnd(m_Value(L), m_Value(R))))
+@@ -1185,13 +1202,13 @@ getValueFromConditionImpl(Value *Val, Value *Cond, bool isTrueDest,
+   else
+     return ValueLatticeElement::getOverdefined();
+ 
+-  auto LV = Visited.find(L);
+-  auto RV = Visited.find(R);
++  auto LV = Visited.find(CondValue(L, isTrueDest));
++  auto RV = Visited.find(CondValue(R, isTrueDest));
+ 
+   // if (L && R) -> intersect L and R
+-  // if (!(L || R)) -> intersect L and R
++  // if (!(L || R)) -> intersect !L and !R
+   // if (L || R) -> union L and R
+-  // if (!(L && R)) -> union L and R
++  // if (!(L && R)) -> union !L and !R
+   if ((isTrueDest ^ IsAnd) && (LV != Visited.end())) {
+     ValueLatticeElement V = LV->second;
+     if (V.isOverdefined())
+@@ -1205,9 +1222,9 @@ getValueFromConditionImpl(Value *Val, Value *Cond, bool isTrueDest,
+   if (LV == Visited.end() || RV == Visited.end()) {
+     assert(!isRevisit);
+     if (LV == Visited.end())
+-      Worklist.push_back(L);
++      Worklist.push_back(CondValue(L, isTrueDest));
+     if (RV == Visited.end())
+-      Worklist.push_back(R);
++      Worklist.push_back(CondValue(R, isTrueDest));
+     return None;
+   }
+ 
+@@ -1217,12 +1234,13 @@ getValueFromConditionImpl(Value *Val, Value *Cond, bool isTrueDest,
+ ValueLatticeElement getValueFromCondition(Value *Val, Value *Cond,
+                                           bool isTrueDest) {
+   assert(Cond && "precondition");
+-  SmallDenseMap<Value*, ValueLatticeElement> Visited;
+-  SmallVector<Value *> Worklist;
++  SmallDenseMap<CondValue, ValueLatticeElement> Visited;
++  SmallVector<CondValue> Worklist;
+ 
+-  Worklist.push_back(Cond);
++  CondValue CondKey(Cond, isTrueDest);
++  Worklist.push_back(CondKey);
+   do {
+-    Value *CurrentCond = Worklist.back();
++    CondValue CurrentCond = Worklist.back();
+     // Insert an Overdefined placeholder into the set to prevent
+     // infinite recursion if there exists IRs that use not
+     // dominated by its def as in this example:
+@@ -1232,14 +1250,14 @@ ValueLatticeElement getValueFromCondition(Value *Val, Value *Cond,
+         Visited.try_emplace(CurrentCond, ValueLatticeElement::getOverdefined());
+     bool isRevisit = !Iter.second;
+     Optional<ValueLatticeElement> Result = getValueFromConditionImpl(
+-        Val, CurrentCond, isTrueDest, isRevisit, Visited, Worklist);
++        Val, CurrentCond, isRevisit, Visited, Worklist);
+     if (Result) {
+       Visited[CurrentCond] = *Result;
+       Worklist.pop_back();
+     }
+   } while (!Worklist.empty());
+ 
+-  auto Result = Visited.find(Cond);
++  auto Result = Visited.find(CondKey);
+   assert(Result != Visited.end());
+   return Result->second;
+ }
+diff --git a/llvm/test/Transforms/CorrelatedValuePropagation/basic.ll b/llvm/test/Transforms/CorrelatedValuePropagation/basic.ll
+index 7a08f4d2bd270..b39dae7b28e89 100644
+--- a/llvm/test/Transforms/CorrelatedValuePropagation/basic.ll
++++ b/llvm/test/Transforms/CorrelatedValuePropagation/basic.ll
+@@ -1853,6 +1853,63 @@ define void @xor(i8 %a, i1* %p) {
+   ret void
+ }
+ 
++define i1 @xor_neg_cond(i32 %a) {
++; CHECK-LABEL: @xor_neg_cond(
++; CHECK-NEXT:    [[CMP1:%.*]] = icmp eq i32 [[A:%.*]], 10
++; CHECK-NEXT:    [[XOR:%.*]] = xor i1 [[CMP1]], true
++; CHECK-NEXT:    br i1 [[XOR]], label [[EXIT:%.*]], label [[GUARD:%.*]]
++; CHECK:       guard:
++; CHECK-NEXT:    ret i1 true
++; CHECK:       exit:
++; CHECK-NEXT:    ret i1 false
++;
++  %cmp1 = icmp eq i32 %a, 10
++  %xor = xor i1 %cmp1, true
++  br i1 %xor, label %exit, label %guard
++
++guard:
++  %cmp2 = icmp eq i32 %a, 10
++  ret i1 %cmp2
++
++exit:
++  ret i1 false
++}
++
++define i1 @xor_approx(i32 %a) {
++; CHECK-LABEL: @xor_approx(
++; CHECK-NEXT:    [[CMP1:%.*]] = icmp ugt i32 [[A:%.*]], 2
++; CHECK-NEXT:    [[CMP2:%.*]] = icmp ult i32 [[A]], 5
++; CHECK-NEXT:    [[CMP3:%.*]] = icmp ugt i32 [[A]], 7
++; CHECK-NEXT:    [[CMP4:%.*]] = icmp ult i32 [[A]], 9
++; CHECK-NEXT:    [[AND1:%.*]] = and i1 [[CMP1]], [[CMP2]]
++; CHECK-NEXT:    [[AND2:%.*]] = and i1 [[CMP3]], [[CMP4]]
++; CHECK-NEXT:    [[OR:%.*]] = or i1 [[AND1]], [[AND2]]
++; CHECK-NEXT:    [[XOR:%.*]] = xor i1 [[OR]], true
++; CHECK-NEXT:    br i1 [[XOR]], label [[EXIT:%.*]], label [[GUARD:%.*]]
++; CHECK:       guard:
++; CHECK-NEXT:    [[CMP5:%.*]] = icmp eq i32 [[A]], 6
++; CHECK-NEXT:    ret i1 [[CMP5]]
++; CHECK:       exit:
++; CHECK-NEXT:    ret i1 false
++;
++  %cmp1 = icmp ugt i32 %a, 2
++  %cmp2 = icmp ult i32 %a, 5
++  %cmp3 = icmp ugt i32 %a, 7
++  %cmp4 = icmp ult i32 %a, 9
++  %and1 = and i1 %cmp1, %cmp2
++  %and2 = and i1 %cmp3, %cmp4
++  %or = or i1 %and1, %and2
++  %xor = xor i1 %or, true
++  br i1 %xor, label %exit, label %guard
++
++guard:
++  %cmp5 = icmp eq i32 %a, 6
++  ret i1 %cmp5
++
++exit:
++  ret i1 false
++}
++
+ declare i32 @llvm.uadd.sat.i32(i32, i32)
+ declare i32 @llvm.usub.sat.i32(i32, i32)
+ declare i32 @llvm.sadd.sat.i32(i32, i32)
+
+From bf7ed7ade77424108f5de7c02b8a1febe4751cee Mon Sep 17 00:00:00 2001
+From: Prem Chintalapudi <prem.chintalapudi@gmail.com>
+Date: Fri, 14 Apr 2023 17:35:07 -0700
+Subject: [PATCH 17/27] [NewPM] Use PassID instead of pass name
+
+PrintIRInstrumentation::shouldPrintAfterPass accepts a pass ID instead of a pass name
+
+Reviewed By: aeubanks
+
+Differential Revision: https://reviews.llvm.org/D147394
+
+(cherry picked from commit d4de7c2e1e7954ea03545f1551fda9f6bb9387cf)
+---
+ llvm/lib/Passes/StandardInstrumentations.cpp  |  3 +--
+ .../loop-print-after-pass-invalidated.ll      | 21 +++++++++++++++++++
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+ create mode 100644 llvm/test/Other/loop-print-after-pass-invalidated.ll
+
+diff --git a/llvm/lib/Passes/StandardInstrumentations.cpp b/llvm/lib/Passes/StandardInstrumentations.cpp
+index a0c63fb33369e..60ab3314259e0 100644
+--- a/llvm/lib/Passes/StandardInstrumentations.cpp
++++ b/llvm/lib/Passes/StandardInstrumentations.cpp
+@@ -758,8 +758,7 @@ void PrintIRInstrumentation::printAfterPass(StringRef PassID, Any IR) {
+ }
+ 
+ void PrintIRInstrumentation::printAfterPassInvalidated(StringRef PassID) {
+-  StringRef PassName = PIC->getPassNameForClassName(PassID);
+-  if (!shouldPrintAfterPass(PassName))
++  if (!shouldPrintAfterPass(PassID))
+     return;
+ 
+   if (isIgnored(PassID))
+diff --git a/llvm/test/Other/loop-print-after-pass-invalidated.ll b/llvm/test/Other/loop-print-after-pass-invalidated.ll
+new file mode 100644
+index 0000000000000..63106f62ae132
+--- /dev/null
++++ b/llvm/test/Other/loop-print-after-pass-invalidated.ll
+@@ -0,0 +1,21 @@
++; RUN: opt < %s 2>&1 -disable-output \
++; RUN: 	   -passes='simple-loop-unswitch<nontrivial>' \
++; RUN:     -print-after=simple-loop-unswitch \
++; RUN:	   | FileCheck %s
++
++; CHECK: *** IR Dump After SimpleLoopUnswitchPass on for.cond ***
++; CHECK: *** IR Dump After SimpleLoopUnswitchPass on for.cond.us ***
++
++define void @loop(i1 %w)  {
++entry:
++  br label %for.cond
++; Loop:
++for.cond:                                         ; preds = %for.inc, %entry
++  br i1 %w, label %for.inc, label %if.then
++
++if.then:                                          ; preds = %for.cond
++  br label %for.inc
++
++for.inc:                                          ; preds = %if.then, %for.cond
++  br label %for.cond
++}
+
+From 6783826bf945837ac95d93546644d2723dedef73 Mon Sep 17 00:00:00 2001
+From: Elliot Saba <staticfloat@gmail.com>
+Date: Mon, 27 Mar 2023 17:43:54 -0700
+Subject: [PATCH 18/27] Disable pathologically expensive `SimplifySelectOps`
+ optimization
+
+`SimplifySelectOps` is a late optimization in LLVM that attempts to
+translate `select(C, load(A), load(B))` into `load(select(C, A, B))`.
+However, in order for it to do this optimization, it needs to check that
+`C` does not depend on the result of `load(A)` or `load(B)`.
+Unfortunately (unlikely Julia and LLVM at the IR level), LLVM does not
+have a topological order of statements computed at this stage of the
+compiler, so LLVM needs to iterate through all statements in the
+function in order to perform this legality check. For large functions,
+this is extremely expensive, accounting for the majority of all
+compilation time for such functions. On the other hand, the optimization
+itself is minor, allowing at most the elision of one additional load
+(and doesn't fire particularly often, because the middle end can perform
+similar optimizations). Until there is a proper solution in LLVM, simply
+disable this optimizations, making LLVM several orders of magnitude
+faster on real world benchmarks.
+
+X-ref: https://github.com/llvm/llvm-project/issues/60132
+---
+ llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+index a7f9382478d47..2607179c20aa8 100644
+--- a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
++++ b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+@@ -23772,6 +23772,7 @@ bool DAGCombiner::SimplifySelectOps(SDNode *TheSelect, SDValue LHS,
+         !TLI.isOperationLegalOrCustom(TheSelect->getOpcode(),
+                                       LLD->getBasePtr().getValueType()))
+       return false;
++    return false;
+ 
+     // The loads must not depend on one another.
+     if (LLD->isPredecessorOf(RLD) || RLD->isPredecessorOf(LLD))
+
+From 5354b0a21acb90f128273b2653bf0005d8ae58b7 Mon Sep 17 00:00:00 2001
+From: Joshua Cao <cao.joshua@yahoo.com>
+Date: Mon, 17 Apr 2023 14:28:48 -0400
+Subject: [PATCH 19/27] [SimpleLoopUnswitch] unswitch selects
+
+The old LoopUnswitch pass unswitched selects, but the changes were never
+ported to the new SimpleLoopUnswitch.
+
+We unswitch by turning:
+
+```
+S = select %cond, %a, %b
+```
+
+into:
+
+```
+head:
+br %cond, label %then, label %tail
+
+then:
+br label %tail
+
+tail:
+S = phi [ %a, %then ], [ %b, %head ]
+```
+
+Unswitch selects are always nontrivial, since the successors do not exit
+the loop and the loop body always needs to be cloned.
+
+Differential Revision: https://reviews.llvm.org/D138526
+---
+ .../Transforms/Scalar/SimpleLoopUnswitch.cpp  | 96 ++++++++++++++++---
+ .../nontrivial-unswitch-freeze.ll             | 19 ++--
+ .../nontrivial-unswitch-trivial-select.ll     | 28 ++++--
+ 3 files changed, 115 insertions(+), 28 deletions(-)
+
+diff --git a/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp b/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
+index 0535608244cc2..e503795536301 100644
+--- a/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
++++ b/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
+@@ -70,6 +70,7 @@ using namespace llvm::PatternMatch;
+ 
+ STATISTIC(NumBranches, "Number of branches unswitched");
+ STATISTIC(NumSwitches, "Number of switches unswitched");
++STATISTIC(NumSelects, "Number of selects turned into branches for unswitching");
+ STATISTIC(NumGuards, "Number of guards turned into branches for unswitching");
+ STATISTIC(NumTrivial, "Number of unswitches that are trivial");
+ STATISTIC(
+@@ -2552,6 +2553,59 @@ static InstructionCost computeDomSubtreeCost(
+   return Cost;
+ }
+ 
++/// Turns a select instruction into implicit control flow branch,
++/// making the following replacement:
++///
++/// head:
++///   --code before select--
++///   select %cond, %trueval, %falseval
++///   --code after select--
++///
++/// into
++///
++/// head:
++///   --code before select--
++///   br i1 %cond, label %then, label %tail
++///
++/// then:
++///   br %tail
++///
++/// tail:
++///   phi [ %trueval, %then ], [ %falseval, %head]
++///   unreachable
++///
++/// It also makes all relevant DT and LI updates, so that all structures are in
++/// valid state after this transform.
++static BranchInst *turnSelectIntoBranch(SelectInst *SI, DominatorTree &DT,
++                                        LoopInfo &LI, MemorySSAUpdater *MSSAU,
++                                        AssumptionCache *AC) {
++  LLVM_DEBUG(dbgs() << "Turning " << *SI << " into a branch.\n");
++  BasicBlock *HeadBB = SI->getParent();
++
++  Value *Cond = SI->getCondition();
++  if (!isGuaranteedNotToBeUndefOrPoison(Cond, AC, SI, &DT))
++    Cond = new FreezeInst(Cond, Cond->getName() + ".fr", SI);
++  SplitBlockAndInsertIfThen(SI->getCondition(), SI, false,
++                            SI->getMetadata(LLVMContext::MD_prof), &DT, &LI);
++  auto *CondBr = cast<BranchInst>(HeadBB->getTerminator());
++  BasicBlock *ThenBB = CondBr->getSuccessor(0),
++             *TailBB = CondBr->getSuccessor(1);
++  if (MSSAU)
++    MSSAU->moveAllAfterSpliceBlocks(HeadBB, TailBB, SI);
++
++  PHINode *Phi = PHINode::Create(SI->getType(), 2, "unswitched.select", SI);
++  Phi->addIncoming(SI->getTrueValue(), ThenBB);
++  Phi->addIncoming(SI->getFalseValue(), HeadBB);
++  SI->replaceAllUsesWith(Phi);
++  SI->eraseFromParent();
++
++  if (MSSAU && VerifyMemorySSA)
++    MSSAU->getMemorySSA()->verifyMemorySSA();
++
++  ++NumSelects;
++  return CondBr;
++}
++
+ /// Turns a llvm.experimental.guard intrinsic into implicit control flow branch,
+ /// making the following replacement:
+ ///
+@@ -2663,9 +2717,10 @@ static int CalculateUnswitchCostMultiplier(
+   BasicBlock *CondBlock = TI.getParent();
+   if (DT.dominates(CondBlock, Latch) &&
+       (isGuard(&TI) ||
+-       llvm::count_if(successors(&TI), [&L](BasicBlock *SuccBB) {
+-         return L.contains(SuccBB);
+-       }) <= 1)) {
++       (TI.isTerminator() &&
++        llvm::count_if(successors(&TI), [&L](BasicBlock *SuccBB) {
++          return L.contains(SuccBB);
++        }) <= 1))) {
+     NumCostMultiplierSkipped++;
+     return 1;
+   }
+@@ -2674,12 +2729,17 @@ static int CalculateUnswitchCostMultiplier(
+   int SiblingsCount = (ParentL ? ParentL->getSubLoopsVector().size()
+                                : std::distance(LI.begin(), LI.end()));
+   // Count amount of clones that all the candidates might cause during
+-  // unswitching. Branch/guard counts as 1, switch counts as log2 of its cases.
++  // unswitching. Branch/guard/select counts as 1, switch counts as log2 of its
++  // cases.
+   int UnswitchedClones = 0;
+   for (auto Candidate : UnswitchCandidates) {
+     Instruction *CI = Candidate.first;
+     BasicBlock *CondBlock = CI->getParent();
+     bool SkipExitingSuccessors = DT.dominates(CondBlock, Latch);
++    if (isa<SelectInst>(CI)) {
++      UnswitchedClones++;
++      continue;
++    }
+     if (isGuard(CI)) {
+       if (!SkipExitingSuccessors)
+         UnswitchedClones++;
+@@ -2747,14 +2807,19 @@ static bool unswitchBestCondition(
+     if (LI.getLoopFor(BB) != &L)
+       continue;
+ 
+-    if (CollectGuards)
+-      for (auto &I : *BB)
+-        if (isGuard(&I)) {
+-          auto *Cond = cast<IntrinsicInst>(&I)->getArgOperand(0);
+-          // TODO: Support AND, OR conditions and partial unswitching.
+-          if (!isa<Constant>(Cond) && L.isLoopInvariant(Cond))
+-            UnswitchCandidates.push_back({&I, {Cond}});
+-        }
++    for (auto &I : *BB) {
++      if (auto *SI = dyn_cast<SelectInst>(&I)) {
++        auto *Cond = SI->getCondition();
++        if (!isa<Constant>(Cond) && L.isLoopInvariant(Cond))
++          UnswitchCandidates.push_back({&I, {Cond}});
++      } else if (CollectGuards && isGuard(&I)) {
++        auto *Cond =
++            skipTrivialSelect(cast<IntrinsicInst>(&I)->getArgOperand(0));
++        // TODO: Support AND, OR conditions and partial unswitching.
++        if (!isa<Constant>(Cond) && L.isLoopInvariant(Cond))
++          UnswitchCandidates.push_back({&I, {Cond}});
++      }
++    }
+ 
+     if (auto *SI = dyn_cast<SwitchInst>(BB->getTerminator())) {
+       // We can only consider fully loop-invariant switch conditions as we need
+@@ -2953,7 +3018,8 @@ static bool unswitchBestCondition(
+     // loop. This is computing the new cost of unswitching a condition.
+     // Note that guards always have 2 unique successors that are implicit and
+     // will be materialized if we decide to unswitch it.
+-    int SuccessorsCount = isGuard(&TI) ? 2 : Visited.size();
++    int SuccessorsCount =
++        isGuard(&TI) || isa<SelectInst>(TI) ? 2 : Visited.size();
+     assert(SuccessorsCount > 1 &&
+            "Cannot unswitch a condition without multiple distinct successors!");
+     return (LoopCost - Cost) * (SuccessorsCount - 1);
+@@ -3004,7 +3070,9 @@ static bool unswitchBestCondition(
+     PartialIVInfo.InstToDuplicate.clear();
+ 
+   // If the best candidate is a guard, turn it into a branch.
+-  if (isGuard(BestUnswitchTI))
++  if (auto *SI = dyn_cast<SelectInst>(BestUnswitchTI))
++    BestUnswitchTI = turnSelectIntoBranch(SI, DT, LI, MSSAU, &AC);
++  else if (isGuard(BestUnswitchTI))
+     BestUnswitchTI = turnGuardIntoBranch(cast<IntrinsicInst>(BestUnswitchTI), L,
+                                          ExitBlocks, DT, LI, MSSAU);
+ 
+diff --git a/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-freeze.ll b/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-freeze.ll
+index ff9feab4a74c0..d253205576d17 100644
+--- a/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-freeze.ll
++++ b/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-freeze.ll
+@@ -2332,21 +2332,26 @@ exit:
+ define i32 @test_partial_unswitch_all_conds_guaranteed_non_poison(i1 noundef %c.1, i1 noundef %c.2) {
+ ; CHECK-LABEL: @test_partial_unswitch_all_conds_guaranteed_non_poison(
+ ; CHECK-NEXT:  entry:
+-; CHECK-NEXT:    [[TMP0:%.*]] = and i1 [[C_1:%.*]], [[C_2:%.*]]
+-; CHECK-NEXT:    br i1 [[TMP0]], label [[ENTRY_SPLIT:%.*]], label [[ENTRY_SPLIT_US:%.*]]
++; CHECK-NEXT:    br i1 [[C_1:%.*]], label [[ENTRY_SPLIT_US:%.*]], label [[ENTRY_SPLIT:%.*]]
+ ; CHECK:       entry.split.us:
+ ; CHECK-NEXT:    br label [[LOOP_US:%.*]]
+ ; CHECK:       loop.us:
+-; CHECK-NEXT:    [[TMP1:%.*]] = call i32 @a()
+-; CHECK-NEXT:    br label [[EXIT_SPLIT_US:%.*]]
++; CHECK-NEXT:    [[TMP0:%.*]] = call i32 @a()
++; CHECK-NEXT:    br label [[TMP1:%.*]]
++; CHECK:       1:
++; CHECK-NEXT:    br label [[TMP2:%.*]]
++; CHECK:       2:
++; CHECK-NEXT:    [[UNSWITCHED_SELECT_US:%.*]] = phi i1 [ [[C_2:%.*]], [[TMP1]] ]
++; CHECK-NEXT:    br i1 [[UNSWITCHED_SELECT_US]], label [[LOOP_US]], label [[EXIT_SPLIT_US:%.*]]
+ ; CHECK:       exit.split.us:
+ ; CHECK-NEXT:    br label [[EXIT:%.*]]
+ ; CHECK:       entry.split:
+ ; CHECK-NEXT:    br label [[LOOP:%.*]]
+ ; CHECK:       loop:
+-; CHECK-NEXT:    [[TMP2:%.*]] = call i32 @a()
+-; CHECK-NEXT:    [[SEL:%.*]] = select i1 true, i1 true, i1 false
+-; CHECK-NEXT:    br i1 [[SEL]], label [[LOOP]], label [[EXIT_SPLIT:%.*]]
++; CHECK-NEXT:    [[TMP3:%.*]] = call i32 @a()
++; CHECK-NEXT:    br label [[TMP4:%.*]]
++; CHECK:       4:
++; CHECK-NEXT:    br i1 false, label [[LOOP]], label [[EXIT_SPLIT:%.*]]
+ ; CHECK:       exit.split:
+ ; CHECK-NEXT:    br label [[EXIT]]
+ ; CHECK:       exit:
+diff --git a/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-trivial-select.ll b/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-trivial-select.ll
+index 5280aa7d3e284..654b9efb2a275 100644
+--- a/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-trivial-select.ll
++++ b/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-trivial-select.ll
+@@ -92,17 +92,31 @@ define i32 @unswitch_trivial_select_cmp_outside(i32 %x) {
+ ; CHECK:       entry.split.us:
+ ; CHECK-NEXT:    br label [[LOOP_US:%.*]]
+ ; CHECK:       loop.us:
+-; CHECK-NEXT:    [[P_US:%.*]] = phi i32 [ 0, [[ENTRY_SPLIT_US]] ], [ 35, [[LOOP_US]] ]
+-; CHECK-NEXT:    br label [[LOOP_US]]
++; CHECK-NEXT:    [[P_US:%.*]] = phi i32 [ 0, [[ENTRY_SPLIT_US]] ], [ 35, [[TMP1:%.*]] ]
++; CHECK-NEXT:    [[C_FR_US:%.*]] = freeze i1 true
++; CHECK-NEXT:    br label [[TMP0:%.*]]
++; CHECK:       0:
++; CHECK-NEXT:    br label [[TMP1]]
++; CHECK:       1:
++; CHECK-NEXT:    [[UNSWITCHED_SELECT_US:%.*]] = phi i1 [ true, [[TMP0]] ]
++; CHECK-NEXT:    br i1 [[UNSWITCHED_SELECT_US]], label [[LOOP_US]], label [[EXIT_SPLIT_US:%.*]]
++; CHECK:       exit.split.us:
++; CHECK-NEXT:    [[LCSSA_US:%.*]] = phi i32 [ [[P_US]], [[TMP1]] ]
++; CHECK-NEXT:    br label [[EXIT:%.*]]
+ ; CHECK:       entry.split:
+ ; CHECK-NEXT:    br label [[LOOP:%.*]]
+ ; CHECK:       loop:
+-; CHECK-NEXT:    [[P:%.*]] = phi i32 [ 0, [[ENTRY_SPLIT]] ]
+-; CHECK-NEXT:    [[SPEC_SELECT:%.*]] = select i1 false, i1 true, i1 false
+-; CHECK-NEXT:    br label [[EXIT:%.*]]
++; CHECK-NEXT:    [[P:%.*]] = phi i32 [ 0, [[ENTRY_SPLIT]] ], [ 35, [[TMP2:%.*]] ]
++; CHECK-NEXT:    [[C_FR:%.*]] = freeze i1 false
++; CHECK-NEXT:    br label [[TMP2]]
++; CHECK:       2:
++; CHECK-NEXT:    br i1 false, label [[LOOP]], label [[EXIT_SPLIT:%.*]]
++; CHECK:       exit.split:
++; CHECK-NEXT:    [[LCSSA:%.*]] = phi i32 [ [[P]], [[TMP2]] ]
++; CHECK-NEXT:    br label [[EXIT]]
+ ; CHECK:       exit:
+-; CHECK-NEXT:    [[LCSSA:%.*]] = phi i32 [ [[P]], [[LOOP]] ]
+-; CHECK-NEXT:    ret i32 [[LCSSA]]
++; CHECK-NEXT:    [[DOTUS_PHI:%.*]] = phi i32 [ [[LCSSA]], [[EXIT_SPLIT]] ], [ [[LCSSA_US]], [[EXIT_SPLIT_US]] ]
++; CHECK-NEXT:    ret i32 [[DOTUS_PHI]]
+ ;
+ entry:
+   %c = icmp ult i32 %x, 100
+
+From 6f51ecd2842de0ea4b72bc9807b4294d6bab227c Mon Sep 17 00:00:00 2001
+From: Prem Chintalapudi <prem.chintalapudi@gmail.com>
+Date: Sun, 2 Apr 2023 10:29:52 -0700
+Subject: [PATCH 20/27] [MCJIT] Set VMA to code address in
+ PerfJITEventListener.
+
+VMA should default to CodeAddr, not 0, as specified here:
+https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/tools/perf/Documentation/jitdump-specification.txt
+
+Reviewed By: lhames
+
+Differential Revision: https://reviews.llvm.org/D146496
+
+(cherry picked from commit e5bdf0f6d2552541ebab1d2a865f9c4e10ca6724)
+---
+ llvm/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/llvm/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp b/llvm/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
+index bb41bac325348..730805a056ceb 100644
+--- a/llvm/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
++++ b/llvm/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
+@@ -417,7 +417,7 @@ void PerfJITEventListener::NotifyCode(Expected<llvm::StringRef> &Symbol,
+   rec.Prefix.Timestamp = perf_get_timestamp();
+ 
+   rec.CodeSize = CodeSize;
+-  rec.Vma = 0;
++  rec.Vma = CodeAddr;
+   rec.CodeAddr = CodeAddr;
+   rec.Pid = Pid;
+   rec.Tid = get_threadid();
+
+From fcc8566589dd38181281316a65a96ea1e8b6b599 Mon Sep 17 00:00:00 2001
+From: Prem Chintalapudi <prem.chintalapudi@gmail.com>
+Date: Mon, 17 Apr 2023 17:14:30 -0700
+Subject: [PATCH 21/27] Expose PassBuilder extension point callbacks
+
+This patch allows access to callbacks registered by TargetMachines to allow custom pipelines to run those callbacks.
+
+Reviewed By: aeubanks
+
+Differential Revision: https://reviews.llvm.org/D148561
+
+(cherry picked from commit 33817296c6003f6b3bb7eed5fbcd64a2385fe425)
+---
+ llvm/include/llvm/Passes/PassBuilder.h   |  29 ++++-
+ llvm/lib/Passes/PassBuilderPipelines.cpp | 136 ++++++++++++++---------
+ 2 files changed, 110 insertions(+), 55 deletions(-)
+
+diff --git a/llvm/include/llvm/Passes/PassBuilder.h b/llvm/include/llvm/Passes/PassBuilder.h
+index 0cbbdf7f3ce80..88c6382f14b1b 100644
+--- a/llvm/include/llvm/Passes/PassBuilder.h
++++ b/llvm/include/llvm/Passes/PassBuilder.h
+@@ -579,6 +579,34 @@ class PassBuilder {
+     return PIC;
+   }
+ 
++  // Invoke the callbacks registered for the various extension points.
++  // Custom pipelines should use these to invoke the callbacks registered
++  // by TargetMachines and other clients.
++  void invokePeepholeEPCallbacks(FunctionPassManager &FPM,
++                                 OptimizationLevel Level);
++  void invokeLateLoopOptimizationsEPCallbacks(LoopPassManager &LPM,
++                                              OptimizationLevel Level);
++  void invokeLoopOptimizerEndEPCallbacks(LoopPassManager &LPM,
++                                         OptimizationLevel Level);
++  void invokeScalarOptimizerLateEPCallbacks(FunctionPassManager &FPM,
++                                            OptimizationLevel Level);
++  void invokeCGSCCOptimizerLateEPCallbacks(CGSCCPassManager &CGPM,
++                                           OptimizationLevel Level);
++  void invokeVectorizerStartEPCallbacks(FunctionPassManager &FPM,
++                                        OptimizationLevel Level);
++  void invokeOptimizerEarlyEPCallbacks(ModulePassManager &MPM,
++                                       OptimizationLevel Level);
++  void invokeOptimizerLastEPCallbacks(ModulePassManager &MPM,
++                                      OptimizationLevel Level);
++  void invokeFullLinkTimeOptimizationEarlyEPCallbacks(ModulePassManager &MPM,
++                                                      OptimizationLevel Level);
++  void invokeFullLinkTimeOptimizationLastEPCallbacks(ModulePassManager &MPM,
++                                                     OptimizationLevel Level);
++  void invokePipelineStartEPCallbacks(ModulePassManager &MPM,
++                                      OptimizationLevel Level);
++  void invokePipelineEarlySimplificationEPCallbacks(ModulePassManager &MPM,
++                                                    OptimizationLevel Level);
++
+ private:
+   // O1 pass pipeline
+   FunctionPassManager
+@@ -612,7 +640,6 @@ class PassBuilder {
+                          bool RunProfileGen, bool IsCS, std::string ProfileFile,
+                          std::string ProfileRemappingFile,
+                          ThinOrFullLTOPhase LTOPhase);
+-  void invokePeepholeEPCallbacks(FunctionPassManager &, OptimizationLevel);
+ 
+   // Extension Point callbacks
+   SmallVector<std::function<void(FunctionPassManager &, OptimizationLevel)>, 2>
+diff --git a/llvm/lib/Passes/PassBuilderPipelines.cpp b/llvm/lib/Passes/PassBuilderPipelines.cpp
+index 945ef512391b0..b77c351e16a43 100644
+--- a/llvm/lib/Passes/PassBuilderPipelines.cpp
++++ b/llvm/lib/Passes/PassBuilderPipelines.cpp
+@@ -230,6 +230,61 @@ void PassBuilder::invokePeepholeEPCallbacks(FunctionPassManager &FPM,
+   for (auto &C : PeepholeEPCallbacks)
+     C(FPM, Level);
+ }
++void PassBuilder::invokeLateLoopOptimizationsEPCallbacks(
++    LoopPassManager &LPM, OptimizationLevel Level) {
++  for (auto &C : LateLoopOptimizationsEPCallbacks)
++    C(LPM, Level);
++}
++void PassBuilder::invokeLoopOptimizerEndEPCallbacks(LoopPassManager &LPM,
++                                                    OptimizationLevel Level) {
++  for (auto &C : LoopOptimizerEndEPCallbacks)
++    C(LPM, Level);
++}
++void PassBuilder::invokeScalarOptimizerLateEPCallbacks(
++    FunctionPassManager &FPM, OptimizationLevel Level) {
++  for (auto &C : ScalarOptimizerLateEPCallbacks)
++    C(FPM, Level);
++}
++void PassBuilder::invokeCGSCCOptimizerLateEPCallbacks(CGSCCPassManager &CGPM,
++                                                      OptimizationLevel Level) {
++  for (auto &C : CGSCCOptimizerLateEPCallbacks)
++    C(CGPM, Level);
++}
++void PassBuilder::invokeVectorizerStartEPCallbacks(FunctionPassManager &FPM,
++                                                   OptimizationLevel Level) {
++  for (auto &C : VectorizerStartEPCallbacks)
++    C(FPM, Level);
++}
++void PassBuilder::invokeOptimizerEarlyEPCallbacks(ModulePassManager &MPM,
++                                                  OptimizationLevel Level) {
++  for (auto &C : OptimizerEarlyEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokeOptimizerLastEPCallbacks(ModulePassManager &MPM,
++                                                 OptimizationLevel Level) {
++  for (auto &C : OptimizerLastEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokeFullLinkTimeOptimizationEarlyEPCallbacks(
++    ModulePassManager &MPM, OptimizationLevel Level) {
++  for (auto &C : FullLinkTimeOptimizationEarlyEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokeFullLinkTimeOptimizationLastEPCallbacks(
++    ModulePassManager &MPM, OptimizationLevel Level) {
++  for (auto &C : FullLinkTimeOptimizationLastEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokePipelineStartEPCallbacks(ModulePassManager &MPM,
++                                                 OptimizationLevel Level) {
++  for (auto &C : PipelineStartEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokePipelineEarlySimplificationEPCallbacks(
++    ModulePassManager &MPM, OptimizationLevel Level) {
++  for (auto &C : PipelineEarlySimplificationEPCallbacks)
++    C(MPM, Level);
++}
+ 
+ // Helper to add AnnotationRemarksPass.
+ static void addAnnotationRemarksPass(ModulePassManager &MPM) {
+@@ -311,8 +366,7 @@ PassBuilder::buildO1FunctionSimplificationPipeline(OptimizationLevel Level,
+   LPM2.addPass(LoopIdiomRecognizePass());
+   LPM2.addPass(IndVarSimplifyPass());
+ 
+-  for (auto &C : LateLoopOptimizationsEPCallbacks)
+-    C(LPM2, Level);
++  invokeLateLoopOptimizationsEPCallbacks(LPM2, Level);
+ 
+   LPM2.addPass(LoopDeletionPass());
+ 
+@@ -330,8 +384,7 @@ PassBuilder::buildO1FunctionSimplificationPipeline(OptimizationLevel Level,
+                                     /* OnlyWhenForced= */ !PTO.LoopUnrolling,
+                                     PTO.ForgetAllSCEVInLoopUnroll));
+ 
+-  for (auto &C : LoopOptimizerEndEPCallbacks)
+-    C(LPM2, Level);
++  invokeLoopOptimizerEndEPCallbacks(LPM2, Level);
+ 
+   // We provide the opt remark emitter pass for LICM to use. We only need to do
+   // this once as it is immutable.
+@@ -372,8 +425,7 @@ PassBuilder::buildO1FunctionSimplificationPipeline(OptimizationLevel Level,
+ 
+   FPM.addPass(CoroElidePass());
+ 
+-  for (auto &C : ScalarOptimizerLateEPCallbacks)
+-    C(FPM, Level);
++  invokeScalarOptimizerLateEPCallbacks(FPM, Level);
+ 
+   // Finally, do an expensive DCE pass to catch all the dead code exposed by
+   // the simplifications and basic cleanup after all the simplifications.
+@@ -496,8 +548,7 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
+   LPM2.addPass(LoopIdiomRecognizePass());
+   LPM2.addPass(IndVarSimplifyPass());
+ 
+-  for (auto &C : LateLoopOptimizationsEPCallbacks)
+-    C(LPM2, Level);
++  invokeLateLoopOptimizationsEPCallbacks(LPM2, Level);
+ 
+   LPM2.addPass(LoopDeletionPass());
+ 
+@@ -515,8 +566,7 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
+                                     /* OnlyWhenForced= */ !PTO.LoopUnrolling,
+                                     PTO.ForgetAllSCEVInLoopUnroll));
+ 
+-  for (auto &C : LoopOptimizerEndEPCallbacks)
+-    C(LPM2, Level);
++  invokeLoopOptimizerEndEPCallbacks(LPM2, Level);
+ 
+   // We provide the opt remark emitter pass for LICM to use. We only need to do
+   // this once as it is immutable.
+@@ -589,8 +639,7 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
+ 
+   FPM.addPass(CoroElidePass());
+ 
+-  for (auto &C : ScalarOptimizerLateEPCallbacks)
+-    C(FPM, Level);
++  invokeScalarOptimizerLateEPCallbacks(FPM, Level);
+ 
+   FPM.addPass(SimplifyCFGPass(SimplifyCFGOptions()
+                                   .convertSwitchRangeToICmp(true)
+@@ -772,8 +821,7 @@ PassBuilder::buildInlinerPipeline(OptimizationLevel Level,
+   if (Level == OptimizationLevel::O2 || Level == OptimizationLevel::O3)
+     MainCGPipeline.addPass(OpenMPOptCGSCCPass());
+ 
+-  for (auto &C : CGSCCOptimizerLateEPCallbacks)
+-    C(MainCGPipeline, Level);
++  invokeCGSCCOptimizerLateEPCallbacks(MainCGPipeline, Level);
+ 
+   // Lastly, add the core function simplification pipeline nested inside the
+   // CGSCC walk.
+@@ -928,8 +976,7 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
+   if (Phase == ThinOrFullLTOPhase::ThinLTOPostLink)
+     MPM.addPass(LowerTypeTestsPass(nullptr, nullptr, true));
+ 
+-  for (auto &C : PipelineEarlySimplificationEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineEarlySimplificationEPCallbacks(MPM, Level);
+ 
+   // Specialize functions with IPSCCP.
+   if (EnableFunctionSpecialization && Level == OptimizationLevel::O3)
+@@ -1189,8 +1236,7 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
+   // memory operations.
+   MPM.addPass(RecomputeGlobalsAAPass());
+ 
+-  for (auto &C : OptimizerEarlyEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerEarlyEPCallbacks(MPM, Level);
+ 
+   FunctionPassManager OptimizePM;
+   OptimizePM.addPass(Float2IntPass());
+@@ -1208,8 +1254,7 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
+   // rather than on each loop in an inside-out manner, and so they are actually
+   // function passes.
+ 
+-  for (auto &C : VectorizerStartEPCallbacks)
+-    C(OptimizePM, Level);
++  invokeVectorizerStartEPCallbacks(OptimizePM, Level);
+ 
+   LoopPassManager LPM;
+   // First rotate loops that may have been un-rotated by prior passes.
+@@ -1261,8 +1306,7 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
+   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(OptimizePM),
+                                                 PTO.EagerlyInvalidateAnalyses));
+ 
+-  for (auto &C : OptimizerLastEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerLastEPCallbacks(MPM, Level);
+ 
+   // Split out cold code. Splitting is done late to avoid hiding context from
+   // other optimizations and inadvertently regressing performance. The tradeoff
+@@ -1315,8 +1359,7 @@ PassBuilder::buildPerModuleDefaultPipeline(OptimizationLevel Level,
+   MPM.addPass(ForceFunctionAttrsPass());
+ 
+   // Apply module pipeline start EP callback.
+-  for (auto &C : PipelineStartEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineStartEPCallbacks(MPM, Level);
+ 
+   if (PGOOpt && PGOOpt->DebugInfoForProfiling)
+     MPM.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
+@@ -1360,8 +1403,7 @@ PassBuilder::buildThinLTOPreLinkDefaultPipeline(OptimizationLevel Level) {
+     MPM.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
+ 
+   // Apply module pipeline start EP callback.
+-  for (auto &C : PipelineStartEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineStartEPCallbacks(MPM, Level);
+ 
+   // If we are planning to perform ThinLTO later, we don't bloat the code with
+   // unrolling/vectorization/... now. Just simplify the module as much as we
+@@ -1389,8 +1431,7 @@ PassBuilder::buildThinLTOPreLinkDefaultPipeline(OptimizationLevel Level) {
+   // Handle OptimizerLastEPCallbacks added by clang on PreLink. Actual
+   // optimization is going to be done in PostLink stage, but clang can't
+   // add callbacks there in case of in-process ThinLTO called by linker.
+-  for (auto &C : OptimizerLastEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerLastEPCallbacks(MPM, Level);
+ 
+   // Emit annotation remarks.
+   addAnnotationRemarksPass(MPM);
+@@ -1473,8 +1514,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
+   // Convert @llvm.global.annotations to !annotation metadata.
+   MPM.addPass(Annotation2MetadataPass());
+ 
+-  for (auto &C : FullLinkTimeOptimizationEarlyEPCallbacks)
+-    C(MPM, Level);
++  invokeFullLinkTimeOptimizationEarlyEPCallbacks(MPM, Level);
+ 
+   // Create a function that performs CFI checks for cross-DSO calls with targets
+   // in the current module.
+@@ -1489,8 +1529,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
+     // in ICP.
+     MPM.addPass(LowerTypeTestsPass(nullptr, nullptr, true));
+ 
+-    for (auto &C : FullLinkTimeOptimizationLastEPCallbacks)
+-      C(MPM, Level);
++    invokeFullLinkTimeOptimizationLastEPCallbacks(MPM, Level);
+ 
+     // Emit annotation remarks.
+     addAnnotationRemarksPass(MPM);
+@@ -1571,8 +1610,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
+     // pipeline).
+     MPM.addPass(LowerTypeTestsPass(nullptr, nullptr, true));
+ 
+-    for (auto &C : FullLinkTimeOptimizationLastEPCallbacks)
+-      C(MPM, Level);
++    invokeFullLinkTimeOptimizationLastEPCallbacks(MPM, Level);
+ 
+     // Emit annotation remarks.
+     addAnnotationRemarksPass(MPM);
+@@ -1753,8 +1791,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
+   if (PTO.CallGraphProfile)
+     MPM.addPass(CGProfilePass());
+ 
+-  for (auto &C : FullLinkTimeOptimizationLastEPCallbacks)
+-    C(MPM, Level);
++  invokeFullLinkTimeOptimizationLastEPCallbacks(MPM, Level);
+ 
+   // Emit annotation remarks.
+   addAnnotationRemarksPass(MPM);
+@@ -1783,14 +1820,12 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+         /* RunProfileGen */ (PGOOpt->Action == PGOOptions::IRInstr),
+         /* IsCS */ false, PGOOpt->ProfileFile, PGOOpt->ProfileRemappingFile);
+ 
+-  for (auto &C : PipelineStartEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineStartEPCallbacks(MPM, Level);
+ 
+   if (PGOOpt && PGOOpt->DebugInfoForProfiling)
+     MPM.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
+ 
+-  for (auto &C : PipelineEarlySimplificationEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineEarlySimplificationEPCallbacks(MPM, Level);
+ 
+   // Build a minimal pipeline based on the semantics required by LLVM,
+   // which is just that always inlining occurs. Further, disable generating
+@@ -1808,15 +1843,13 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+ 
+   if (!CGSCCOptimizerLateEPCallbacks.empty()) {
+     CGSCCPassManager CGPM;
+-    for (auto &C : CGSCCOptimizerLateEPCallbacks)
+-      C(CGPM, Level);
++    invokeCGSCCOptimizerLateEPCallbacks(CGPM, Level);
+     if (!CGPM.isEmpty())
+       MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(std::move(CGPM)));
+   }
+   if (!LateLoopOptimizationsEPCallbacks.empty()) {
+     LoopPassManager LPM;
+-    for (auto &C : LateLoopOptimizationsEPCallbacks)
+-      C(LPM, Level);
++    invokeLateLoopOptimizationsEPCallbacks(LPM, Level);
+     if (!LPM.isEmpty()) {
+       MPM.addPass(createModuleToFunctionPassAdaptor(
+           createFunctionToLoopPassAdaptor(std::move(LPM))));
+@@ -1824,8 +1857,7 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+   }
+   if (!LoopOptimizerEndEPCallbacks.empty()) {
+     LoopPassManager LPM;
+-    for (auto &C : LoopOptimizerEndEPCallbacks)
+-      C(LPM, Level);
++    invokeLoopOptimizerEndEPCallbacks(LPM, Level);
+     if (!LPM.isEmpty()) {
+       MPM.addPass(createModuleToFunctionPassAdaptor(
+           createFunctionToLoopPassAdaptor(std::move(LPM))));
+@@ -1833,19 +1865,16 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+   }
+   if (!ScalarOptimizerLateEPCallbacks.empty()) {
+     FunctionPassManager FPM;
+-    for (auto &C : ScalarOptimizerLateEPCallbacks)
+-      C(FPM, Level);
++    invokeScalarOptimizerLateEPCallbacks(FPM, Level);
+     if (!FPM.isEmpty())
+       MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+   }
+ 
+-  for (auto &C : OptimizerEarlyEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerEarlyEPCallbacks(MPM, Level);
+ 
+   if (!VectorizerStartEPCallbacks.empty()) {
+     FunctionPassManager FPM;
+-    for (auto &C : VectorizerStartEPCallbacks)
+-      C(FPM, Level);
++    invokeVectorizerStartEPCallbacks(FPM, Level);
+     if (!FPM.isEmpty())
+       MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+   }
+@@ -1859,8 +1888,7 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+   CoroPM.addPass(GlobalDCEPass());
+   MPM.addPass(CoroConditionalWrapper(std::move(CoroPM)));
+ 
+-  for (auto &C : OptimizerLastEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerLastEPCallbacks(MPM, Level);
+ 
+   if (LTOPreLink)
+     addRequiredLTOPreLinkPasses(MPM);
+
+From 3089b0b526eed060bc1c0ed582dabe2a06801226 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sun, 30 Apr 2023 17:35:09 -0400
+Subject: [PATCH 22/27] Don't loop unswitch vector selects
+
+Otherwise we could produce `br <2x i1>` which are of course not legal.
+
+```
+Branch condition is not 'i1' type!
+  br <2 x i1> %cond.fr1, label %entry.split.us, label %entry.split
+  %cond.fr1 = freeze <2 x i1> %cond
+LLVM ERROR: Broken module found, compilation aborted!
+PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.
+Stack dump:
+0.	Program arguments: /home/vchuravy/builds/llvm/bin/opt -passes=simple-loop-unswitch<nontrivial> -S
+```
+
+Fixes https://reviews.llvm.org/D138526
+
+Differential Revision: https://reviews.llvm.org/D149560
+---
+ llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp b/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
+index e503795536301..bf53dfd456e0d 100644
+--- a/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
++++ b/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
+@@ -2810,7 +2810,8 @@ static bool unswitchBestCondition(
+     for (auto &I : *BB) {
+       if (auto *SI = dyn_cast<SelectInst>(&I)) {
+         auto *Cond = SI->getCondition();
+-        if (!isa<Constant>(Cond) && L.isLoopInvariant(Cond))
++        // restrict to simple boolean selects
++        if (!isa<Constant>(Cond) && L.isLoopInvariant(Cond) && Cond->getType()->isIntegerTy(1))
+           UnswitchCandidates.push_back({&I, {Cond}});
+       } else if (CollectGuards && isGuard(&I)) {
+         auto *Cond =
+
+From e9683c03b0e034f0ac1ab5f2b1f22465aad73385 Mon Sep 17 00:00:00 2001
+From: Nikita Popov <npopov@redhat.com>
+Date: Wed, 13 Jul 2022 16:53:11 +0200
+Subject: [PATCH 23/27] [IR] Add Instruction::getInsertionPointAfterDef()
+
+Transforms occasionally want to insert an instruction directly
+after the definition point of a value. This involves quite a few
+different edge cases, e.g. for phi nodes the next insertion point
+is not the next instruction, and for invokes and callbrs its not
+even in the same block. Additionally, the insertion point may not
+exist at all if catchswitch is involved.
+
+This adds a general Instruction::getInsertionPointAfterDef() API to
+implement the necessary logic. For now it is used in two places
+where this should be mostly NFC. I will follow up with additional
+uses where this fixes specific bugs in the existing implementations.
+
+Differential Revision: https://reviews.llvm.org/D129660
+---
+ llvm/include/llvm/IR/Instruction.h            |  7 +++++
+ llvm/lib/IR/Instruction.cpp                   | 26 +++++++++++++++++++
+ llvm/lib/Transforms/Coroutines/CoroFrame.cpp  | 17 +++++-------
+ .../InstCombine/InstCombineCalls.cpp          | 15 +++--------
+ 4 files changed, 43 insertions(+), 22 deletions(-)
+
+diff --git a/llvm/include/llvm/IR/Instruction.h b/llvm/include/llvm/IR/Instruction.h
+index 15b0bdf557fb1..dd9cd519fc4b7 100644
+--- a/llvm/include/llvm/IR/Instruction.h
++++ b/llvm/include/llvm/IR/Instruction.h
+@@ -149,6 +149,13 @@ class Instruction : public User,
+   /// it takes constant time.
+   bool comesBefore(const Instruction *Other) const;
+ 
++  /// Get the first insertion point at which the result of this instruction
++  /// is defined. This is *not* the directly following instruction in a number
++  /// of cases, e.g. phi nodes or terminators that return values. This function
++  /// may return null if the insertion after the definition is not possible,
++  /// e.g. due to a catchswitch terminator.
++  Instruction *getInsertionPointAfterDef();
++
+   //===--------------------------------------------------------------------===//
+   // Subclass classification.
+   //===--------------------------------------------------------------------===//
+diff --git a/llvm/lib/IR/Instruction.cpp b/llvm/lib/IR/Instruction.cpp
+index bf76c89f26ca8..007e518a1a817 100644
+--- a/llvm/lib/IR/Instruction.cpp
++++ b/llvm/lib/IR/Instruction.cpp
+@@ -116,6 +116,32 @@ bool Instruction::comesBefore(const Instruction *Other) const {
+   return Order < Other->Order;
+ }
+ 
++Instruction *Instruction::getInsertionPointAfterDef() {
++  assert(!getType()->isVoidTy() && "Instruction must define result");
++  BasicBlock *InsertBB;
++  BasicBlock::iterator InsertPt;
++  if (auto *PN = dyn_cast<PHINode>(this)) {
++    InsertBB = PN->getParent();
++    InsertPt = InsertBB->getFirstInsertionPt();
++  } else if (auto *II = dyn_cast<InvokeInst>(this)) {
++    InsertBB = II->getNormalDest();
++    InsertPt = InsertBB->getFirstInsertionPt();
++  } else if (auto *CB = dyn_cast<CallBrInst>(this)) {
++    InsertBB = CB->getDefaultDest();
++    InsertPt = InsertBB->getFirstInsertionPt();
++  } else {
++    assert(!isTerminator() && "Only invoke/callbr terminators return value");
++    InsertBB = getParent();
++    InsertPt = std::next(getIterator());
++  }
++
++  // catchswitch blocks don't have any legal insertion point (because they
++  // are both an exception pad and a terminator).
++  if (InsertPt == InsertBB->end())
++    return nullptr;
++  return &*InsertPt;
++}
++
+ bool Instruction::isOnlyUserOfAnyOperand() {
+   return any_of(operands(), [](Value *V) { return V->hasOneUser(); });
+ }
+diff --git a/llvm/lib/Transforms/Coroutines/CoroFrame.cpp b/llvm/lib/Transforms/Coroutines/CoroFrame.cpp
+index 51eb8ebf03691..dcff14b863854 100644
+--- a/llvm/lib/Transforms/Coroutines/CoroFrame.cpp
++++ b/llvm/lib/Transforms/Coroutines/CoroFrame.cpp
+@@ -2633,16 +2633,13 @@ void coro::salvageDebugInfo(
+   // dbg.value or dbg.addr since they do not have the same function wide
+   // guarantees that dbg.declare does.
+   if (!isa<DbgValueInst>(DVI) && !isa<DbgAddrIntrinsic>(DVI)) {
+-    if (auto *II = dyn_cast<InvokeInst>(Storage))
+-      DVI->moveBefore(II->getNormalDest()->getFirstNonPHI());
+-    else if (auto *CBI = dyn_cast<CallBrInst>(Storage))
+-      DVI->moveBefore(CBI->getDefaultDest()->getFirstNonPHI());
+-    else if (auto *InsertPt = dyn_cast<Instruction>(Storage)) {
+-      assert(!InsertPt->isTerminator() &&
+-             "Unimaged terminator that could return a storage.");
+-      DVI->moveAfter(InsertPt);
+-    } else if (isa<Argument>(Storage))
+-      DVI->moveAfter(F->getEntryBlock().getFirstNonPHI());
++    Instruction *InsertPt = nullptr;
++    if (auto *I = dyn_cast<Instruction>(Storage))
++      InsertPt = I->getInsertionPointAfterDef();
++    else if (isa<Argument>(Storage))
++      InsertPt = &*F->getEntryBlock().begin();
++    if (InsertPt)
++      DVI->moveBefore(InsertPt);
+   }
+ }
+ 
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
+index 52596b30494fa..9e3dec1cf92b4 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
+@@ -3451,18 +3451,9 @@ bool InstCombinerImpl::transformConstExprCastCall(CallBase &Call) {
+       NV = NC = CastInst::CreateBitOrPointerCast(NC, OldRetTy);
+       NC->setDebugLoc(Caller->getDebugLoc());
+ 
+-      // If this is an invoke/callbr instruction, we should insert it after the
+-      // first non-phi instruction in the normal successor block.
+-      if (InvokeInst *II = dyn_cast<InvokeInst>(Caller)) {
+-        BasicBlock::iterator I = II->getNormalDest()->getFirstInsertionPt();
+-        InsertNewInstBefore(NC, *I);
+-      } else if (CallBrInst *CBI = dyn_cast<CallBrInst>(Caller)) {
+-        BasicBlock::iterator I = CBI->getDefaultDest()->getFirstInsertionPt();
+-        InsertNewInstBefore(NC, *I);
+-      } else {
+-        // Otherwise, it's a call, just insert cast right after the call.
+-        InsertNewInstBefore(NC, *Caller);
+-      }
++      Instruction *InsertPt = NewCall->getInsertionPointAfterDef();
++      assert(InsertPt && "No place to insert cast");
++      InsertNewInstBefore(NC, *InsertPt);
+       Worklist.pushUsersToWorkList(*Caller);
+     } else {
+       NV = UndefValue::get(Caller->getType());
+
+From e42aaf192bf5a8a2b55ac520cad9a70f5aab3348 Mon Sep 17 00:00:00 2001
+From: Sanjay Patel <spatel@rotateright.com>
+Date: Fri, 10 Feb 2023 10:53:22 -0500
+Subject: [PATCH 24/27] [VectorCombine] fix insertion point of shuffles
+
+As shown in issue #60649, the new shuffles were
+being inserted before a phi, and that is invalid.
+
+It seems like most test coverage for this fold
+(foldSelectShuffle) lives in the AArch64 dir,
+but this doesn't repro there for a base target.
+---
+ .../Transforms/Vectorize/VectorCombine.cpp    |  8 ++--
+ .../VectorCombine/X86/select-shuffle.ll       | 38 +++++++++++++++++++
+ 2 files changed, 42 insertions(+), 4 deletions(-)
+ create mode 100644 llvm/test/Transforms/VectorCombine/X86/select-shuffle.ll
+
+diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp
+index a38936644bd30..0c0976ab96979 100644
+--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp
++++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp
+@@ -1518,16 +1518,16 @@ bool VectorCombine::foldSelectShuffle(Instruction &I, bool FromReduction) {
+           return SSV->getOperand(Op);
+     return SV->getOperand(Op);
+   };
+-  Builder.SetInsertPoint(SVI0A->getNextNode());
++  Builder.SetInsertPoint(SVI0A->getInsertionPointAfterDef());
+   Value *NSV0A = Builder.CreateShuffleVector(GetShuffleOperand(SVI0A, 0),
+                                              GetShuffleOperand(SVI0A, 1), V1A);
+-  Builder.SetInsertPoint(SVI0B->getNextNode());
++  Builder.SetInsertPoint(SVI0B->getInsertionPointAfterDef());
+   Value *NSV0B = Builder.CreateShuffleVector(GetShuffleOperand(SVI0B, 0),
+                                              GetShuffleOperand(SVI0B, 1), V1B);
+-  Builder.SetInsertPoint(SVI1A->getNextNode());
++  Builder.SetInsertPoint(SVI1A->getInsertionPointAfterDef());
+   Value *NSV1A = Builder.CreateShuffleVector(GetShuffleOperand(SVI1A, 0),
+                                              GetShuffleOperand(SVI1A, 1), V2A);
+-  Builder.SetInsertPoint(SVI1B->getNextNode());
++  Builder.SetInsertPoint(SVI1B->getInsertionPointAfterDef());
+   Value *NSV1B = Builder.CreateShuffleVector(GetShuffleOperand(SVI1B, 0),
+                                              GetShuffleOperand(SVI1B, 1), V2B);
+   Builder.SetInsertPoint(Op0);
+diff --git a/llvm/test/Transforms/VectorCombine/X86/select-shuffle.ll b/llvm/test/Transforms/VectorCombine/X86/select-shuffle.ll
+new file mode 100644
+index 0000000000000..d51ac6a33911d
+--- /dev/null
++++ b/llvm/test/Transforms/VectorCombine/X86/select-shuffle.ll
+@@ -0,0 +1,38 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
++; RUN: opt < %s -passes=vector-combine -S -mtriple=x86_64-- | FileCheck %s
++
++target datalayout = "e-p:64:64-i64:64-f80:128-n8:16:32:64-S128"
++
++; This would insert before a phi instruction which is invalid IR.
++
++define <4 x double> @PR60649() {
++; CHECK-LABEL: @PR60649(
++; CHECK-NEXT:  entry:
++; CHECK-NEXT:    br label [[END:%.*]]
++; CHECK:       unreachable:
++; CHECK-NEXT:    br label [[END]]
++; CHECK:       end:
++; CHECK-NEXT:    [[T0:%.*]] = phi <4 x double> [ zeroinitializer, [[ENTRY:%.*]] ], [ zeroinitializer, [[UNREACHABLE:%.*]] ]
++; CHECK-NEXT:    [[T1:%.*]] = phi <4 x double> [ zeroinitializer, [[ENTRY]] ], [ zeroinitializer, [[UNREACHABLE]] ]
++; CHECK-NEXT:    [[TMP0:%.*]] = shufflevector <4 x double> [[T0]], <4 x double> [[T0]], <4 x i32> <i32 2, i32 3, i32 undef, i32 undef>
++; CHECK-NEXT:    [[TMP1:%.*]] = shufflevector <4 x double> [[T0]], <4 x double> [[T0]], <4 x i32> <i32 0, i32 1, i32 undef, i32 undef>
++; CHECK-NEXT:    [[TMP2:%.*]] = fdiv <4 x double> [[TMP1]], <double 0.000000e+00, double 0.000000e+00, double undef, double undef>
++; CHECK-NEXT:    [[TMP3:%.*]] = fmul <4 x double> [[TMP0]], <double 0.000000e+00, double 0.000000e+00, double undef, double undef>
++; CHECK-NEXT:    [[T5:%.*]] = shufflevector <4 x double> [[TMP2]], <4 x double> [[TMP3]], <4 x i32> <i32 0, i32 1, i32 4, i32 5>
++; CHECK-NEXT:    ret <4 x double> [[T5]]
++;
++entry:
++  br label %end
++
++unreachable:
++  br label %end
++
++end:
++  %t0 = phi <4 x double> [ zeroinitializer, %entry ], [ zeroinitializer, %unreachable ]
++  %t1 = phi <4 x double> [ zeroinitializer, %entry ], [ zeroinitializer, %unreachable ]
++  %t2 = shufflevector <4 x double> zeroinitializer, <4 x double> zeroinitializer, <4 x i32> <i32 0, i32 0, i32 1, i32 1>
++  %t3 = fdiv <4 x double> %t0, %t2
++  %t4 = fmul <4 x double> %t0, %t2
++  %t5 = shufflevector <4 x double> %t3, <4 x double> %t4, <4 x i32> <i32 0, i32 1, i32 6, i32 7>
++  ret <4 x double> %t5
++}
+
+From e010657e399d312a9440732a8a67125ecd0e2298 Mon Sep 17 00:00:00 2001
+From: Phoebe Wang <phoebe.wang@intel.com>
+Date: Thu, 1 Dec 2022 22:31:51 +0800
+Subject: [PATCH 25/27] [X86][FP16] Do not combine fminnum/fmaxnum for FP16
+ emulation
+
+Under the emulation situation, we lack native fmin/fmax instruction support.
+
+Fixes #59258
+
+Reviewed By: skan, spatel
+
+Differential Revision: https://reviews.llvm.org/D139078
+---
+ llvm/lib/Target/X86/X86ISelLowering.cpp |   4 +-
+ llvm/test/CodeGen/X86/pr59258.ll        | 169 ++++++++++++++++++++++++
+ 2 files changed, 171 insertions(+), 2 deletions(-)
+ create mode 100644 llvm/test/CodeGen/X86/pr59258.ll
+
+diff --git a/llvm/lib/Target/X86/X86ISelLowering.cpp b/llvm/lib/Target/X86/X86ISelLowering.cpp
+index cd45c48259bbf..a53192bce8fd1 100644
+--- a/llvm/lib/Target/X86/X86ISelLowering.cpp
++++ b/llvm/lib/Target/X86/X86ISelLowering.cpp
+@@ -51111,12 +51111,12 @@ static SDValue combineFMinFMax(SDNode *N, SelectionDAG &DAG) {
+ 
+ static SDValue combineFMinNumFMaxNum(SDNode *N, SelectionDAG &DAG,
+                                      const X86Subtarget &Subtarget) {
+-  if (Subtarget.useSoftFloat())
++  EVT VT = N->getValueType(0);
++  if (Subtarget.useSoftFloat() || isSoftFP16(VT, Subtarget))
+     return SDValue();
+ 
+   const TargetLowering &TLI = DAG.getTargetLoweringInfo();
+ 
+-  EVT VT = N->getValueType(0);
+   if (!((Subtarget.hasSSE1() && VT == MVT::f32) ||
+         (Subtarget.hasSSE2() && VT == MVT::f64) ||
+         (Subtarget.hasFP16() && VT == MVT::f16) ||
+diff --git a/llvm/test/CodeGen/X86/pr59258.ll b/llvm/test/CodeGen/X86/pr59258.ll
+new file mode 100644
+index 0000000000000..fb2d219556632
+--- /dev/null
++++ b/llvm/test/CodeGen/X86/pr59258.ll
+@@ -0,0 +1,169 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
++; RUN: llc < %s -mtriple=x86_64-unknown-unknown | FileCheck %s
++
++define <8 x half> @cvt_and_clamp2(<8 x float>) nounwind {
++; CHECK-LABEL: cvt_and_clamp2:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:    subq $120, %rsp
++; CHECK-NEXT:    movaps %xmm1, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    movaps %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    movaps %xmm1, %xmm0
++; CHECK-NEXT:    shufps {{.*#+}} xmm0 = xmm0[3,3],xmm1[3,3]
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movaps {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 16-byte Reload
++; CHECK-NEXT:    movhlps {{.*#+}} xmm0 = xmm0[1,1]
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movaps {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 16-byte Reload
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movaps {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 16-byte Reload
++; CHECK-NEXT:    shufps {{.*#+}} xmm0 = xmm0[1,1,1,1]
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movaps {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 16-byte Reload
++; CHECK-NEXT:    shufps {{.*#+}} xmm0 = xmm0[3,3,3,3]
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movaps {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 16-byte Reload
++; CHECK-NEXT:    movhlps {{.*#+}} xmm0 = xmm0[1,1]
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movaps {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 16-byte Reload
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movaps {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 16-byte Reload
++; CHECK-NEXT:    shufps {{.*#+}} xmm0 = xmm0[1,1,1,1]
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    xorps %xmm1, %xmm1
++; CHECK-NEXT:    callq fmaxf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    xorps %xmm1, %xmm1
++; CHECK-NEXT:    callq fmaxf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    xorps %xmm1, %xmm1
++; CHECK-NEXT:    callq fmaxf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    xorps %xmm1, %xmm1
++; CHECK-NEXT:    callq fmaxf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    xorps %xmm1, %xmm1
++; CHECK-NEXT:    callq fmaxf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    xorps %xmm1, %xmm1
++; CHECK-NEXT:    callq fmaxf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    xorps %xmm1, %xmm1
++; CHECK-NEXT:    callq fmaxf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movss %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    xorps %xmm1, %xmm1
++; CHECK-NEXT:    callq fmaxf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq fminf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movaps %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    movd {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Folded Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq fminf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    punpcklwd {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 16-byte Folded Reload
++; CHECK-NEXT:    # xmm0 = xmm0[0],mem[0],xmm0[1],mem[1],xmm0[2],mem[2],xmm0[3],mem[3]
++; CHECK-NEXT:    movdqa %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq fminf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movaps %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    movd {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Folded Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq fminf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movdqa {{[-0-9]+}}(%r{{[sb]}}p), %xmm1 # 16-byte Reload
++; CHECK-NEXT:    punpcklwd {{.*#+}} xmm1 = xmm1[0],xmm0[0],xmm1[1],xmm0[1],xmm1[2],xmm0[2],xmm1[3],xmm0[3]
++; CHECK-NEXT:    punpckldq {{[-0-9]+}}(%r{{[sb]}}p), %xmm1 # 16-byte Folded Reload
++; CHECK-NEXT:    # xmm1 = xmm1[0],mem[0],xmm1[1],mem[1]
++; CHECK-NEXT:    movdqa %xmm1, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq fminf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movaps %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    movd {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Folded Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq fminf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    punpcklwd {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 16-byte Folded Reload
++; CHECK-NEXT:    # xmm0 = xmm0[0],mem[0],xmm0[1],mem[1],xmm0[2],mem[2],xmm0[3],mem[3]
++; CHECK-NEXT:    movdqa %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    movss {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq fminf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movaps %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    movd {{[-0-9]+}}(%r{{[sb]}}p), %xmm0 # 4-byte Folded Reload
++; CHECK-NEXT:    # xmm0 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq __extendhfsf2@PLT
++; CHECK-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
++; CHECK-NEXT:    callq fminf@PLT
++; CHECK-NEXT:    callq __truncsfhf2@PLT
++; CHECK-NEXT:    movdqa {{[-0-9]+}}(%r{{[sb]}}p), %xmm1 # 16-byte Reload
++; CHECK-NEXT:    punpcklwd {{.*#+}} xmm1 = xmm1[0],xmm0[0],xmm1[1],xmm0[1],xmm1[2],xmm0[2],xmm1[3],xmm0[3]
++; CHECK-NEXT:    punpckldq {{[-0-9]+}}(%r{{[sb]}}p), %xmm1 # 16-byte Folded Reload
++; CHECK-NEXT:    # xmm1 = xmm1[0],mem[0],xmm1[1],mem[1]
++; CHECK-NEXT:    punpcklqdq {{[-0-9]+}}(%r{{[sb]}}p), %xmm1 # 16-byte Folded Reload
++; CHECK-NEXT:    # xmm1 = xmm1[0],mem[0]
++; CHECK-NEXT:    movdqa %xmm1, %xmm0
++; CHECK-NEXT:    addq $120, %rsp
++; CHECK-NEXT:    retq
++    %2 = fptrunc <8 x float> %0 to <8 x half>
++    %3 = call <8 x half> @llvm.maxnum.v8f16(<8 x half> zeroinitializer, <8 x half> %2)
++    %4 = call <8 x half> @llvm.minnum.v8f16(<8 x half> %3, <8 x half> <half 1.0, half 1.0, half 1.0, half 1.0, half 1.0, half 1.0, half 1.0, half 1.0>)
++    ret <8 x half> %4
++}
++
++declare <8 x half> @llvm.maxnum.v8f16(<8 x half>, <8 x half>)
++declare <8 x half> @llvm.minnum.v8f16(<8 x half>, <8 x half>)
+
+From 084cd0fc414425be2d22f23552b79432dcbb01f0 Mon Sep 17 00:00:00 2001
+From: Anton Smirnov <tonysmn97@gmail.com>
+Date: Tue, 17 Oct 2023 18:48:14 +0300
+Subject: [PATCH 26/27] [AMDGPU][Backend] Fix user-after-free in
+ AMDGPUReleaseVGPRs::isLastVGPRUseVMEMStore (#21)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reviewed By: jpages, arsenm
+
+Differential Revision: https://reviews.llvm.org/D134641
+
+(cherry picked from commit bb24b2c610b4fea76a3682b108847f69e230714c)
+
+Co-authored-by: Juan Manuel MARTINEZ CAAMAÑO <juamarti@amd.com>
+---
+ llvm/lib/Target/AMDGPU/AMDGPUReleaseVGPRs.cpp | 106 ++++++++++--------
+ 1 file changed, 60 insertions(+), 46 deletions(-)
+
+diff --git a/llvm/lib/Target/AMDGPU/AMDGPUReleaseVGPRs.cpp b/llvm/lib/Target/AMDGPU/AMDGPUReleaseVGPRs.cpp
+index a86871a4a653f..c53e262d23dfb 100644
+--- a/llvm/lib/Target/AMDGPU/AMDGPUReleaseVGPRs.cpp
++++ b/llvm/lib/Target/AMDGPU/AMDGPUReleaseVGPRs.cpp
+@@ -16,7 +16,7 @@
+ #include "GCNSubtarget.h"
+ #include "MCTargetDesc/AMDGPUMCTargetDesc.h"
+ #include "SIDefines.h"
+-#include "llvm/ADT/STLExtras.h"
++#include "llvm/ADT/DepthFirstIterator.h"
+ #include "llvm/CodeGen/MachineBasicBlock.h"
+ #include "llvm/CodeGen/MachineOperand.h"
+ using namespace llvm;
+@@ -29,9 +29,6 @@ class AMDGPUReleaseVGPRs : public MachineFunctionPass {
+ public:
+   static char ID;
+ 
+-  const SIInstrInfo *SII;
+-  const SIRegisterInfo *TRI;
+-
+   AMDGPUReleaseVGPRs() : MachineFunctionPass(ID) {}
+ 
+   void getAnalysisUsage(AnalysisUsage &AU) const override {
+@@ -39,50 +36,69 @@ class AMDGPUReleaseVGPRs : public MachineFunctionPass {
+     MachineFunctionPass::getAnalysisUsage(AU);
+   }
+ 
+-  // Used to cache the result of isLastInstructionVMEMStore for each block
+-  using BlockVMEMStoreType = DenseMap<MachineBasicBlock *, bool>;
+-  BlockVMEMStoreType BlockVMEMStore;
+-
+-  // Return true if the last instruction referencing a vgpr in this MBB
+-  // is a VMEM store, otherwise return false.
+-  // Visit previous basic blocks to find this last instruction if needed.
+-  // Because this pass is late in the pipeline, it is expected that the
++  // Track if the last instruction referencing a vgpr in a MBB is a VMEM
++  // store. Because this pass is late in the pipeline, it is expected that the
+   // last vgpr use will likely be one of vmem store, ds, exp.
+   // Loads and others vgpr operations would have been
+   // deleted by this point, except for complex control flow involving loops.
+   // This is why we are just testing the type of instructions rather
+   // than the operands.
+-  bool isLastVGPRUseVMEMStore(MachineBasicBlock &MBB) {
+-    // Use the cache to break infinite loop and save some time. Initialize to
+-    // false in case we have a cycle.
+-    BlockVMEMStoreType::iterator It;
+-    bool Inserted;
+-    std::tie(It, Inserted) = BlockVMEMStore.insert({&MBB, false});
+-    bool &CacheEntry = It->second;
+-    if (!Inserted)
+-      return CacheEntry;
+-
+-    for (auto &MI : reverse(MBB.instrs())) {
+-      // If it's a VMEM store, a vgpr will be used, return true.
+-      if ((SIInstrInfo::isVMEM(MI) || SIInstrInfo::isFLAT(MI)) && MI.mayStore())
+-        return CacheEntry = true;
+-
+-      // If it's referencing a VGPR but is not a VMEM store, return false.
+-      if (SIInstrInfo::isDS(MI) || SIInstrInfo::isEXP(MI) ||
+-          SIInstrInfo::isVMEM(MI) || SIInstrInfo::isFLAT(MI) ||
+-          SIInstrInfo::isVALU(MI))
+-        return CacheEntry = false;
++  class LastVGPRUseIsVMEMStore {
++    BitVector BlockVMEMStore;
++
++    static Optional<bool> lastVGPRUseIsStore(const MachineBasicBlock &MBB) {
++      for (auto &MI : reverse(MBB.instrs())) {
++        // If it's a VMEM store, a VGPR will be used, return true.
++        if ((SIInstrInfo::isVMEM(MI) || SIInstrInfo::isFLAT(MI)) &&
++            MI.mayStore())
++          return true;
++
++        // If it's referencing a VGPR but is not a VMEM store, return false.
++        if (SIInstrInfo::isDS(MI) || SIInstrInfo::isEXP(MI) ||
++            SIInstrInfo::isVMEM(MI) || SIInstrInfo::isFLAT(MI) ||
++            SIInstrInfo::isVALU(MI))
++          return false;
++      }
++      // Wait until the values are propagated from the predecessors
++      return None;
+     }
+ 
+-    // Recursive call into parent blocks. Look into predecessors if there is no
+-    // vgpr used in this block.
+-    return CacheEntry = llvm::any_of(MBB.predecessors(),
+-                                     [this](MachineBasicBlock *Parent) {
+-                                       return isLastVGPRUseVMEMStore(*Parent);
+-                                     });
+-  }
++  public:
++    LastVGPRUseIsVMEMStore(const MachineFunction &MF)
++        : BlockVMEMStore(MF.getNumBlockIDs()) {
++
++      df_iterator_default_set<const MachineBasicBlock *> Visited;
++      SmallVector<const MachineBasicBlock *> EndWithVMEMStoreBlocks;
++
++      for (const auto &MBB : MF) {
++        auto LastUseIsStore = lastVGPRUseIsStore(MBB);
++        if (!LastUseIsStore.has_value())
++          continue;
++
++        if (*LastUseIsStore) {
++          EndWithVMEMStoreBlocks.push_back(&MBB);
++        } else {
++          Visited.insert(&MBB);
++        }
++      }
++
++      for (const auto *MBB : EndWithVMEMStoreBlocks) {
++        for (const auto *Succ : depth_first_ext(MBB, Visited)) {
++          BlockVMEMStore[Succ->getNumber()] = true;
++        }
++      }
++    }
++
++    // Return true if the last instruction referencing a vgpr in this MBB
++    // is a VMEM store, otherwise return false.
++    bool isLastVGPRUseVMEMStore(const MachineBasicBlock &MBB) const {
++      return BlockVMEMStore[MBB.getNumber()];
++    }
++  };
+ 
+-  bool runOnMachineBasicBlock(MachineBasicBlock &MBB) {
++  static bool
++  runOnMachineBasicBlock(MachineBasicBlock &MBB, const SIInstrInfo *SII,
++                         const LastVGPRUseIsVMEMStore &BlockVMEMStore) {
+ 
+     bool Changed = false;
+ 
+@@ -93,7 +109,7 @@ class AMDGPUReleaseVGPRs : public MachineFunctionPass {
+         // If the last instruction using a VGPR in the block is a VMEM store,
+         // release VGPRs. The VGPRs release will be placed just before ending
+         // the program
+-        if (isLastVGPRUseVMEMStore(MBB)) {
++        if (BlockVMEMStore.isLastVGPRUseVMEMStore(MBB)) {
+           BuildMI(MBB, MI, DebugLoc(), SII->get(AMDGPU::S_SENDMSG))
+               .addImm(AMDGPU::SendMsg::ID_DEALLOC_VGPRS_GFX11Plus);
+           Changed = true;
+@@ -117,16 +133,14 @@ class AMDGPUReleaseVGPRs : public MachineFunctionPass {
+     LLVM_DEBUG(dbgs() << "AMDGPUReleaseVGPRs running on " << MF.getName()
+                       << "\n");
+ 
+-    SII = ST.getInstrInfo();
+-    TRI = ST.getRegisterInfo();
++    const SIInstrInfo *SII = ST.getInstrInfo();
++    LastVGPRUseIsVMEMStore BlockVMEMStore(MF);
+ 
+     bool Changed = false;
+     for (auto &MBB : MF) {
+-      Changed |= runOnMachineBasicBlock(MBB);
++      Changed |= runOnMachineBasicBlock(MBB, SII, BlockVMEMStore);
+     }
+ 
+-    BlockVMEMStore.clear();
+-
+     return Changed;
+   }
+ };
+
+From 2593167b92dd2d27849e8bc331db2072a9b4bd7f Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <vchuravy@users.noreply.github.com>
+Date: Mon, 4 Dec 2023 11:21:55 -0500
+Subject: [PATCH 27/27] Block hoisting bitcasts over non-integral ascast (#23)
+
+---
+ llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp
+index a9a930555b3c6..5f09f59cff7d6 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineCasts.cpp
+@@ -2906,8 +2906,10 @@ Instruction *InstCombinerImpl::visitAddrSpaceCast(AddrSpaceCastInst &CI) {
+   Value *Src = CI.getOperand(0);
+   PointerType *SrcTy = cast<PointerType>(Src->getType()->getScalarType());
+   PointerType *DestTy = cast<PointerType>(CI.getType()->getScalarType());
++  bool isni = DL.isNonIntegralAddressSpace(SrcTy->getAddressSpace()) ||
++              DL.isNonIntegralAddressSpace(DestTy->getAddressSpace());
+ 
+-  if (!SrcTy->hasSameElementTypeAs(DestTy)) {
++  if (!SrcTy->hasSameElementTypeAs(DestTy) && !isni) {
+     Type *MidTy =
+         PointerType::getWithSamePointeeType(DestTy, SrcTy->getAddressSpace());
+     // Handle vectors of pointers.
