@@ -24,6 +24,12 @@ https://github.com/llvm/llvm-project/compare/8dfdcc7b7bf66834a761bd8de445840ef68
 https://github.com/JuliaLang/llvm-project/compare/75e33f71c2dae584b13a7d1186ae0a038ba98838...2f4460bd46aa80d4fe0d80c3dabcb10379e8d61b.patch
 ```
 
+### 4997cd3006a3171d9b33f9a72ff9fdadc84e91a7c86aa044dcf495eef3a02893.patch
+
+```
+https://github.com/llvm/llvm-project/compare/7cbf1a2591520c2491aa35339f227775f4d3adf6...499f87882a4ba1837ec12a280478cf4cb0d2753d.diff
+```
+
 ### f3def26930832532bbcd861d41b31ae03db993bc2b3510f89ef831a30bd3e099.patch
 
 ```

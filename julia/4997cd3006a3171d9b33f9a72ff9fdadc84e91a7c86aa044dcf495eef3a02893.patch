@@ -1,0 +1,1834 @@
+diff --git a/clang/cmake/modules/AddClang.cmake b/clang/cmake/modules/AddClang.cmake
+index 75b0080f671564..96ac1dc9a86f91 100644
+--- a/clang/cmake/modules/AddClang.cmake
++++ b/clang/cmake/modules/AddClang.cmake
+@@ -169,7 +169,7 @@ macro(add_clang_tool name)
+       get_target_export_arg(${name} Clang export_to_clangtargets)
+       install(TARGETS ${name}
+         ${export_to_clangtargets}
+-        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
++        RUNTIME DESTINATION "${LLVM_TOOLS_INSTALL_DIR}"
+         COMPONENT ${name})
+ 
+       if(NOT LLVM_ENABLE_IDE)
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+index fc01498aa22852..cc09a22b93b508 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_platform_limits_posix.cpp
+@@ -223,7 +223,7 @@ namespace __sanitizer {
+   unsigned struct_sockaddr_sz = sizeof(struct sockaddr);
+ 
+   unsigned ucontext_t_sz(void *ctx) {
+-#    if SANITIZER_GLIBC && SANITIZER_X64
++#    if SANITIZER_GLIBC && SANITIZER_X64 &&  __GLIBC_PREREQ (2, 27)
+     // Added in Linux kernel 3.4.0, merged to glibc in 2.16
+ #      ifndef FP_XSTATE_MAGIC1
+ #        define FP_XSTATE_MAGIC1 0x46505853U
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
+index b13e2dc9e33278..45c52763cebfed 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
+@@ -16,6 +16,10 @@
+ #include "sanitizer_flags.h"
+ #include "sanitizer_platform_interceptors.h"
+ 
++#if !defined(__APPLE__)
++#include <malloc.h>
++#endif
++
+ namespace __sanitizer {
+ #if SANITIZER_INTERCEPT_TLS_GET_ADDR
+ 
+@@ -139,6 +143,8 @@ DTLS::DTV *DTLS_on_tls_get_addr(void *arg_void, void *res,
+     tls_beg = header->start;
+     VReport(2, "__tls_get_addr: glibc >=2.19 suspected; tls={0x%zx 0x%zx}\n",
+             tls_beg, tls_size);
++  } else if (uptr size = malloc_usable_size((void *)tls_beg)) {
++    tls_size = size;
+   } else {
+     VReport(2, "__tls_get_addr: Can't guess glibc version\n");
+     // This may happen inside the DTOR of main thread, so just ignore it.
+diff --git a/compiler-rt/test/msan/Linux/signal_mcontext.cpp b/compiler-rt/test/msan/Linux/signal_mcontext.cpp
+index b49451fbb730b6..11ef74e7462bbe 100644
+--- a/compiler-rt/test/msan/Linux/signal_mcontext.cpp
++++ b/compiler-rt/test/msan/Linux/signal_mcontext.cpp
+@@ -10,7 +10,7 @@
+ 
+ void handler(int sig, siginfo_t *info, void *uctx) {
+   __msan_check_mem_is_initialized(uctx, sizeof(ucontext_t));
+-#if defined(__GLIBC__) && defined(__x86_64__)
++#if defined(__GLIBC__) && defined(__x86_64__) && __GLIBC_PREREQ(2, 27)
+   auto *mctx = &static_cast<ucontext_t *>(uctx)->uc_mcontext;
+   if (auto *fpregs = mctx->fpregs) {
+     // The member names differ across header versions, but the actual layout
+diff --git a/libunwind/src/CompactUnwinder.hpp b/libunwind/src/CompactUnwinder.hpp
+index a7a8a153d86a43..ac8837aa37ec55 100644
+--- a/libunwind/src/CompactUnwinder.hpp
++++ b/libunwind/src/CompactUnwinder.hpp
+@@ -311,6 +311,50 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingRBPFrame(
+   uint32_t savedRegistersLocations =
+       EXTRACT_BITS(compactEncoding, UNWIND_X86_64_RBP_FRAME_REGISTERS);
+ 
++  // If we have not stored EBP yet
++  if (functionStart == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp+8);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp));
++
++    return UNW_STEP_SUCCESS;
++  } else if (functionStart + 1 == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  // If we're about to return, we've already popped the base pointer
++  uint8_t b = addressSpace.get8(registers.getIP());
++
++  // This is a hack to detect VZEROUPPER but in between popq rbp and ret
++  // It's not pretty but it works
++  if (b == 0xC5) {
++    if ((b = addressSpace.get8(registers.getIP() + 1)) == 0xF8 &&
++        (b = addressSpace.get8(registers.getIP() + 2)) == 0x77)
++      b = addressSpace.get8(registers.getIP() + 3);
++    else
++      goto skip_ret;
++  }
++
++  if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++    uint64_t rbp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rbp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rbp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  skip_ret:
++
+   uint64_t savedRegisters = registers.getRBP() - 8 * savedRegistersOffset;
+   for (int i = 0; i < 5; ++i) {
+     switch (savedRegistersLocations & 0x7) {
+@@ -431,6 +475,118 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingFrameless(
+       }
+     }
+   }
++
++  // Note that the order of these registers is so that
++  // registersSaved[0] is the one that will be pushed onto the stack last.
++  // Thus, if we want to walk this from the top, we need to go in reverse.
++  assert(regCount <= 6);
++
++  // check whether we are still in the prologue
++  uint64_t curAddr = functionStart;
++  if (regCount > 0) {
++    for (int8_t i = (int8_t)(regCount) - 1; i >= 0; --i) {
++      if (registers.getIP() == curAddr) {
++        // None of the registers have been modified yet, so we don't need to reload them
++        framelessUnwind(addressSpace, registers.getSP() + 8 * (regCount - (uint64_t)(i + 1)), registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        assert(curAddr < registers.getIP());
++      }
++
++
++      // pushq %rbp and pushq %rbx is 1 byte. Everything else 2
++      if ((UNWIND_X86_64_REG_RBP == registersSaved[i]) ||
++          (UNWIND_X86_64_REG_RBX == registersSaved[i]))
++        curAddr += 1;
++      else
++        curAddr += 2;
++    }
++  }
++  if (registers.getIP() == curAddr) {
++    // None of the registers have been modified yet, so we don't need to reload them
++    framelessUnwind(addressSpace, registers.getSP() + 8*regCount, registers);
++    return UNW_STEP_SUCCESS;
++  } else {
++    assert(curAddr < registers.getIP());
++  }
++
++
++  // And now for the epilogue
++  {
++    uint8_t  i  = 0;
++    uint64_t p  = registers.getIP();
++    uint8_t  b  = 0;
++
++    while (true) {
++      b = addressSpace.get8(p++);
++      // This is a hack to detect VZEROUPPER but in between the popq's and ret
++      // It's not pretty but it works
++      if (b == 0xC5) {
++        if ((b = addressSpace.get8(p++)) == 0xF8 && (b = addressSpace.get8(p++)) == 0x77)
++          b = addressSpace.get8(p++);
++        else
++          break;
++      }
++      //  popq %rbx    popq %rbp
++      if (b == 0x5B || b == 0x5D) {
++        i++;
++      } else if (b == 0x41) {
++        b = addressSpace.get8(p++);
++        if (b == 0x5C || b == 0x5D || b == 0x5E || b == 0x5F)
++          i++;
++        else
++          break;
++      } else if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++        // i pop's haven't happened yet
++        uint64_t savedRegisters = registers.getSP() + 8 * i;
++        if (regCount > 0) {
++          for (int8_t j = (int8_t)(regCount) - 1; j >= (int8_t)(regCount) - i; --j) {
++            uint64_t addr = savedRegisters - 8 * (regCount - (uint64_t)(j));
++            switch (registersSaved[j]) {
++              case UNWIND_X86_64_REG_RBX:
++                registers.setRBX(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R12:
++                registers.setR12(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R13:
++                registers.setR13(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R14:
++                registers.setR14(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R15:
++                registers.setR15(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_RBP:
++                registers.setRBP(addressSpace.get64(addr));
++                break;
++              default:
++                _LIBUNWIND_DEBUG_LOG("bad register for frameless, encoding=%08X for "
++                             "function starting at 0x%llX",
++                              encoding, functionStart);
++                _LIBUNWIND_ABORT("invalid compact unwind encoding");
++            }
++          }
++        }
++        framelessUnwind(addressSpace, savedRegisters, registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        break;
++      }
++    }
++  }
++
++  /*
++   0x10fe2733a:  5b                             popq   %rbx
++   0x10fe2733b:  41 5c                          popq   %r12
++   0x10fe2733d:  41 5d                          popq   %r13
++   0x10fe2733f:  41 5e                          popq   %r14
++   0x10fe27341:  41 5f                          popq   %r15
++   0x10fe27343:  5d                             popq   %rbp
++   */
++
++
+   uint64_t savedRegisters = registers.getSP() + stackSize - 8 - 8 * regCount;
+   for (uint32_t i = 0; i < regCount; ++i) {
+     switch (registersSaved[i]) {
+diff --git a/lld/cmake/modules/AddLLD.cmake b/lld/cmake/modules/AddLLD.cmake
+index d3924f7243d403..01b4fe65a45ac2 100644
+--- a/lld/cmake/modules/AddLLD.cmake
++++ b/lld/cmake/modules/AddLLD.cmake
+@@ -20,7 +20,7 @@ macro(add_lld_library name)
+       ${export_to_lldtargets}
+       LIBRARY DESTINATION lib${LLVM_LIBDIR_SUFFIX}
+       ARCHIVE DESTINATION lib${LLVM_LIBDIR_SUFFIX}
+-      RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
++      RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR})
+ 
+     if (${ARG_SHARED} AND NOT CMAKE_CONFIGURATION_TYPES)
+       add_llvm_install_targets(install-${name}
+@@ -47,7 +47,7 @@ macro(add_lld_tool name)
+     get_target_export_arg(${name} LLD export_to_lldtargets)
+     install(TARGETS ${name}
+       ${export_to_lldtargets}
+-      RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
++      RUNTIME DESTINATION ${LLVM_TOOLS_INSTALL_DIR}
+       COMPONENT ${name})
+ 
+     if(NOT CMAKE_CONFIGURATION_TYPES)
+diff --git a/llvm/include/llvm/Passes/PassBuilder.h b/llvm/include/llvm/Passes/PassBuilder.h
+index b7e6764d428bf1..e6378ed446c3d0 100644
+--- a/llvm/include/llvm/Passes/PassBuilder.h
++++ b/llvm/include/llvm/Passes/PassBuilder.h
+@@ -575,6 +575,34 @@ class PassBuilder {
+     return PIC;
+   }
+ 
++  // Invoke the callbacks registered for the various extension points.
++  // Custom pipelines should use these to invoke the callbacks registered
++  // by TargetMachines and other clients.
++  void invokePeepholeEPCallbacks(FunctionPassManager &FPM,
++                                 OptimizationLevel Level);
++  void invokeLateLoopOptimizationsEPCallbacks(LoopPassManager &LPM,
++                                              OptimizationLevel Level);
++  void invokeLoopOptimizerEndEPCallbacks(LoopPassManager &LPM,
++                                         OptimizationLevel Level);
++  void invokeScalarOptimizerLateEPCallbacks(FunctionPassManager &FPM,
++                                            OptimizationLevel Level);
++  void invokeCGSCCOptimizerLateEPCallbacks(CGSCCPassManager &CGPM,
++                                           OptimizationLevel Level);
++  void invokeVectorizerStartEPCallbacks(FunctionPassManager &FPM,
++                                        OptimizationLevel Level);
++  void invokeOptimizerEarlyEPCallbacks(ModulePassManager &MPM,
++                                       OptimizationLevel Level);
++  void invokeOptimizerLastEPCallbacks(ModulePassManager &MPM,
++                                      OptimizationLevel Level);
++  void invokeFullLinkTimeOptimizationEarlyEPCallbacks(ModulePassManager &MPM,
++                                                      OptimizationLevel Level);
++  void invokeFullLinkTimeOptimizationLastEPCallbacks(ModulePassManager &MPM,
++                                                     OptimizationLevel Level);
++  void invokePipelineStartEPCallbacks(ModulePassManager &MPM,
++                                      OptimizationLevel Level);
++  void invokePipelineEarlySimplificationEPCallbacks(ModulePassManager &MPM,
++                                                    OptimizationLevel Level);
++
+ private:
+   // O1 pass pipeline
+   FunctionPassManager
+@@ -608,7 +636,6 @@ class PassBuilder {
+                          bool RunProfileGen, bool IsCS, std::string ProfileFile,
+                          std::string ProfileRemappingFile,
+                          ThinOrFullLTOPhase LTOPhase);
+-  void invokePeepholeEPCallbacks(FunctionPassManager &, OptimizationLevel);
+ 
+   // Extension Point callbacks
+   SmallVector<std::function<void(FunctionPassManager &, OptimizationLevel)>, 2>
+diff --git a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+index d9cde609e5992d..e10ba1d3a66b9e 100644
+--- a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
++++ b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+@@ -25219,6 +25219,7 @@ bool DAGCombiner::SimplifySelectOps(SDNode *TheSelect, SDValue LHS,
+         !TLI.isOperationLegalOrCustom(TheSelect->getOpcode(),
+                                       LLD->getBasePtr().getValueType()))
+       return false;
++    return false;
+ 
+     // The loads must not depend on one another.
+     if (LLD->isPredecessorOf(RLD) || RLD->isPredecessorOf(LLD))
+diff --git a/llvm/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp b/llvm/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
+index b425eec5f6d6a8..62cab22a1c45d8 100644
+--- a/llvm/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
++++ b/llvm/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
+@@ -417,7 +417,7 @@ void PerfJITEventListener::NotifyCode(Expected<llvm::StringRef> &Symbol,
+   rec.Prefix.Timestamp = perf_get_timestamp();
+ 
+   rec.CodeSize = CodeSize;
+-  rec.Vma = 0;
++  rec.Vma = CodeAddr;
+   rec.CodeAddr = CodeAddr;
+   rec.Pid = Pid;
+   rec.Tid = get_threadid();
+diff --git a/llvm/lib/MC/MCObjectFileInfo.cpp b/llvm/lib/MC/MCObjectFileInfo.cpp
+index 7af00b71677c87..a3f0ca59787859 100644
+--- a/llvm/lib/MC/MCObjectFileInfo.cpp
++++ b/llvm/lib/MC/MCObjectFileInfo.cpp
+@@ -61,9 +61,10 @@ void MCObjectFileInfo::initMachOMCObjectFileInfo(const Triple &T) {
+           MachO::S_ATTR_STRIP_STATIC_SYMS | MachO::S_ATTR_LIVE_SUPPORT,
+       SectionKind::getReadOnly());
+ 
+-  if (T.isOSDarwin() &&
+-      (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32))
+-    SupportsCompactUnwindWithoutEHFrame = true;
++  // Disabled for now, since we need to emit EH Frames for stack unwinding in the JIT
++  // if (T.isOSDarwin() &&
++  //     (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32))
++  //   SupportsCompactUnwindWithoutEHFrame = true;
+ 
+   switch (Ctx->emitDwarfUnwindInfo()) {
+   case EmitDwarfUnwindType::Always:
+diff --git a/llvm/lib/MC/WinCOFFObjectWriter.cpp b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+index c0b5e8bdc5039f..18c002cb165d05 100644
+--- a/llvm/lib/MC/WinCOFFObjectWriter.cpp
++++ b/llvm/lib/MC/WinCOFFObjectWriter.cpp
+@@ -679,14 +679,12 @@ void WinCOFFObjectWriter::executePostLayoutBinding(MCAssembler &Asm,
+ bool WinCOFFObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
+     const MCAssembler &Asm, const MCSymbol &SymA, const MCFragment &FB,
+     bool InSet, bool IsPCRel) const {
+-  // Don't drop relocations between functions, even if they are in the same text
+-  // section. Multiple Visual C++ linker features depend on having the
+-  // relocations present. The /INCREMENTAL flag will cause these relocations to
+-  // point to thunks, and the /GUARD:CF flag assumes that it can use relocations
+-  // to approximate the set of all address taken functions. LLD's implementation
+-  // of /GUARD:CF also relies on the existance of these relocations.
++  // MS LINK expects to be able to replace all references to a function with a
++  // thunk to implement their /INCREMENTAL feature.  Make sure we don't optimize
++  // away any relocations to functions.
+   uint16_t Type = cast<MCSymbolCOFF>(SymA).getType();
+-  if ((Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
++  if (Asm.isIncrementalLinkerCompatible() &&
++      (Type >> COFF::SCT_COMPLEX_TYPE_SHIFT) == COFF::IMAGE_SYM_DTYPE_FUNCTION)
+     return false;
+   return MCObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(Asm, SymA, FB,
+                                                                 InSet, IsPCRel);
+diff --git a/llvm/lib/Passes/PassBuilderPipelines.cpp b/llvm/lib/Passes/PassBuilderPipelines.cpp
+index 0d074951cffc5c..8a7e490fe2058e 100644
+--- a/llvm/lib/Passes/PassBuilderPipelines.cpp
++++ b/llvm/lib/Passes/PassBuilderPipelines.cpp
+@@ -303,6 +303,61 @@ void PassBuilder::invokePeepholeEPCallbacks(FunctionPassManager &FPM,
+   for (auto &C : PeepholeEPCallbacks)
+     C(FPM, Level);
+ }
++void PassBuilder::invokeLateLoopOptimizationsEPCallbacks(
++    LoopPassManager &LPM, OptimizationLevel Level) {
++  for (auto &C : LateLoopOptimizationsEPCallbacks)
++    C(LPM, Level);
++}
++void PassBuilder::invokeLoopOptimizerEndEPCallbacks(LoopPassManager &LPM,
++                                                    OptimizationLevel Level) {
++  for (auto &C : LoopOptimizerEndEPCallbacks)
++    C(LPM, Level);
++}
++void PassBuilder::invokeScalarOptimizerLateEPCallbacks(
++    FunctionPassManager &FPM, OptimizationLevel Level) {
++  for (auto &C : ScalarOptimizerLateEPCallbacks)
++    C(FPM, Level);
++}
++void PassBuilder::invokeCGSCCOptimizerLateEPCallbacks(CGSCCPassManager &CGPM,
++                                                      OptimizationLevel Level) {
++  for (auto &C : CGSCCOptimizerLateEPCallbacks)
++    C(CGPM, Level);
++}
++void PassBuilder::invokeVectorizerStartEPCallbacks(FunctionPassManager &FPM,
++                                                   OptimizationLevel Level) {
++  for (auto &C : VectorizerStartEPCallbacks)
++    C(FPM, Level);
++}
++void PassBuilder::invokeOptimizerEarlyEPCallbacks(ModulePassManager &MPM,
++                                                  OptimizationLevel Level) {
++  for (auto &C : OptimizerEarlyEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokeOptimizerLastEPCallbacks(ModulePassManager &MPM,
++                                                 OptimizationLevel Level) {
++  for (auto &C : OptimizerLastEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokeFullLinkTimeOptimizationEarlyEPCallbacks(
++    ModulePassManager &MPM, OptimizationLevel Level) {
++  for (auto &C : FullLinkTimeOptimizationEarlyEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokeFullLinkTimeOptimizationLastEPCallbacks(
++    ModulePassManager &MPM, OptimizationLevel Level) {
++  for (auto &C : FullLinkTimeOptimizationLastEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokePipelineStartEPCallbacks(ModulePassManager &MPM,
++                                                 OptimizationLevel Level) {
++  for (auto &C : PipelineStartEPCallbacks)
++    C(MPM, Level);
++}
++void PassBuilder::invokePipelineEarlySimplificationEPCallbacks(
++    ModulePassManager &MPM, OptimizationLevel Level) {
++  for (auto &C : PipelineEarlySimplificationEPCallbacks)
++    C(MPM, Level);
++}
+ 
+ // Helper to add AnnotationRemarksPass.
+ static void addAnnotationRemarksPass(ModulePassManager &MPM) {
+@@ -384,8 +439,7 @@ PassBuilder::buildO1FunctionSimplificationPipeline(OptimizationLevel Level,
+   LPM2.addPass(LoopIdiomRecognizePass());
+   LPM2.addPass(IndVarSimplifyPass());
+ 
+-  for (auto &C : LateLoopOptimizationsEPCallbacks)
+-    C(LPM2, Level);
++  invokeLateLoopOptimizationsEPCallbacks(LPM2, Level);
+ 
+   LPM2.addPass(LoopDeletionPass());
+ 
+@@ -403,8 +457,7 @@ PassBuilder::buildO1FunctionSimplificationPipeline(OptimizationLevel Level,
+                                     /* OnlyWhenForced= */ !PTO.LoopUnrolling,
+                                     PTO.ForgetAllSCEVInLoopUnroll));
+ 
+-  for (auto &C : LoopOptimizerEndEPCallbacks)
+-    C(LPM2, Level);
++  invokeLoopOptimizerEndEPCallbacks(LPM2, Level);
+ 
+   // We provide the opt remark emitter pass for LICM to use. We only need to do
+   // this once as it is immutable.
+@@ -445,8 +498,7 @@ PassBuilder::buildO1FunctionSimplificationPipeline(OptimizationLevel Level,
+ 
+   FPM.addPass(CoroElidePass());
+ 
+-  for (auto &C : ScalarOptimizerLateEPCallbacks)
+-    C(FPM, Level);
++  invokeScalarOptimizerLateEPCallbacks(FPM, Level);
+ 
+   // Finally, do an expensive DCE pass to catch all the dead code exposed by
+   // the simplifications and basic cleanup after all the simplifications.
+@@ -569,8 +621,7 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
+   LPM2.addPass(LoopIdiomRecognizePass());
+   LPM2.addPass(IndVarSimplifyPass());
+ 
+-  for (auto &C : LateLoopOptimizationsEPCallbacks)
+-    C(LPM2, Level);
++  invokeLateLoopOptimizationsEPCallbacks(LPM2, Level);
+ 
+   LPM2.addPass(LoopDeletionPass());
+ 
+@@ -588,8 +639,7 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
+                                     /* OnlyWhenForced= */ !PTO.LoopUnrolling,
+                                     PTO.ForgetAllSCEVInLoopUnroll));
+ 
+-  for (auto &C : LoopOptimizerEndEPCallbacks)
+-    C(LPM2, Level);
++  invokeLoopOptimizerEndEPCallbacks(LPM2, Level);
+ 
+   // We provide the opt remark emitter pass for LICM to use. We only need to do
+   // this once as it is immutable.
+@@ -661,8 +711,7 @@ PassBuilder::buildFunctionSimplificationPipeline(OptimizationLevel Level,
+ 
+   FPM.addPass(CoroElidePass());
+ 
+-  for (auto &C : ScalarOptimizerLateEPCallbacks)
+-    C(FPM, Level);
++  invokeScalarOptimizerLateEPCallbacks(FPM, Level);
+ 
+   FPM.addPass(SimplifyCFGPass(SimplifyCFGOptions()
+                                   .convertSwitchRangeToICmp(true)
+@@ -853,8 +902,7 @@ PassBuilder::buildInlinerPipeline(OptimizationLevel Level,
+   if (Level == OptimizationLevel::O2 || Level == OptimizationLevel::O3)
+     MainCGPipeline.addPass(OpenMPOptCGSCCPass());
+ 
+-  for (auto &C : CGSCCOptimizerLateEPCallbacks)
+-    C(MainCGPipeline, Level);
++  invokeCGSCCOptimizerLateEPCallbacks(MainCGPipeline, Level);
+ 
+   // Lastly, add the core function simplification pipeline nested inside the
+   // CGSCC walk.
+@@ -1009,8 +1057,7 @@ PassBuilder::buildModuleSimplificationPipeline(OptimizationLevel Level,
+   if (Phase == ThinOrFullLTOPhase::ThinLTOPostLink)
+     MPM.addPass(LowerTypeTestsPass(nullptr, nullptr, true));
+ 
+-  for (auto &C : PipelineEarlySimplificationEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineEarlySimplificationEPCallbacks(MPM, Level);
+ 
+   // Interprocedural constant propagation now that basic cleanup has occurred
+   // and prior to optimizing globals.
+@@ -1282,8 +1329,7 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
+   // memory operations.
+   MPM.addPass(RecomputeGlobalsAAPass());
+ 
+-  for (auto &C : OptimizerEarlyEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerEarlyEPCallbacks(MPM, Level);
+ 
+   FunctionPassManager OptimizePM;
+   OptimizePM.addPass(Float2IntPass());
+@@ -1301,8 +1347,7 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
+   // rather than on each loop in an inside-out manner, and so they are actually
+   // function passes.
+ 
+-  for (auto &C : VectorizerStartEPCallbacks)
+-    C(OptimizePM, Level);
++  invokeVectorizerStartEPCallbacks(OptimizePM, Level);
+ 
+   LoopPassManager LPM;
+   // First rotate loops that may have been un-rotated by prior passes.
+@@ -1354,8 +1399,7 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
+   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(OptimizePM),
+                                                 PTO.EagerlyInvalidateAnalyses));
+ 
+-  for (auto &C : OptimizerLastEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerLastEPCallbacks(MPM, Level);
+ 
+   // Split out cold code. Splitting is done late to avoid hiding context from
+   // other optimizations and inadvertently regressing performance. The tradeoff
+@@ -1408,8 +1452,7 @@ PassBuilder::buildPerModuleDefaultPipeline(OptimizationLevel Level,
+   MPM.addPass(ForceFunctionAttrsPass());
+ 
+   // Apply module pipeline start EP callback.
+-  for (auto &C : PipelineStartEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineStartEPCallbacks(MPM, Level);
+ 
+   if (PGOOpt && PGOOpt->DebugInfoForProfiling)
+     MPM.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
+@@ -1453,8 +1496,7 @@ PassBuilder::buildThinLTOPreLinkDefaultPipeline(OptimizationLevel Level) {
+     MPM.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
+ 
+   // Apply module pipeline start EP callback.
+-  for (auto &C : PipelineStartEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineStartEPCallbacks(MPM, Level);
+ 
+   // If we are planning to perform ThinLTO later, we don't bloat the code with
+   // unrolling/vectorization/... now. Just simplify the module as much as we
+@@ -1482,10 +1524,8 @@ PassBuilder::buildThinLTOPreLinkDefaultPipeline(OptimizationLevel Level) {
+   // Handle Optimizer{Early,Last}EPCallbacks added by clang on PreLink. Actual
+   // optimization is going to be done in PostLink stage, but clang can't add
+   // callbacks there in case of in-process ThinLTO called by linker.
+-  for (auto &C : OptimizerEarlyEPCallbacks)
+-    C(MPM, Level);
+-  for (auto &C : OptimizerLastEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerEarlyEPCallbacks(MPM, Level);
++  invokeOptimizerLastEPCallbacks(MPM, Level);
+ 
+   // Emit annotation remarks.
+   addAnnotationRemarksPass(MPM);
+@@ -1568,8 +1608,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
+   // Convert @llvm.global.annotations to !annotation metadata.
+   MPM.addPass(Annotation2MetadataPass());
+ 
+-  for (auto &C : FullLinkTimeOptimizationEarlyEPCallbacks)
+-    C(MPM, Level);
++  invokeFullLinkTimeOptimizationEarlyEPCallbacks(MPM, Level);
+ 
+   // Create a function that performs CFI checks for cross-DSO calls with targets
+   // in the current module.
+@@ -1584,8 +1623,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
+     // in ICP.
+     MPM.addPass(LowerTypeTestsPass(nullptr, nullptr, true));
+ 
+-    for (auto &C : FullLinkTimeOptimizationLastEPCallbacks)
+-      C(MPM, Level);
++    invokeFullLinkTimeOptimizationLastEPCallbacks(MPM, Level);
+ 
+     // Emit annotation remarks.
+     addAnnotationRemarksPass(MPM);
+@@ -1666,8 +1704,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
+     // pipeline).
+     MPM.addPass(LowerTypeTestsPass(nullptr, nullptr, true));
+ 
+-    for (auto &C : FullLinkTimeOptimizationLastEPCallbacks)
+-      C(MPM, Level);
++    invokeFullLinkTimeOptimizationLastEPCallbacks(MPM, Level);
+ 
+     // Emit annotation remarks.
+     addAnnotationRemarksPass(MPM);
+@@ -1850,8 +1887,7 @@ PassBuilder::buildLTODefaultPipeline(OptimizationLevel Level,
+   if (PTO.CallGraphProfile)
+     MPM.addPass(CGProfilePass());
+ 
+-  for (auto &C : FullLinkTimeOptimizationLastEPCallbacks)
+-    C(MPM, Level);
++  invokeFullLinkTimeOptimizationLastEPCallbacks(MPM, Level);
+ 
+   // Emit annotation remarks.
+   addAnnotationRemarksPass(MPM);
+@@ -1880,14 +1916,12 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+         /* RunProfileGen */ (PGOOpt->Action == PGOOptions::IRInstr),
+         /* IsCS */ false, PGOOpt->ProfileFile, PGOOpt->ProfileRemappingFile);
+ 
+-  for (auto &C : PipelineStartEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineStartEPCallbacks(MPM, Level);
+ 
+   if (PGOOpt && PGOOpt->DebugInfoForProfiling)
+     MPM.addPass(createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
+ 
+-  for (auto &C : PipelineEarlySimplificationEPCallbacks)
+-    C(MPM, Level);
++  invokePipelineEarlySimplificationEPCallbacks(MPM, Level);
+ 
+   // Build a minimal pipeline based on the semantics required by LLVM,
+   // which is just that always inlining occurs. Further, disable generating
+@@ -1905,15 +1939,13 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+ 
+   if (!CGSCCOptimizerLateEPCallbacks.empty()) {
+     CGSCCPassManager CGPM;
+-    for (auto &C : CGSCCOptimizerLateEPCallbacks)
+-      C(CGPM, Level);
++    invokeCGSCCOptimizerLateEPCallbacks(CGPM, Level);
+     if (!CGPM.isEmpty())
+       MPM.addPass(createModuleToPostOrderCGSCCPassAdaptor(std::move(CGPM)));
+   }
+   if (!LateLoopOptimizationsEPCallbacks.empty()) {
+     LoopPassManager LPM;
+-    for (auto &C : LateLoopOptimizationsEPCallbacks)
+-      C(LPM, Level);
++    invokeLateLoopOptimizationsEPCallbacks(LPM, Level);
+     if (!LPM.isEmpty()) {
+       MPM.addPass(createModuleToFunctionPassAdaptor(
+           createFunctionToLoopPassAdaptor(std::move(LPM))));
+@@ -1921,8 +1953,7 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+   }
+   if (!LoopOptimizerEndEPCallbacks.empty()) {
+     LoopPassManager LPM;
+-    for (auto &C : LoopOptimizerEndEPCallbacks)
+-      C(LPM, Level);
++    invokeLoopOptimizerEndEPCallbacks(LPM, Level);
+     if (!LPM.isEmpty()) {
+       MPM.addPass(createModuleToFunctionPassAdaptor(
+           createFunctionToLoopPassAdaptor(std::move(LPM))));
+@@ -1930,19 +1961,16 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+   }
+   if (!ScalarOptimizerLateEPCallbacks.empty()) {
+     FunctionPassManager FPM;
+-    for (auto &C : ScalarOptimizerLateEPCallbacks)
+-      C(FPM, Level);
++    invokeScalarOptimizerLateEPCallbacks(FPM, Level);
+     if (!FPM.isEmpty())
+       MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+   }
+ 
+-  for (auto &C : OptimizerEarlyEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerEarlyEPCallbacks(MPM, Level);
+ 
+   if (!VectorizerStartEPCallbacks.empty()) {
+     FunctionPassManager FPM;
+-    for (auto &C : VectorizerStartEPCallbacks)
+-      C(FPM, Level);
++    invokeVectorizerStartEPCallbacks(FPM, Level);
+     if (!FPM.isEmpty())
+       MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+   }
+@@ -1956,8 +1984,7 @@ ModulePassManager PassBuilder::buildO0DefaultPipeline(OptimizationLevel Level,
+   CoroPM.addPass(GlobalDCEPass());
+   MPM.addPass(CoroConditionalWrapper(std::move(CoroPM)));
+ 
+-  for (auto &C : OptimizerLastEPCallbacks)
+-    C(MPM, Level);
++  invokeOptimizerLastEPCallbacks(MPM, Level);
+ 
+   if (LTOPreLink)
+     addRequiredLTOPreLinkPasses(MPM);
+diff --git a/llvm/lib/Passes/StandardInstrumentations.cpp b/llvm/lib/Passes/StandardInstrumentations.cpp
+index ad2504eca2fbbd..ce7308d882a0b6 100644
+--- a/llvm/lib/Passes/StandardInstrumentations.cpp
++++ b/llvm/lib/Passes/StandardInstrumentations.cpp
+@@ -726,8 +726,7 @@ void PrintIRInstrumentation::printAfterPass(StringRef PassID, Any IR) {
+ }
+ 
+ void PrintIRInstrumentation::printAfterPassInvalidated(StringRef PassID) {
+-  StringRef PassName = PIC->getPassNameForClassName(PassID);
+-  if (!shouldPrintAfterPass(PassName))
++  if (!shouldPrintAfterPass(PassID))
+     return;
+ 
+   if (isIgnored(PassID))
+diff --git a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
+index fbf1327143a89a..3bd06d0aa3878d 100644
+--- a/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstCombineCalls.cpp
+@@ -184,10 +184,10 @@ Instruction *InstCombinerImpl::SimplifyAnyMemTransfer(AnyMemTransferInst *MI) {
+ 
+   // If the memcpy has metadata describing the members, see if we can get the
+   // TBAA tag describing our copy.
+-  MDNode *CopyMD = nullptr;
+-  if (MDNode *M = MI->getMetadata(LLVMContext::MD_tbaa)) {
+-    CopyMD = M;
+-  } else if (MDNode *M = MI->getMetadata(LLVMContext::MD_tbaa_struct)) {
++   AAMDNodes AACopyMD = MI->getAAMetadata();
++
++  if (MDNode *M = AACopyMD.TBAAStruct) {
++    AACopyMD.TBAAStruct = nullptr;
+     if (M->getNumOperands() == 3 && M->getOperand(0) &&
+         mdconst::hasa<ConstantInt>(M->getOperand(0)) &&
+         mdconst::extract<ConstantInt>(M->getOperand(0))->isZero() &&
+@@ -196,7 +196,7 @@ Instruction *InstCombinerImpl::SimplifyAnyMemTransfer(AnyMemTransferInst *MI) {
+         mdconst::extract<ConstantInt>(M->getOperand(1))->getValue() ==
+         Size &&
+         M->getOperand(2) && isa<MDNode>(M->getOperand(2)))
+-      CopyMD = cast<MDNode>(M->getOperand(2));
++       AACopyMD.TBAA = cast<MDNode>(M->getOperand(2));
+   }
+ 
+   Value *Src = Builder.CreateBitCast(MI->getArgOperand(1), NewSrcPtrTy);
+@@ -204,8 +204,7 @@ Instruction *InstCombinerImpl::SimplifyAnyMemTransfer(AnyMemTransferInst *MI) {
+   LoadInst *L = Builder.CreateLoad(IntType, Src);
+   // Alignment from the mem intrinsic will be better, so use it.
+   L->setAlignment(*CopySrcAlign);
+-  if (CopyMD)
+-    L->setMetadata(LLVMContext::MD_tbaa, CopyMD);
++  L->setAAMetadata(AACopyMD);
+   MDNode *LoopMemParallelMD =
+     MI->getMetadata(LLVMContext::MD_mem_parallel_loop_access);
+   if (LoopMemParallelMD)
+@@ -217,8 +216,7 @@ Instruction *InstCombinerImpl::SimplifyAnyMemTransfer(AnyMemTransferInst *MI) {
+   StoreInst *S = Builder.CreateStore(L, Dest);
+   // Alignment from the mem intrinsic will be better, so use it.
+   S->setAlignment(*CopyDstAlign);
+-  if (CopyMD)
+-    S->setMetadata(LLVMContext::MD_tbaa, CopyMD);
++  S->setAAMetadata(AACopyMD);
+   if (LoopMemParallelMD)
+     S->setMetadata(LLVMContext::MD_mem_parallel_loop_access, LoopMemParallelMD);
+   if (AccessGroupMD)
+diff --git a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index a127e81ce6433d..3316611e0af224 100644
+--- a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -375,7 +375,9 @@ static bool shouldInstrumentReadWriteFromAddress(const Module *M, Value *Addr) {
+   // with them.
+   if (Addr) {
+     Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+-    if (PtrTy->getPointerAddressSpace() != 0)
++    auto AS = PtrTy->getPointerAddressSpace();
++    // Allow for custom addresspaces
++    if (AS != 0 && AS < 10)
+       return false;
+   }
+ 
+diff --git a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp
+index 64846484f93683..3ef718ae74d968 100644
+--- a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp
++++ b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp
+@@ -1455,6 +1455,13 @@ bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {
+     eraseInstruction(M);
+     return true;
+   }
++    // If the size is zero, remove the memcpy. This also prevents infinite loops
++  // in processMemSetMemCpyDependence, which is a no-op for zero-length memcpys.
++
++  MemoryUseOrDef *MA = MSSA->getMemoryAccess(M);
++  if (!MA)
++    // Degenerate case: memcpy marked as not accessing memory.
++    return false;
+ 
+   // If copying from a constant, try to turn the memcpy into a memset.
+   if (auto *GV = dyn_cast<GlobalVariable>(M->getSource()))
+@@ -1464,8 +1471,7 @@ bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {
+         IRBuilder<> Builder(M);
+         Instruction *NewM = Builder.CreateMemSet(
+             M->getRawDest(), ByteVal, M->getLength(), M->getDestAlign(), false);
+-        auto *LastDef =
+-            cast<MemoryDef>(MSSAU->getMemorySSA()->getMemoryAccess(M));
++        auto *LastDef = cast<MemoryDef>(MA);
+         auto *NewAccess =
+             MSSAU->createMemoryAccessAfter(NewM, LastDef, LastDef);
+         MSSAU->insertDef(cast<MemoryDef>(NewAccess), /*RenameUses=*/true);
+@@ -1476,7 +1482,6 @@ bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {
+       }
+ 
+   BatchAAResults BAA(*AA);
+-  MemoryUseOrDef *MA = MSSA->getMemoryAccess(M);
+   // FIXME: Not using getClobberingMemoryAccess() here due to PR54682.
+   MemoryAccess *AnyClobber = MA->getDefiningAccess();
+   MemoryLocation DestLoc = MemoryLocation::getForDest(M);
+diff --git a/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp b/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
+index 7e08120f923d5d..4100f39e28cc70 100644
+--- a/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
++++ b/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
+@@ -19,6 +19,7 @@
+ #include "llvm/Analysis/BlockFrequencyInfo.h"
+ #include "llvm/Analysis/CFG.h"
+ #include "llvm/Analysis/CodeMetrics.h"
++#include "llvm/Analysis/DomTreeUpdater.h"
+ #include "llvm/Analysis/GuardUtils.h"
+ #include "llvm/Analysis/LoopAnalysisManager.h"
+ #include "llvm/Analysis/LoopInfo.h"
+@@ -73,6 +74,7 @@ using namespace llvm::PatternMatch;
+ 
+ STATISTIC(NumBranches, "Number of branches unswitched");
+ STATISTIC(NumSwitches, "Number of switches unswitched");
++STATISTIC(NumSelects, "Number of selects turned into branches for unswitching");
+ STATISTIC(NumGuards, "Number of guards turned into branches for unswitching");
+ STATISTIC(NumTrivial, "Number of unswitches that are trivial");
+ STATISTIC(
+@@ -2079,7 +2081,7 @@ static void unswitchNontrivialInvariants(
+     AssumptionCache &AC,
+     function_ref<void(bool, bool, ArrayRef<Loop *>)> UnswitchCB,
+     ScalarEvolution *SE, MemorySSAUpdater *MSSAU,
+-    function_ref<void(Loop &, StringRef)> DestroyLoopCB) {
++    function_ref<void(Loop &, StringRef)> DestroyLoopCB, bool InsertFreeze) {
+   auto *ParentBB = TI.getParent();
+   BranchInst *BI = dyn_cast<BranchInst>(&TI);
+   SwitchInst *SI = BI ? nullptr : cast<SwitchInst>(&TI);
+@@ -2181,25 +2183,6 @@ static void unswitchNontrivialInvariants(
+     SE->forgetBlockAndLoopDispositions();
+   }
+ 
+-  bool InsertFreeze = false;
+-  if (FreezeLoopUnswitchCond) {
+-    ICFLoopSafetyInfo SafetyInfo;
+-    SafetyInfo.computeLoopSafetyInfo(&L);
+-    InsertFreeze = !SafetyInfo.isGuaranteedToExecute(TI, &DT, &L);
+-  }
+-
+-  // Perform the isGuaranteedNotToBeUndefOrPoison() query before the transform,
+-  // otherwise the branch instruction will have been moved outside the loop
+-  // already, and may imply that a poison condition is always UB.
+-  Value *FullUnswitchCond = nullptr;
+-  if (FullUnswitch) {
+-    FullUnswitchCond =
+-        BI ? skipTrivialSelect(BI->getCondition()) : SI->getCondition();
+-    if (InsertFreeze)
+-      InsertFreeze = !isGuaranteedNotToBeUndefOrPoison(
+-          FullUnswitchCond, &AC, L.getLoopPreheader()->getTerminator(), &DT);
+-  }
+-
+   // If the edge from this terminator to a successor dominates that successor,
+   // store a map from each block in its dominator subtree to it. This lets us
+   // tell when cloning for a particular successor if a block is dominated by
+@@ -2274,10 +2257,11 @@ static void unswitchNontrivialInvariants(
+       BasicBlock *ClonedPH = ClonedPHs.begin()->second;
+       BI->setSuccessor(ClonedSucc, ClonedPH);
+       BI->setSuccessor(1 - ClonedSucc, LoopPH);
++      Value *Cond = skipTrivialSelect(BI->getCondition());
+       if (InsertFreeze)
+-        FullUnswitchCond = new FreezeInst(
+-            FullUnswitchCond, FullUnswitchCond->getName() + ".fr", BI);
+-      BI->setCondition(FullUnswitchCond);
++        Cond = new FreezeInst(
++            Cond, Cond->getName() + ".fr", BI);
++      BI->setCondition(Cond);
+       DTUpdates.push_back({DominatorTree::Insert, SplitBB, ClonedPH});
+     } else {
+       assert(SI && "Must either be a branch or switch!");
+@@ -2294,7 +2278,7 @@ static void unswitchNontrivialInvariants(
+ 
+       if (InsertFreeze)
+         SI->setCondition(new FreezeInst(
+-            FullUnswitchCond, FullUnswitchCond->getName() + ".fr", SI));
++            SI->getCondition(), SI->getCondition()->getName() + ".fr", SI));
+ 
+       // We need to use the set to populate domtree updates as even when there
+       // are multiple cases pointing at the same successor we only want to
+@@ -2593,6 +2577,58 @@ static InstructionCost computeDomSubtreeCost(
+   return Cost;
+ }
+ 
++/// Turns a select instruction into implicit control flow branch,
++/// making the following replacement:
++///
++/// head:
++///   --code before select--
++///   select %cond, %trueval, %falseval
++///   --code after select--
++///
++/// into
++///
++/// head:
++///   --code before select--
++///   br i1 %cond, label %then, label %tail
++///
++/// then:
++///   br %tail
++///
++/// tail:
++///   phi [ %trueval, %then ], [ %falseval, %head]
++///   unreachable
++///
++/// It also makes all relevant DT and LI updates, so that all structures are in
++/// valid state after this transform.
++static BranchInst *turnSelectIntoBranch(SelectInst *SI, DominatorTree &DT,
++                                        LoopInfo &LI, MemorySSAUpdater *MSSAU,
++                                        AssumptionCache *AC) {
++  LLVM_DEBUG(dbgs() << "Turning " << *SI << " into a branch.\n");
++  BasicBlock *HeadBB = SI->getParent();
++
++  DomTreeUpdater DTU =
++      DomTreeUpdater(DT, DomTreeUpdater::UpdateStrategy::Eager);
++  SplitBlockAndInsertIfThen(SI->getCondition(), SI, false,
++                            SI->getMetadata(LLVMContext::MD_prof), &DTU, &LI);
++  auto *CondBr = cast<BranchInst>(HeadBB->getTerminator());
++  BasicBlock *ThenBB = CondBr->getSuccessor(0),
++             *TailBB = CondBr->getSuccessor(1);
++  if (MSSAU)
++    MSSAU->moveAllAfterSpliceBlocks(HeadBB, TailBB, SI);
++
++  PHINode *Phi = PHINode::Create(SI->getType(), 2, "unswitched.select", SI);
++  Phi->addIncoming(SI->getTrueValue(), ThenBB);
++  Phi->addIncoming(SI->getFalseValue(), HeadBB);
++  SI->replaceAllUsesWith(Phi);
++  SI->eraseFromParent();
++
++  if (MSSAU && VerifyMemorySSA)
++    MSSAU->getMemorySSA()->verifyMemorySSA();
++
++  ++NumSelects;
++  return CondBr;
++}
++
+ /// Turns a llvm.experimental.guard intrinsic into implicit control flow branch,
+ /// making the following replacement:
+ ///
+@@ -2700,9 +2736,10 @@ static int CalculateUnswitchCostMultiplier(
+   const BasicBlock *CondBlock = TI.getParent();
+   if (DT.dominates(CondBlock, Latch) &&
+       (isGuard(&TI) ||
+-       llvm::count_if(successors(&TI), [&L](const BasicBlock *SuccBB) {
+-         return L.contains(SuccBB);
+-       }) <= 1)) {
++       (TI.isTerminator() &&
++        llvm::count_if(successors(&TI), [&L](const BasicBlock *SuccBB) {
++          return L.contains(SuccBB);
++        }) <= 1))) {
+     NumCostMultiplierSkipped++;
+     return 1;
+   }
+@@ -2711,12 +2748,17 @@ static int CalculateUnswitchCostMultiplier(
+   int SiblingsCount = (ParentL ? ParentL->getSubLoopsVector().size()
+                                : std::distance(LI.begin(), LI.end()));
+   // Count amount of clones that all the candidates might cause during
+-  // unswitching. Branch/guard counts as 1, switch counts as log2 of its cases.
++  // unswitching. Branch/guard/select counts as 1, switch counts as log2 of its
++  // cases.
+   int UnswitchedClones = 0;
+   for (auto Candidate : UnswitchCandidates) {
+     const Instruction *CI = Candidate.TI;
+     const BasicBlock *CondBlock = CI->getParent();
+     bool SkipExitingSuccessors = DT.dominates(CondBlock, Latch);
++    if (isa<SelectInst>(CI)) {
++      UnswitchedClones++;
++      continue;
++    }
+     if (isGuard(CI)) {
+       if (!SkipExitingSuccessors)
+         UnswitchedClones++;
+@@ -2779,15 +2821,20 @@ static bool collectUnswitchCandidates(
+     if (LI.getLoopFor(BB) != &L)
+       continue;
+ 
+-    if (CollectGuards)
+-      for (auto &I : *BB)
+-        if (isGuard(&I)) {
+-          auto *Cond =
+-              skipTrivialSelect(cast<IntrinsicInst>(&I)->getArgOperand(0));
+-          // TODO: Support AND, OR conditions and partial unswitching.
+-          if (!isa<Constant>(Cond) && L.isLoopInvariant(Cond))
+-            UnswitchCandidates.push_back({&I, {Cond}});
+-        }
++    for (auto &I : *BB) {
++      if (auto *SI = dyn_cast<SelectInst>(&I)) {
++        auto *Cond = SI->getCondition();
++        // restrict to simple boolean selects
++        if (!isa<Constant>(Cond) && L.isLoopInvariant(Cond) && Cond->getType()->isIntegerTy(1))
++          UnswitchCandidates.push_back({&I, {Cond}});
++      } else if (CollectGuards && isGuard(&I)) {
++        auto *Cond =
++            skipTrivialSelect(cast<IntrinsicInst>(&I)->getArgOperand(0));
++        // TODO: Support AND, OR conditions and partial unswitching.
++        if (!isa<Constant>(Cond) && L.isLoopInvariant(Cond))
++          UnswitchCandidates.push_back({&I, {Cond}});
++      }
++    }
+ 
+     if (auto *SI = dyn_cast<SwitchInst>(BB->getTerminator())) {
+       // We can only consider fully loop-invariant switch conditions as we need
+@@ -2992,7 +3039,8 @@ static NonTrivialUnswitchCandidate findBestNonTrivialUnswitchCandidate(
+     // loop. This is computing the new cost of unswitching a condition.
+     // Note that guards always have 2 unique successors that are implicit and
+     // will be materialized if we decide to unswitch it.
+-    int SuccessorsCount = isGuard(&TI) ? 2 : Visited.size();
++    int SuccessorsCount =
++        isGuard(&TI) || isa<SelectInst>(TI) ? 2 : Visited.size();
+     assert(SuccessorsCount > 1 &&
+            "Cannot unswitch a condition without multiple distinct successors!");
+     return (LoopCost - Cost) * (SuccessorsCount - 1);
+@@ -3033,6 +3081,32 @@ static NonTrivialUnswitchCandidate findBestNonTrivialUnswitchCandidate(
+   return *Best;
+ }
+ 
++// Insert a freeze on an unswitched branch if all is true:
++// 1. freeze-loop-unswitch-cond option is true
++// 2. The branch may not execute in the loop pre-transformation. If a branch may
++// not execute and could cause UB, it would always cause UB if it is hoisted outside
++// of the loop. Insert a freeze to prevent this case.
++// 3. The branch condition may be poison or undef
++static bool shouldInsertFreeze(Loop &L, Instruction &TI, DominatorTree &DT,
++                               AssumptionCache &AC) {
++  assert(isa<BranchInst>(TI) || isa<SwitchInst>(TI));
++  if (!FreezeLoopUnswitchCond)
++    return false;
++
++  ICFLoopSafetyInfo SafetyInfo;
++  SafetyInfo.computeLoopSafetyInfo(&L);
++  if (SafetyInfo.isGuaranteedToExecute(TI, &DT, &L))
++    return false;
++
++  Value *Cond;
++  if (BranchInst *BI = dyn_cast<BranchInst>(&TI))
++    Cond = skipTrivialSelect(BI->getCondition());
++  else
++    Cond = skipTrivialSelect(cast<SwitchInst>(&TI)->getCondition());
++  return !isGuaranteedNotToBeUndefOrPoison(
++      Cond, &AC, L.getLoopPreheader()->getTerminator(), &DT);
++}
++
+ static bool unswitchBestCondition(
+     Loop &L, DominatorTree &DT, LoopInfo &LI, AssumptionCache &AC,
+     AAResults &AA, TargetTransformInfo &TTI,
+@@ -3068,15 +3142,28 @@ static bool unswitchBestCondition(
+   if (Best.TI != PartialIVCondBranch)
+     PartialIVInfo.InstToDuplicate.clear();
+ 
+-  // If the best candidate is a guard, turn it into a branch.
+-  if (isGuard(Best.TI))
+-    Best.TI =
+-        turnGuardIntoBranch(cast<IntrinsicInst>(Best.TI), L, DT, LI, MSSAU);
++  bool InsertFreeze;
++  if (auto *SI = dyn_cast<SelectInst>(Best.TI)) {
++    // If the best candidate is a select, turn it into a branch. Select
++    // instructions with a poison conditional do not propagate poison, but
++    // branching on poison causes UB. Insert a freeze on the select
++    // conditional to prevent UB after turning the select into a branch.
++    InsertFreeze = !isGuaranteedNotToBeUndefOrPoison(
++        SI->getCondition(), &AC, L.getLoopPreheader()->getTerminator(), &DT);
++    Best.TI = turnSelectIntoBranch(SI, DT, LI, MSSAU, &AC);
++  } else {
++    // If the best candidate is a guard, turn it into a branch.
++    if (isGuard(Best.TI))
++      Best.TI =
++          turnGuardIntoBranch(cast<IntrinsicInst>(Best.TI), L, DT, LI, MSSAU);
++    InsertFreeze = shouldInsertFreeze(L, *Best.TI, DT, AC);
++  }
+ 
+   LLVM_DEBUG(dbgs() << "  Unswitching non-trivial (cost = " << Best.Cost
+                     << ") terminator: " << *Best.TI << "\n");
+   unswitchNontrivialInvariants(L, *Best.TI, Best.Invariants, PartialIVInfo, DT,
+-                               LI, AC, UnswitchCB, SE, MSSAU, DestroyLoopCB);
++                               LI, AC, UnswitchCB, SE, MSSAU, DestroyLoopCB,
++                               InsertFreeze);
+   return true;
+ }
+ 
+diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp
+index 2e489757ebc184..6fc8a024be36a4 100644
+--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp
++++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp
+@@ -1660,16 +1660,16 @@ bool VectorCombine::foldSelectShuffle(Instruction &I, bool FromReduction) {
+           return SSV->getOperand(Op);
+     return SV->getOperand(Op);
+   };
+-  Builder.SetInsertPoint(SVI0A->getNextNode());
++  Builder.SetInsertPoint(SVI0A->getInsertionPointAfterDef());
+   Value *NSV0A = Builder.CreateShuffleVector(GetShuffleOperand(SVI0A, 0),
+                                              GetShuffleOperand(SVI0A, 1), V1A);
+-  Builder.SetInsertPoint(SVI0B->getNextNode());
++  Builder.SetInsertPoint(SVI0B->getInsertionPointAfterDef());
+   Value *NSV0B = Builder.CreateShuffleVector(GetShuffleOperand(SVI0B, 0),
+                                              GetShuffleOperand(SVI0B, 1), V1B);
+-  Builder.SetInsertPoint(SVI1A->getNextNode());
++  Builder.SetInsertPoint(SVI1A->getInsertionPointAfterDef());
+   Value *NSV1A = Builder.CreateShuffleVector(GetShuffleOperand(SVI1A, 0),
+                                              GetShuffleOperand(SVI1A, 1), V2A);
+-  Builder.SetInsertPoint(SVI1B->getNextNode());
++  Builder.SetInsertPoint(SVI1B->getInsertionPointAfterDef());
+   Value *NSV1B = Builder.CreateShuffleVector(GetShuffleOperand(SVI1B, 0),
+                                              GetShuffleOperand(SVI1B, 1), V2B);
+   Builder.SetInsertPoint(Op0);
+diff --git a/llvm/test/Instrumentation/MemorySanitizer/alloca.ll b/llvm/test/Instrumentation/MemorySanitizer/alloca.ll
+index 25a44ecd9d241d..738680e573462e 100644
+--- a/llvm/test/Instrumentation/MemorySanitizer/alloca.ll
++++ b/llvm/test/Instrumentation/MemorySanitizer/alloca.ll
+@@ -72,6 +72,20 @@ entry:
+ ; KMSAN: call void @__msan_poison_alloca(ptr {{.*}}, i64 20,
+ ; CHECK: ret void
+ 
++define void @array32() sanitize_memory {
++entry:
++  %x = alloca i32, i32 5, align 4
++  ret void
++}
++
++; CHECK-LABEL: define void @array32(
++; INLINE: call void @llvm.memset.p0i8.i64(i8* align 4 {{.*}}, i8 -1, i64 20, i1 false)
++; CALL: call void @__msan_poison_stack(i8* {{.*}}, i64 20)
++; ORIGIN: call void @__msan_set_alloca_origin_with_descr(i8* {{.*}}, i64 20,
++; ORIGIN-LEAN: call void @__msan_set_alloca_origin_no_descr(i8* {{.*}}, i64 20,
++; KMSAN: call void @__msan_poison_alloca(i8* {{.*}}, i64 20,
++; CHECK: ret void
++
+ define void @array_non_const(i64 %cnt) sanitize_memory {
+ entry:
+   %x = alloca i32, i64 %cnt, align 4
+@@ -103,6 +117,22 @@ entry:
+ ; KMSAN: call void @__msan_poison_alloca(ptr {{.*}}, i64 %[[A]],
+ ; CHECK: ret void
+ 
++define void @array_non_const32(i32 %cnt) sanitize_memory {
++entry:
++  %x = alloca i32, i32 %cnt, align 4
++  ret void
++}
++
++; CHECK-LABEL: define void @array_non_const32(
++; CHECK: %[[Z:.*]] = zext i32 %cnt to i64
++; CHECK: %[[A:.*]] = mul i64 4, %[[Z]]
++; INLINE: call void @llvm.memset.p0i8.i64(i8* align 4 {{.*}}, i8 -1, i64 %[[A]], i1 false)
++; CALL: call void @__msan_poison_stack(i8* {{.*}}, i64 %[[A]])
++; ORIGIN: call void @__msan_set_alloca_origin_with_descr(i8* {{.*}}, i64 %[[A]],
++; ORIGIN-LEAN: call void @__msan_set_alloca_origin_no_descr(i8* {{.*}}, i64 %[[A]],
++; KMSAN: call void @__msan_poison_alloca(i8* {{.*}}, i64 %[[A]],
++; CHECK: ret void
++
+ ; Check that the local is unpoisoned in the absence of sanitize_memory
+ define void @unpoison_local() {
+ entry:
+diff --git a/llvm/test/MC/COFF/diff.s b/llvm/test/MC/COFF/diff.s
+index 90466b59d02522..640bf8189e0395 100644
+--- a/llvm/test/MC/COFF/diff.s
++++ b/llvm/test/MC/COFF/diff.s
+@@ -1,14 +1,19 @@
+ // RUN: llvm-mc -filetype=obj -triple i686-pc-mingw32 %s | llvm-readobj -S --sr --sd - | FileCheck %s
+ 
+-// COFF resolves differences between labels in the same section, unless that
+-// label is declared with function type.
+-
+ .section baz, "xr"
++	.def	X
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	X
+ X:
+ 	mov	Y-X+42,	%eax
+ 	retl
+ 
++	.def	Y
++	.scl	2;
++	.type	32;
++	.endef
+ 	.globl	Y
+ Y:
+ 	retl
+@@ -25,11 +30,6 @@ _foobar:                                # @foobar
+ # %bb.0:
+ 	ret
+ 
+-	.globl	_baz
+-_baz:
+-	calll	_foobar
+-	retl
+-
+ 	.data
+ 	.globl	_rust_crate             # @rust_crate
+ 	.align	4
+@@ -39,15 +39,6 @@ _rust_crate:
+ 	.long	_foobar-_rust_crate
+ 	.long	_foobar-_rust_crate
+ 
+-// Even though _baz and _foobar are in the same .text section, we keep the
+-// relocation for compatibility with the VC linker's /guard:cf and /incremental
+-// flags, even on mingw.
+-
+-// CHECK:        Name: .text
+-// CHECK:        Relocations [
+-// CHECK-NEXT:     0x12 IMAGE_REL_I386_REL32 _foobar
+-// CHECK-NEXT:   ]
+-
+ // CHECK:        Name: .data
+ // CHECK:        Relocations [
+ // CHECK-NEXT:     0x4 IMAGE_REL_I386_DIR32 _foobar
+diff --git a/llvm/test/Other/loop-print-after-pass-invalidated.ll b/llvm/test/Other/loop-print-after-pass-invalidated.ll
+new file mode 100644
+index 00000000000000..63106f62ae1328
+--- /dev/null
++++ b/llvm/test/Other/loop-print-after-pass-invalidated.ll
+@@ -0,0 +1,21 @@
++; RUN: opt < %s 2>&1 -disable-output \
++; RUN: 	   -passes='simple-loop-unswitch<nontrivial>' \
++; RUN:     -print-after=simple-loop-unswitch \
++; RUN:	   | FileCheck %s
++
++; CHECK: *** IR Dump After SimpleLoopUnswitchPass on for.cond ***
++; CHECK: *** IR Dump After SimpleLoopUnswitchPass on for.cond.us ***
++
++define void @loop(i1 %w)  {
++entry:
++  br label %for.cond
++; Loop:
++for.cond:                                         ; preds = %for.inc, %entry
++  br i1 %w, label %for.inc, label %if.then
++
++if.then:                                          ; preds = %for.cond
++  br label %for.inc
++
++for.inc:                                          ; preds = %if.then, %for.cond
++  br label %for.cond
++}
+diff --git a/llvm/test/Transforms/InstCombine/memcpy-to-load.ll b/llvm/test/Transforms/InstCombine/memcpy-to-load.ll
+index 4ee6ed22202413..6bd9349518d22e 100644
+--- a/llvm/test/Transforms/InstCombine/memcpy-to-load.ll
++++ b/llvm/test/Transforms/InstCombine/memcpy-to-load.ll
+@@ -79,3 +79,19 @@ define void @copy_16_bytes(ptr %d, ptr %s) {
+   ret void
+ }
+ 
++define void @copy_8_bytes_noalias(ptr %d, ptr %s) {
++; CHECK-LABEL: @copy_8_bytes_noalias(
++; CHECK-NEXT:    [[TMP1:%.*]] = load i64, ptr [[S:%.*]], align 1, !alias.scope [[META0:![0-9]+]], !noalias [[META3:![0-9]+]]
++; CHECK-NEXT:    store i64 [[TMP1]], ptr [[D:%.*]], align 1, !alias.scope [[META0]], !noalias [[META3]]
++; CHECK-NEXT:    ret void
++;
++  call void @llvm.memcpy.p0.p0.i32(ptr %d, ptr %s, i32 8, i1 false), !alias.scope !4, !noalias !5
++  ret void
++}
++
++!0 = distinct !{!0, !"The domain"}
++!1 = distinct !{!1}
++!2 = !{!2, !0}
++!3 = !{!3, !1}
++!4 = !{!2}
++!5 = !{!3}
+diff --git a/llvm/test/Transforms/MemCpyOpt/memcpy.ll b/llvm/test/Transforms/MemCpyOpt/memcpy.ll
+index 553bb787cca08c..e1736cab3751d9 100644
+--- a/llvm/test/Transforms/MemCpyOpt/memcpy.ll
++++ b/llvm/test/Transforms/MemCpyOpt/memcpy.ll
+@@ -377,3 +377,347 @@ define void @test11(ptr addrspace(1) nocapture dereferenceable(80) %P) {
+ 
+ declare void @f1(ptr nocapture sret(%struct.big))
+ declare void @f2(ptr)
++
++declare void @f(ptr)
++declare void @f_byval(ptr byval(i32))
++declare void @f_full_readonly(ptr nocapture noalias readonly)
++
++define void @immut_param(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param(
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly align 4 [[VAL:%.*]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  call void @f(ptr align 4 nocapture noalias readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy because dest may be captured.
++define void @immut_param_maycapture(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_maycapture(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL1]], ptr align 4 [[VAL:%.*]], i64 1, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias readonly align 4 [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  call void @f(ptr align 4 noalias readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy because dest may be aliased.
++define void @immut_param_mayalias(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_mayalias(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL1]], ptr align 4 [[VAL:%.*]], i64 1, i1 false)
++; CHECK-NEXT:    call void @f(ptr nocapture readonly align 4 [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  call void @f(ptr align 4 nocapture readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy because dest may be written.
++define void @immut_param_maywrite(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_maywrite(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL1]], ptr align 4 [[VAL:%.*]], i64 1, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture align 4 [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  call void @f(ptr align 4 nocapture noalias %val1)
++  ret void
++}
++
++define void @immut_param_readonly(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_readonly(
++; CHECK-NEXT:    call void @f_full_readonly(ptr align 4 [[VAL:%.*]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  call void @f_full_readonly(ptr align 4 %val1)
++  ret void
++}
++
++define void @immut_param_no_align(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_no_align(
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly [[VAL:%.*]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  call void @f(ptr nocapture noalias readonly %val1)
++  ret void
++}
++
++@gp = external constant [0 x i8]
++; Can't remove memcpy because dest is not unescaped alloca, so cpying is meaningfull.
++define void @immut_param_global(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_global(
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 @gp, ptr align 4 [[VAL:%.*]], i64 1, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly align 4 @gp)
++; CHECK-NEXT:    ret void
++;
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 @gp, ptr align 4 %val, i64 1, i1 false)
++  call void @f(ptr nocapture align 4 noalias readonly @gp)
++  ret void
++}
++
++; Can't remove memcpy for VLA because of unknown size and alignment.
++define void @immut_param_vla(ptr align 4 noalias %val, i64 %n) {
++; CHECK-LABEL: @immut_param_vla(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca ptr, i64 [[N:%.*]], align 4
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL1]], ptr align 4 [[VAL:%.*]], i64 1, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly align 4 [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca ptr, i64 %n
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  call void @f(ptr nocapture align 4 noalias readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy for scalable vector, because of memcpy size sufficiency is unknown
++define void @immut_param_scalable_vector(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_scalable_vector(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca <vscale x 2 x i32>, align 8
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL1]], ptr align 4 [[VAL:%.*]], i64 2, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly align 4 [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca <vscale x 2 x i32>
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 2, i1 false)
++  call void @f(ptr nocapture align 4 noalias readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy because dst is modified between call and memcpy
++define void @immut_param_modified_dst(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_modified_dst(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    store i32 13, ptr [[VAL1]], align 4
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly align 4 [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  store i32 13, ptr %val1
++  call void @f(ptr nocapture align 4 noalias readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy because src is modified between call and memcpy
++define void @immut_param_modified_src(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_modified_src(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL1]], ptr align 4 [[VAL:%.*]], i64 1, i1 false)
++; CHECK-NEXT:    store i32 13, ptr [[VAL]], align 4
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly align 4 [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  store i32 13, ptr %val
++  call void @f(ptr nocapture align 4 noalias readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy because memcpy is volatile
++define void @immut_param_volatile(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_volatile(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL1]], ptr align 4 [[VAL:%.*]], i64 1, i1 true)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly align 4 [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 true)
++  call void @f(ptr nocapture align 4 noalias readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy because address spaces are different.
++define void @immut_param_different_addrespace(ptr addrspace(1) align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_different_addrespace(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p1.i64(ptr align 4 [[VAL1]], ptr addrspace(1) align 4 [[VAL:%.*]], i64 1, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly align 4 [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p1.i64(ptr align 4 %val1, ptr addrspace(1) align 4 %val, i64 1, i1 false)
++  call void @f(ptr nocapture align 4 noalias readonly %val1)
++  ret void
++}
++
++define void @immut_param_bigger_align(ptr align 16 noalias %val) {
++; CHECK-LABEL: @immut_param_bigger_align(
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly [[VAL:%.*]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr %val, i64 1, i1 false)
++  call void @f(ptr nocapture noalias readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy if we remove, the bigger alignment couldn't replaced by smaller one.
++define void @immut_param_smaller_align(ptr align 4 noalias %val) {
++; CHECK-LABEL: @immut_param_smaller_align(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 16
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 16 [[VAL1]], ptr [[VAL:%.*]], i64 1, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 16
++  call void @llvm.memcpy.p0.p0.i64(ptr align 16 %val1, ptr %val, i64 1, i1 false)
++  call void @f(ptr nocapture noalias readonly %val1)
++  ret void
++}
++
++define void @immut_param_enforced_alignment() {
++; CHECK-LABEL: @immut_param_enforced_alignment(
++; CHECK-NEXT:    [[VAL:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    store i32 42, ptr [[VAL]], align 4
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly [[VAL]])
++; CHECK-NEXT:    ret void
++;
++  %val = alloca i8, align 1
++  store i32 42, ptr %val
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr %val1, ptr %val, i64 1, i1 false)
++  call void @f(ptr nocapture noalias readonly %val1)
++  ret void
++}
++
++; Can't remove memcpy, because if the %val directly passed to @f,
++; alignment of ptr to f's argument will be different.
++define void @immut_invalid_align_branched(i1 %c, ptr noalias %val) {
++; CHECK-LABEL: @immut_invalid_align_branched(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca [4 x i8], align 4
++; CHECK-NEXT:    [[VAL2:%.*]] = alloca [16 x i8], align 16
++; CHECK-NEXT:    [[VAL3:%.*]] = select i1 [[C:%.*]], ptr [[VAL1]], ptr [[VAL2]]
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL3]], ptr align 4 [[VAL:%.*]], i64 4, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly [[VAL3]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca [4 x i8], align 4
++  %val2 = alloca [16 x i8], align 16
++  %val3 = select i1 %c, ptr %val1, ptr %val2
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val3, ptr align 4 %val, i64 4, i1 false)
++  call void @f(ptr nocapture noalias readonly %val3)
++  ret void
++}
++
++; Can't remove memcpy, because alias might modify the src.
++define void @immut_but_alias_src(ptr %val) {
++; CHECK-LABEL: @immut_but_alias_src(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL1]], ptr align 4 [[VAL:%.*]], i64 1, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  call void @f(ptr nocapture noalias readonly %val1)
++  ret void
++}
++
++define void @immut_unescaped_alloca() {
++; CHECK-LABEL: @immut_unescaped_alloca(
++; CHECK-NEXT:    [[VAL:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    store i32 42, ptr [[VAL]], align 4
++; CHECK-NEXT:    call void @f_full_readonly(ptr [[VAL]])
++; CHECK-NEXT:    ret void
++;
++  %val = alloca i8, align 4
++  store i32 42, ptr %val
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  call void @f_full_readonly(ptr %val1)
++  ret void
++}
++
++; Can't remove memcpy, because alloca src is modified
++define void @immut_unescaped_alloca_modified() {
++; CHECK-LABEL: @immut_unescaped_alloca_modified(
++; CHECK-NEXT:    [[VAL:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    store i32 42, ptr [[VAL]], align 4
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca i8, align 4
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL1]], ptr align 4 [[VAL]], i64 1, i1 false)
++; CHECK-NEXT:    call void @f_full_readonly(ptr [[VAL1]])
++; CHECK-NEXT:    ret void
++;
++  %val = alloca i8, align 4
++  store i32 42, ptr %val
++  %val1 = alloca i8, align 4
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val1, ptr align 4 %val, i64 1, i1 false)
++  store i32 13, ptr %val
++  call void @f_full_readonly(ptr %val1)
++  ret void
++}
++
++; TODO: Remove memcpy
++define void @immut_valid_align_branched(i1 %c, ptr noalias align 4 %val) {
++; CHECK-LABEL: @immut_valid_align_branched(
++; CHECK-NEXT:    [[VAL1:%.*]] = alloca [4 x i8], align 4
++; CHECK-NEXT:    [[VAL2:%.*]] = alloca [16 x i8], align 4
++; CHECK-NEXT:    [[VAL3:%.*]] = select i1 [[C:%.*]], ptr [[VAL1]], ptr [[VAL2]]
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr align 4 [[VAL3]], ptr align 4 [[VAL:%.*]], i64 4, i1 false)
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly [[VAL3]])
++; CHECK-NEXT:    ret void
++;
++  %val1 = alloca [4 x i8], align 4
++  %val2 = alloca [16 x i8], align 4
++  %val3 = select i1 %c, ptr %val1, ptr %val2
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %val3, ptr align 4 %val, i64 4, i1 false)
++  call void @f(ptr nocapture noalias readonly %val3)
++  ret void
++}
++
++; Merge/drop noalias metadata when replacing parameter.
++define void @immut_param_noalias_metadata(ptr align 4 byval(i32) %ptr) {
++; CHECK-LABEL: @immut_param_noalias_metadata(
++; CHECK-NEXT:    store i32 1, ptr [[PTR:%.*]], align 4, !noalias !0
++; CHECK-NEXT:    call void @f(ptr noalias nocapture readonly [[PTR]])
++; CHECK-NEXT:    ret void
++;
++  %tmp = alloca i32, align 4
++  store i32 1, ptr %ptr, !noalias !2
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %tmp, ptr align 4 %ptr, i64 4, i1 false)
++  call void @f(ptr nocapture noalias readonly %tmp), !alias.scope !2
++  ret void
++}
++
++define void @byval_param_noalias_metadata(ptr align 4 byval(i32) %ptr) {
++; CHECK-LABEL: @byval_param_noalias_metadata(
++; CHECK-NEXT:    store i32 1, ptr [[PTR:%.*]], align 4, !noalias !0
++; CHECK-NEXT:    call void @f_byval(ptr byval(i32) align 4 [[PTR]])
++; CHECK-NEXT:    ret void
++;
++  %tmp = alloca i32, align 4
++  store i32 1, ptr %ptr, !noalias !2
++  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %tmp, ptr align 4 %ptr, i64 4, i1 false)
++  call void @f_byval(ptr align 4 byval(i32) %tmp), !alias.scope !2
++  ret void
++}
++
++define void @memcpy_memory_none(ptr %p, ptr %p2, i64 %size) {
++; CHECK-LABEL: @memcpy_memory_none(
++; CHECK-NEXT:    call void @llvm.memcpy.p0.p0.i64(ptr [[P:%.*]], ptr [[P2:%.*]], i64 [[SIZE:%.*]], i1 false) #[[ATTR6:[0-9]+]]
++; CHECK-NEXT:    ret void
++;
++  call void @llvm.memcpy.p0.p0.i64(ptr %p, ptr %p2, i64 %size, i1 false) memory(none)
++  ret void
++}
++
++!0 = !{!0}
++!1 = !{!1, !0}
++!2 = !{!1}
+diff --git a/llvm/test/Transforms/MergeICmps/addressspaces.ll b/llvm/test/Transforms/MergeICmps/addressspaces.ll
+new file mode 100644
+index 00000000000000..9a74b4a5b2ca4b
+--- /dev/null
++++ b/llvm/test/Transforms/MergeICmps/addressspaces.ll
+@@ -0,0 +1,67 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
++; RUN: opt < %s -mergeicmps -S | FileCheck %s
++
++source_filename = "=="
++target datalayout = "e-m:e-i64:64-n32:64"
++target triple = "powerpc64le-unknown-linux-gnu"
++
++define void @juliaAS([2 x [5 x i64]] addrspace(11)* nocapture nonnull readonly align 8 dereferenceable(80) %0, [2 x [5 x i64]] addrspace(11)* nocapture nonnull readonly align 8 dereferenceable(80) %1) {
++; CHECK-LABEL: @juliaAS(
++; CHECK-NEXT:  top:
++; CHECK-NEXT:    [[TMP2:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0:%.*]], i64 0, i64 1, i64 2
++; CHECK-NEXT:    [[TMP3:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0]], i64 0, i64 1, i64 3
++; CHECK-NEXT:    [[TMP4:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP0]], i64 0, i64 1, i64 4
++; CHECK-NEXT:    [[TMP5:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1:%.*]], i64 0, i64 1, i64 2
++; CHECK-NEXT:    [[TMP6:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1]], i64 0, i64 1, i64 3
++; CHECK-NEXT:    [[TMP7:%.*]] = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* [[TMP1]], i64 0, i64 1, i64 4
++; CHECK-NEXT:    [[TMP8:%.*]] = load i64, i64 addrspace(11)* [[TMP2]], align 8
++; CHECK-NEXT:    [[TMP9:%.*]] = load i64, i64 addrspace(11)* [[TMP5]], align 8
++; CHECK-NEXT:    [[DOTNOT17:%.*]] = icmp eq i64 [[TMP8]], [[TMP9]]
++; CHECK-NEXT:    br i1 [[DOTNOT17]], label [[L70:%.*]], label [[L90:%.*]]
++; CHECK:       L70:
++; CHECK-NEXT:    [[TMP10:%.*]] = load i64, i64 addrspace(11)* [[TMP3]], align 8
++; CHECK-NEXT:    [[TMP11:%.*]] = load i64, i64 addrspace(11)* [[TMP6]], align 8
++; CHECK-NEXT:    [[DOTNOT18:%.*]] = icmp eq i64 [[TMP10]], [[TMP11]]
++; CHECK-NEXT:    br i1 [[DOTNOT18]], label [[L74:%.*]], label [[L90]]
++; CHECK:       L74:
++; CHECK-NEXT:    [[TMP12:%.*]] = load i64, i64 addrspace(11)* [[TMP4]], align 8
++; CHECK-NEXT:    [[TMP13:%.*]] = load i64, i64 addrspace(11)* [[TMP7]], align 8
++; CHECK-NEXT:    [[DOTNOT19:%.*]] = icmp eq i64 [[TMP12]], [[TMP13]]
++; CHECK-NEXT:    br label [[L90]]
++; CHECK:       L90:
++; CHECK-NEXT:    [[VALUE_PHI2_OFF0:%.*]] = phi i1 [ false, [[TOP:%.*]] ], [ [[DOTNOT19]], [[L74]] ], [ false, [[L70]] ]
++; CHECK-NEXT:    ret void
++;
++top:
++  %2 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 2
++  %3 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 3
++  %4 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %0, i64 0, i64 1, i64 4
++  %5 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 2
++  %6 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 3
++  %7 = getelementptr inbounds [2 x [5 x i64]], [2 x [5 x i64]] addrspace(11)* %1, i64 0, i64 1, i64 4
++  %8 = load i64, i64 addrspace(11)* %2, align 8
++  %9 = load i64, i64 addrspace(11)* %5, align 8
++  %.not17 = icmp eq i64 %8, %9
++  br i1 %.not17, label %L70, label %L90
++
++L70:                                              ; preds = %top
++  %10 = load i64, i64 addrspace(11)* %3, align 8
++  %11 = load i64, i64 addrspace(11)* %6, align 8
++  %.not18 = icmp eq i64 %10, %11
++  br i1 %.not18, label %L74, label %L90
++
++L74:                                              ; preds = %L70
++  %12 = load i64, i64 addrspace(11)* %4, align 8
++  %13 = load i64, i64 addrspace(11)* %7, align 8
++  %.not19 = icmp eq i64 %12, %13
++  br label %L90
++
++L90:                                              ; preds = %L74, %L70, %top
++  %value_phi2.off0 = phi i1 [ false, %top ], [ %.not19, %L74 ], [ false, %L70 ]
++  ret void
++}
++
++!llvm.module.flags = !{!0}
++
++!0 = !{i32 1, !"Debug Info Version", i32 3}
++
+diff --git a/llvm/test/Transforms/SimpleLoopUnswitch/crash.ll b/llvm/test/Transforms/SimpleLoopUnswitch/crash.ll
+index a7f4c08ef874b8..37c49457dec709 100644
+--- a/llvm/test/Transforms/SimpleLoopUnswitch/crash.ll
++++ b/llvm/test/Transforms/SimpleLoopUnswitch/crash.ll
+@@ -1,4 +1,5 @@
+ ; RUN: opt < %s -passes=simple-loop-unswitch -verify-memoryssa -disable-output
++; RUN: opt < %s -passes='simple-loop-unswitch<nontrivial>' -verify-memoryssa -disable-output
+ 
+ define void @test1(ptr %S2) {
+ entry:
+diff --git a/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-freeze.ll b/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-freeze.ll
+index e511dac7fdca72..4f5a250d497a91 100644
+--- a/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-freeze.ll
++++ b/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-freeze.ll
+@@ -2332,21 +2332,26 @@ exit:
+ define i32 @test_partial_unswitch_all_conds_guaranteed_non_poison(i1 noundef %c.1, i1 noundef %c.2) {
+ ; CHECK-LABEL: @test_partial_unswitch_all_conds_guaranteed_non_poison(
+ ; CHECK-NEXT:  entry:
+-; CHECK-NEXT:    [[TMP0:%.*]] = and i1 [[C_1:%.*]], [[C_2:%.*]]
+-; CHECK-NEXT:    br i1 [[TMP0]], label [[ENTRY_SPLIT:%.*]], label [[ENTRY_SPLIT_US:%.*]]
++; CHECK-NEXT:    br i1 [[C_1:%.*]], label [[ENTRY_SPLIT_US:%.*]], label [[ENTRY_SPLIT:%.*]]
+ ; CHECK:       entry.split.us:
+ ; CHECK-NEXT:    br label [[LOOP_US:%.*]]
+ ; CHECK:       loop.us:
+-; CHECK-NEXT:    [[TMP1:%.*]] = call i32 @a()
+-; CHECK-NEXT:    br label [[EXIT_SPLIT_US:%.*]]
++; CHECK-NEXT:    [[TMP0:%.*]] = call i32 @a()
++; CHECK-NEXT:    br label [[TMP1:%.*]]
++; CHECK:       1:
++; CHECK-NEXT:    br label [[TMP2:%.*]]
++; CHECK:       2:
++; CHECK-NEXT:    [[UNSWITCHED_SELECT_US:%.*]] = phi i1 [ [[C_2:%.*]], [[TMP1]] ]
++; CHECK-NEXT:    br i1 [[UNSWITCHED_SELECT_US]], label [[LOOP_US]], label [[EXIT_SPLIT_US:%.*]]
+ ; CHECK:       exit.split.us:
+ ; CHECK-NEXT:    br label [[EXIT:%.*]]
+ ; CHECK:       entry.split:
+ ; CHECK-NEXT:    br label [[LOOP:%.*]]
+ ; CHECK:       loop:
+-; CHECK-NEXT:    [[TMP2:%.*]] = call i32 @a()
+-; CHECK-NEXT:    [[SEL:%.*]] = select i1 true, i1 true, i1 false
+-; CHECK-NEXT:    br i1 [[SEL]], label [[LOOP]], label [[EXIT_SPLIT:%.*]]
++; CHECK-NEXT:    [[TMP3:%.*]] = call i32 @a()
++; CHECK-NEXT:    br label [[TMP4:%.*]]
++; CHECK:       4:
++; CHECK-NEXT:    br i1 false, label [[LOOP]], label [[EXIT_SPLIT:%.*]]
+ ; CHECK:       exit.split:
+ ; CHECK-NEXT:    br label [[EXIT]]
+ ; CHECK:       exit:
+diff --git a/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-trivial-select.ll b/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-trivial-select.ll
+index 5280aa7d3e2847..a75c60dfd27fb4 100644
+--- a/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-trivial-select.ll
++++ b/llvm/test/Transforms/SimpleLoopUnswitch/nontrivial-unswitch-trivial-select.ll
+@@ -88,21 +88,34 @@ define i32 @unswitch_trivial_select_cmp_outside(i32 %x) {
+ ; CHECK-LABEL: @unswitch_trivial_select_cmp_outside(
+ ; CHECK-NEXT:  entry:
+ ; CHECK-NEXT:    [[C:%.*]] = icmp ult i32 [[X:%.*]], 100
+-; CHECK-NEXT:    br i1 [[C]], label [[ENTRY_SPLIT_US:%.*]], label [[ENTRY_SPLIT:%.*]]
++; CHECK-NEXT:    [[C_FR:%.*]] = freeze i1 [[C]]
++; CHECK-NEXT:    br i1 [[C_FR]], label [[ENTRY_SPLIT_US:%.*]], label [[ENTRY_SPLIT:%.*]]
+ ; CHECK:       entry.split.us:
+ ; CHECK-NEXT:    br label [[LOOP_US:%.*]]
+ ; CHECK:       loop.us:
+-; CHECK-NEXT:    [[P_US:%.*]] = phi i32 [ 0, [[ENTRY_SPLIT_US]] ], [ 35, [[LOOP_US]] ]
+-; CHECK-NEXT:    br label [[LOOP_US]]
++; CHECK-NEXT:    [[P_US:%.*]] = phi i32 [ 0, [[ENTRY_SPLIT_US]] ], [ 35, [[TMP1:%.*]] ]
++; CHECK-NEXT:    br label [[TMP0:%.*]]
++; CHECK:       0:
++; CHECK-NEXT:    br label [[TMP1]]
++; CHECK:       1:
++; CHECK-NEXT:    [[UNSWITCHED_SELECT_US:%.*]] = phi i1 [ true, [[TMP0]] ]
++; CHECK-NEXT:    br i1 [[UNSWITCHED_SELECT_US]], label [[LOOP_US]], label [[EXIT_SPLIT_US:%.*]]
++; CHECK:       exit.split.us:
++; CHECK-NEXT:    [[LCSSA_US:%.*]] = phi i32 [ [[P_US]], [[TMP1]] ]
++; CHECK-NEXT:    br label [[EXIT:%.*]]
+ ; CHECK:       entry.split:
+ ; CHECK-NEXT:    br label [[LOOP:%.*]]
+ ; CHECK:       loop:
+-; CHECK-NEXT:    [[P:%.*]] = phi i32 [ 0, [[ENTRY_SPLIT]] ]
+-; CHECK-NEXT:    [[SPEC_SELECT:%.*]] = select i1 false, i1 true, i1 false
+-; CHECK-NEXT:    br label [[EXIT:%.*]]
++; CHECK-NEXT:    [[P:%.*]] = phi i32 [ 0, [[ENTRY_SPLIT]] ], [ 35, [[TMP2:%.*]] ]
++; CHECK-NEXT:    br label [[TMP2]]
++; CHECK:       2:
++; CHECK-NEXT:    br i1 false, label [[LOOP]], label [[EXIT_SPLIT:%.*]]
++; CHECK:       exit.split:
++; CHECK-NEXT:    [[LCSSA:%.*]] = phi i32 [ [[P]], [[TMP2]] ]
++; CHECK-NEXT:    br label [[EXIT]]
+ ; CHECK:       exit:
+-; CHECK-NEXT:    [[LCSSA:%.*]] = phi i32 [ [[P]], [[LOOP]] ]
+-; CHECK-NEXT:    ret i32 [[LCSSA]]
++; CHECK-NEXT:    [[DOTUS_PHI:%.*]] = phi i32 [ [[LCSSA]], [[EXIT_SPLIT]] ], [ [[LCSSA_US]], [[EXIT_SPLIT_US]] ]
++; CHECK-NEXT:    ret i32 [[DOTUS_PHI]]
+ ;
+ entry:
+   %c = icmp ult i32 %x, 100
+diff --git a/llvm/test/Transforms/VectorCombine/X86/select-shuffle.ll b/llvm/test/Transforms/VectorCombine/X86/select-shuffle.ll
+new file mode 100644
+index 00000000000000..d51ac6a33911d4
+--- /dev/null
++++ b/llvm/test/Transforms/VectorCombine/X86/select-shuffle.ll
+@@ -0,0 +1,38 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
++; RUN: opt < %s -passes=vector-combine -S -mtriple=x86_64-- | FileCheck %s
++
++target datalayout = "e-p:64:64-i64:64-f80:128-n8:16:32:64-S128"
++
++; This would insert before a phi instruction which is invalid IR.
++
++define <4 x double> @PR60649() {
++; CHECK-LABEL: @PR60649(
++; CHECK-NEXT:  entry:
++; CHECK-NEXT:    br label [[END:%.*]]
++; CHECK:       unreachable:
++; CHECK-NEXT:    br label [[END]]
++; CHECK:       end:
++; CHECK-NEXT:    [[T0:%.*]] = phi <4 x double> [ zeroinitializer, [[ENTRY:%.*]] ], [ zeroinitializer, [[UNREACHABLE:%.*]] ]
++; CHECK-NEXT:    [[T1:%.*]] = phi <4 x double> [ zeroinitializer, [[ENTRY]] ], [ zeroinitializer, [[UNREACHABLE]] ]
++; CHECK-NEXT:    [[TMP0:%.*]] = shufflevector <4 x double> [[T0]], <4 x double> [[T0]], <4 x i32> <i32 2, i32 3, i32 undef, i32 undef>
++; CHECK-NEXT:    [[TMP1:%.*]] = shufflevector <4 x double> [[T0]], <4 x double> [[T0]], <4 x i32> <i32 0, i32 1, i32 undef, i32 undef>
++; CHECK-NEXT:    [[TMP2:%.*]] = fdiv <4 x double> [[TMP1]], <double 0.000000e+00, double 0.000000e+00, double undef, double undef>
++; CHECK-NEXT:    [[TMP3:%.*]] = fmul <4 x double> [[TMP0]], <double 0.000000e+00, double 0.000000e+00, double undef, double undef>
++; CHECK-NEXT:    [[T5:%.*]] = shufflevector <4 x double> [[TMP2]], <4 x double> [[TMP3]], <4 x i32> <i32 0, i32 1, i32 4, i32 5>
++; CHECK-NEXT:    ret <4 x double> [[T5]]
++;
++entry:
++  br label %end
++
++unreachable:
++  br label %end
++
++end:
++  %t0 = phi <4 x double> [ zeroinitializer, %entry ], [ zeroinitializer, %unreachable ]
++  %t1 = phi <4 x double> [ zeroinitializer, %entry ], [ zeroinitializer, %unreachable ]
++  %t2 = shufflevector <4 x double> zeroinitializer, <4 x double> zeroinitializer, <4 x i32> <i32 0, i32 0, i32 1, i32 1>
++  %t3 = fdiv <4 x double> %t0, %t2
++  %t4 = fmul <4 x double> %t0, %t2
++  %t5 = shufflevector <4 x double> %t3, <4 x double> %t4, <4 x i32> <i32 0, i32 1, i32 6, i32 7>
++  ret <4 x double> %t5
++}
