@@ -1,0 +1,823 @@
+From bd7a76cbf620d90bc0022a39b4366436db10d1e2 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sat, 19 May 2018 11:56:55 -0400
+Subject: [PATCH 01/12] Allow for custom address spaces
+
+Julia uses addressspaces for GC and we want these to be sanitized as well.
+
+(cherry picked from commit 3f53397f402b67341afe2bcb3a3316606b47d15c)
+(cherry picked from commit 58df73b7d510d59462d56092595cf9c91404c601)
+(cherry picked from commit d0b13036b299406cf4b7c14f6cea112a5bc03f5c)
+---
+ llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index 0f42ff7908699..02f5d6d995c1b 100644
+--- a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -370,7 +370,9 @@ static bool shouldInstrumentReadWriteFromAddress(const Module *M, Value *Addr) {
+   // with them.
+   if (Addr) {
+     Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+-    if (PtrTy->getPointerAddressSpace() != 0)
++    auto AS = PtrTy->getPointerAddressSpace();
++    // Allow for custom addresspaces
++    if (AS != 0 && AS < 10)
+       return false;
+   }
+ 
+
+From 463ddeed1155b20ba1d6ca9ae3d4e68e36844290 Mon Sep 17 00:00:00 2001
+From: Keno Fischer <kfischer@college.harvard.edu>
+Date: Sat, 30 Apr 2022 19:00:11 +0100
+Subject: [PATCH 02/12] Add support for unwinding during prologue/epilogue
+
+(cherry picked from commit 5393efbd8a4c7555b9f9fdf185c486c6b05f0c19)
+(cherry picked from commit befad70c8aa422a2415fdb5b2667f2379b9f029b)
+---
+ libunwind/src/CompactUnwinder.hpp | 156 ++++++++++++++++++++++++++++++
+ 1 file changed, 156 insertions(+)
+
+diff --git a/libunwind/src/CompactUnwinder.hpp b/libunwind/src/CompactUnwinder.hpp
+index a7a8a153d86a4..ac8837aa37ec5 100644
+--- a/libunwind/src/CompactUnwinder.hpp
++++ b/libunwind/src/CompactUnwinder.hpp
+@@ -311,6 +311,50 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingRBPFrame(
+   uint32_t savedRegistersLocations =
+       EXTRACT_BITS(compactEncoding, UNWIND_X86_64_RBP_FRAME_REGISTERS);
+ 
++  // If we have not stored EBP yet
++  if (functionStart == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp+8);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp));
++
++    return UNW_STEP_SUCCESS;
++  } else if (functionStart + 1 == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  // If we're about to return, we've already popped the base pointer
++  uint8_t b = addressSpace.get8(registers.getIP());
++
++  // This is a hack to detect VZEROUPPER but in between popq rbp and ret
++  // It's not pretty but it works
++  if (b == 0xC5) {
++    if ((b = addressSpace.get8(registers.getIP() + 1)) == 0xF8 &&
++        (b = addressSpace.get8(registers.getIP() + 2)) == 0x77)
++      b = addressSpace.get8(registers.getIP() + 3);
++    else
++      goto skip_ret;
++  }
++
++  if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++    uint64_t rbp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rbp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rbp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  skip_ret:
++
+   uint64_t savedRegisters = registers.getRBP() - 8 * savedRegistersOffset;
+   for (int i = 0; i < 5; ++i) {
+     switch (savedRegistersLocations & 0x7) {
+@@ -431,6 +475,118 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingFrameless(
+       }
+     }
+   }
++
++  // Note that the order of these registers is so that
++  // registersSaved[0] is the one that will be pushed onto the stack last.
++  // Thus, if we want to walk this from the top, we need to go in reverse.
++  assert(regCount <= 6);
++
++  // check whether we are still in the prologue
++  uint64_t curAddr = functionStart;
++  if (regCount > 0) {
++    for (int8_t i = (int8_t)(regCount) - 1; i >= 0; --i) {
++      if (registers.getIP() == curAddr) {
++        // None of the registers have been modified yet, so we don't need to reload them
++        framelessUnwind(addressSpace, registers.getSP() + 8 * (regCount - (uint64_t)(i + 1)), registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        assert(curAddr < registers.getIP());
++      }
++
++
++      // pushq %rbp and pushq %rbx is 1 byte. Everything else 2
++      if ((UNWIND_X86_64_REG_RBP == registersSaved[i]) ||
++          (UNWIND_X86_64_REG_RBX == registersSaved[i]))
++        curAddr += 1;
++      else
++        curAddr += 2;
++    }
++  }
++  if (registers.getIP() == curAddr) {
++    // None of the registers have been modified yet, so we don't need to reload them
++    framelessUnwind(addressSpace, registers.getSP() + 8*regCount, registers);
++    return UNW_STEP_SUCCESS;
++  } else {
++    assert(curAddr < registers.getIP());
++  }
++
++
++  // And now for the epilogue
++  {
++    uint8_t  i  = 0;
++    uint64_t p  = registers.getIP();
++    uint8_t  b  = 0;
++
++    while (true) {
++      b = addressSpace.get8(p++);
++      // This is a hack to detect VZEROUPPER but in between the popq's and ret
++      // It's not pretty but it works
++      if (b == 0xC5) {
++        if ((b = addressSpace.get8(p++)) == 0xF8 && (b = addressSpace.get8(p++)) == 0x77)
++          b = addressSpace.get8(p++);
++        else
++          break;
++      }
++      //  popq %rbx    popq %rbp
++      if (b == 0x5B || b == 0x5D) {
++        i++;
++      } else if (b == 0x41) {
++        b = addressSpace.get8(p++);
++        if (b == 0x5C || b == 0x5D || b == 0x5E || b == 0x5F)
++          i++;
++        else
++          break;
++      } else if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++        // i pop's haven't happened yet
++        uint64_t savedRegisters = registers.getSP() + 8 * i;
++        if (regCount > 0) {
++          for (int8_t j = (int8_t)(regCount) - 1; j >= (int8_t)(regCount) - i; --j) {
++            uint64_t addr = savedRegisters - 8 * (regCount - (uint64_t)(j));
++            switch (registersSaved[j]) {
++              case UNWIND_X86_64_REG_RBX:
++                registers.setRBX(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R12:
++                registers.setR12(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R13:
++                registers.setR13(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R14:
++                registers.setR14(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R15:
++                registers.setR15(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_RBP:
++                registers.setRBP(addressSpace.get64(addr));
++                break;
++              default:
++                _LIBUNWIND_DEBUG_LOG("bad register for frameless, encoding=%08X for "
++                             "function starting at 0x%llX",
++                              encoding, functionStart);
++                _LIBUNWIND_ABORT("invalid compact unwind encoding");
++            }
++          }
++        }
++        framelessUnwind(addressSpace, savedRegisters, registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        break;
++      }
++    }
++  }
++
++  /*
++   0x10fe2733a:  5b                             popq   %rbx
++   0x10fe2733b:  41 5c                          popq   %r12
++   0x10fe2733d:  41 5d                          popq   %r13
++   0x10fe2733f:  41 5e                          popq   %r14
++   0x10fe27341:  41 5f                          popq   %r15
++   0x10fe27343:  5d                             popq   %rbp
++   */
++
++
+   uint64_t savedRegisters = registers.getSP() + stackSize - 8 - 8 * regCount;
+   for (uint32_t i = 0; i < regCount; ++i) {
+     switch (registersSaved[i]) {
+
+From e2adfc20509b970c1726ae15230e982d4be2b918 Mon Sep 17 00:00:00 2001
+From: Cody Tapscott <cody+github@tapscott.me>
+Date: Mon, 24 May 2021 16:36:06 -0700
+Subject: [PATCH 03/12] Force `.eh_frame` emission on AArch64
+
+We need to force the emission of the EH Frame section (currently done via SupportsCompactUnwindWithoutEHFrame in the MCObjectFileInfo for the target), since libunwind doesn't yet support dynamically registering compact unwind information at run-time.
+
+(cherry picked from commit 60e041894288848e37870c42749a1aabcc2c2274)
+(cherry picked from commit 6275013da5e8cd5e552bd5bb7d85c7b0524ca69d)
+(cherry picked from commit b62bce122191cef0079a1bea7d990c1225de488f)
+---
+ llvm/lib/MC/MCObjectFileInfo.cpp | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/llvm/lib/MC/MCObjectFileInfo.cpp b/llvm/lib/MC/MCObjectFileInfo.cpp
+index 7b382c131ef91..baae090427235 100644
+--- a/llvm/lib/MC/MCObjectFileInfo.cpp
++++ b/llvm/lib/MC/MCObjectFileInfo.cpp
+@@ -69,10 +69,11 @@ void MCObjectFileInfo::initMachOMCObjectFileInfo(const Triple &T) {
+           MachO::S_ATTR_STRIP_STATIC_SYMS | MachO::S_ATTR_LIVE_SUPPORT,
+       SectionKind::getReadOnly());
+ 
+-  if (T.isOSDarwin() &&
+-      (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32 ||
+-      T.isSimulatorEnvironment()))
+-    SupportsCompactUnwindWithoutEHFrame = true;
++  // Disabled for now, since we need to emit EH Frames for stack unwinding in the JIT
++  //if (T.isOSDarwin() &&
++  //    (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32 ||
++  //    T.isSimulatorEnvironment()))
++  //  SupportsCompactUnwindWithoutEHFrame = true;
+ 
+   switch (Ctx->emitDwarfUnwindInfo()) {
+   case EmitDwarfUnwindType::Always:
+
+From 815baabe1d027029311f91ebd99ab5b0ad58aa61 Mon Sep 17 00:00:00 2001
+From: Gabriel Baraldi <baraldigabriel@gmail.com>
+Date: Mon, 22 Aug 2022 13:18:19 -0300
+Subject: [PATCH 04/12] Try keno's tentative TLS fix
+
+(cherry picked from commit 69d4ac093f62e280611709c34ac863613af65c83)
+
+Make include conditional to macos
+
+(cherry picked from commit 6b6465beb211b8d6e52e16e3b2b922731715319b)
+---
+ compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp b/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
+index 252979f1c2baa..e2bab23dae666 100644
+--- a/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
++++ b/compiler-rt/lib/sanitizer_common/sanitizer_tls_get_addr.cpp
+@@ -17,6 +17,10 @@
+ #include "sanitizer_flags.h"
+ #include "sanitizer_platform_interceptors.h"
+ 
++#if !defined(__APPLE__)
++#include <malloc.h>
++#endif
++
+ namespace __sanitizer {
+ #if SANITIZER_INTERCEPT_TLS_GET_ADDR
+ 
+@@ -140,6 +144,8 @@ DTLS::DTV *DTLS_on_tls_get_addr(void *arg_void, void *res,
+     tls_size = __sanitizer_get_allocated_size(start);
+     VReport(2, "__tls_get_addr: glibc >=2.25 suspected; tls={0x%zx,0x%zx}\n",
+             tls_beg, tls_size);
++  } else if (uptr size = malloc_usable_size((void *)tls_beg)) {
++    tls_size = size;
+   } else {
+     VReport(2, "__tls_get_addr: Can't guess glibc version\n");
+     // This may happen inside the DTOR of main thread, so just ignore it.
+
+From d7563d0e8e9334df4aa8e702bf00fa5e31e985b3 Mon Sep 17 00:00:00 2001
+From: Elliot Saba <staticfloat@gmail.com>
+Date: Mon, 27 Mar 2023 17:43:54 -0700
+Subject: [PATCH 05/12] Disable pathologically expensive `SimplifySelectOps`
+ optimization
+
+`SimplifySelectOps` is a late optimization in LLVM that attempts to
+translate `select(C, load(A), load(B))` into `load(select(C, A, B))`.
+However, in order for it to do this optimization, it needs to check that
+`C` does not depend on the result of `load(A)` or `load(B)`.
+Unfortunately (unlikely Julia and LLVM at the IR level), LLVM does not
+have a topological order of statements computed at this stage of the
+compiler, so LLVM needs to iterate through all statements in the
+function in order to perform this legality check. For large functions,
+this is extremely expensive, accounting for the majority of all
+compilation time for such functions. On the other hand, the optimization
+itself is minor, allowing at most the elision of one additional load
+(and doesn't fire particularly often, because the middle end can perform
+similar optimizations). Until there is a proper solution in LLVM, simply
+disable this optimizations, making LLVM several orders of magnitude
+faster on real world benchmarks.
+
+X-ref: https://github.com/llvm/llvm-project/issues/60132
+(cherry picked from commit 8a2c8f5770440a08240aa240c972204b950662cd)
+---
+ llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+index 5038f8a1fc156..784249f2183db 100644
+--- a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
++++ b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+@@ -26931,6 +26931,7 @@ bool DAGCombiner::SimplifySelectOps(SDNode *TheSelect, SDValue LHS,
+         !TLI.isOperationLegalOrCustom(TheSelect->getOpcode(),
+                                       LLD->getBasePtr().getValueType()))
+       return false;
++    return false;
+ 
+     // The loads must not depend on one another.
+     if (LLD->isPredecessorOf(RLD) || RLD->isPredecessorOf(LLD))
+
+From 947be24df6f515ccd8342298472428a617c368cf Mon Sep 17 00:00:00 2001
+From: Zentrik <Zentrik@users.noreply.github.com>
+Date: Sun, 14 Apr 2024 23:21:06 +0100
+Subject: [PATCH 06/12] Include cmath to fix build error on mac os 10.14
+ (#88665)
+
+This fixes #88664.
+
+(cherry picked from commit a5f54175dcf120180c3d91bbc13062bbf8f42f61)
+---
+ clang-tools-extra/clang-tidy/modernize/UseStdNumbersCheck.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/clang-tools-extra/clang-tidy/modernize/UseStdNumbersCheck.cpp b/clang-tools-extra/clang-tidy/modernize/UseStdNumbersCheck.cpp
+index b299afd540b9a..1548fc454cfb3 100644
+--- a/clang-tools-extra/clang-tidy/modernize/UseStdNumbersCheck.cpp
++++ b/clang-tools-extra/clang-tidy/modernize/UseStdNumbersCheck.cpp
+@@ -29,6 +29,7 @@
+ #include "llvm/Support/FormatVariadic.h"
+ #include "llvm/Support/MathExtras.h"
+ #include <array>
++#include <cmath>
+ #include <cstdint>
+ #include <cstdlib>
+ #include <initializer_list>
+
+From 922424cf57b14a40f1c013cb7e9a8545854fcd9a Mon Sep 17 00:00:00 2001
+From: Tim Besard <tim.besard@gmail.com>
+Date: Thu, 16 May 2024 18:18:37 +0200
+Subject: [PATCH 07/12] [NewPM] Add pass options for InternalizePass to
+ preserve GVs (reland) (#92383)
+
+---
+ llvm/lib/Passes/PassBuilder.cpp           | 18 ++++++++++++++++++
+ llvm/lib/Passes/PassRegistry.def          | 15 ++++++++++++++-
+ llvm/test/Transforms/Internalize/lists.ll |  5 +++++
+ 3 files changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Passes/PassBuilder.cpp b/llvm/lib/Passes/PassBuilder.cpp
+index 000594f0e7f4b..c1eb1fec1db5f 100644
+--- a/llvm/lib/Passes/PassBuilder.cpp
++++ b/llvm/lib/Passes/PassBuilder.cpp
+@@ -1135,6 +1135,24 @@ Expected<GlobalMergeOptions> parseGlobalMergeOptions(StringRef Params) {
+   return Result;
+ }
+ 
++Expected<SmallVector<std::string, 0>> parseInternalizeGVs(StringRef Params) {
++  SmallVector<std::string, 1> PreservedGVs;
++  while (!Params.empty()) {
++    StringRef ParamName;
++    std::tie(ParamName, Params) = Params.split(';');
++
++    if (ParamName.consume_front("preserve-gv=")) {
++      PreservedGVs.push_back(ParamName.str());
++    } else {
++      return make_error<StringError>(
++          formatv("invalid Internalize pass parameter '{0}' ", ParamName).str(),
++          inconvertibleErrorCode());
++    }
++  }
++
++  return Expected<SmallVector<std::string, 0>>(std::move(PreservedGVs));
++}
++
+ } // namespace
+ 
+ /// Tests whether a pass name starts with a valid prefix for a default pipeline
+diff --git a/llvm/lib/Passes/PassRegistry.def b/llvm/lib/Passes/PassRegistry.def
+index e59795c7b0840..832429a801337 100644
+--- a/llvm/lib/Passes/PassRegistry.def
++++ b/llvm/lib/Passes/PassRegistry.def
+@@ -77,7 +77,6 @@ MODULE_PASS("inliner-wrapper-no-mandatory-first",
+ MODULE_PASS("insert-gcov-profiling", GCOVProfilerPass())
+ MODULE_PASS("instrorderfile", InstrOrderFilePass())
+ MODULE_PASS("instrprof", InstrProfilingLoweringPass())
+-MODULE_PASS("internalize", InternalizePass())
+ MODULE_PASS("invalidate<all>", InvalidateAllAnalysesPass())
+ MODULE_PASS("iroutliner", IROutlinerPass())
+ MODULE_PASS("jmc-instrumenter", JMCInstrumenterPass())
+@@ -172,6 +171,20 @@ MODULE_PASS_WITH_PARAMS(
+     "hwasan", "HWAddressSanitizerPass",
+     [](HWAddressSanitizerOptions Opts) { return HWAddressSanitizerPass(Opts); },
+     parseHWASanPassOptions, "kernel;recover")
++MODULE_PASS_WITH_PARAMS(
++    "internalize", "InternalizePass",
++    [](SmallVector<std::string, 0> PreservedGVs) {
++      if (PreservedGVs.empty())
++        return InternalizePass();
++      auto MustPreserveGV = [=](const GlobalValue &GV) {
++        for (auto &PreservedGV : PreservedGVs)
++          if (GV.getName() == PreservedGV)
++            return true;
++        return false;
++      };
++      return InternalizePass(MustPreserveGV);
++    },
++    parseInternalizeGVs, "preserve-gv=GV")
+ MODULE_PASS_WITH_PARAMS(
+     "ipsccp", "IPSCCPPass", [](IPSCCPOptions Opts) { return IPSCCPPass(Opts); },
+     parseIPSCCPOptions, "no-func-spec;func-spec")
+diff --git a/llvm/test/Transforms/Internalize/lists.ll b/llvm/test/Transforms/Internalize/lists.ll
+index df408f906b780..83dad03d75eae 100644
+--- a/llvm/test/Transforms/Internalize/lists.ll
++++ b/llvm/test/Transforms/Internalize/lists.ll
+@@ -13,6 +13,11 @@
+ ; -file and -list options should be merged, the apifile contains foo and j
+ ; RUN: opt < %s -passes=internalize -internalize-public-api-list bar -internalize-public-api-file %S/apifile -S | FileCheck --check-prefix=FOO_J_AND_BAR %s
+ 
++; specifying through pass builder option
++; RUN: opt < %s -passes='internalize<preserve-gv=foo;preserve-gv=j>' -S | FileCheck --check-prefix=FOO_AND_J %s
++; RUN: opt < %s -passes='internalize<preserve-gv=foo;preserve-gv=bar>' -S | FileCheck --check-prefix=FOO_AND_BAR %s
++; RUN: opt < %s -passes='internalize<preserve-gv=foo;preserve-gv=j;preserve-gv=bar>' -S | FileCheck --check-prefix=FOO_J_AND_BAR %s
++
+ ; ALL: @i = internal global
+ ; FOO_AND_J: @i = internal global
+ ; FOO_AND_BAR: @i = internal global
+
+From 223a28803a9a5b6bed2d905d864d08670502fdbf Mon Sep 17 00:00:00 2001
+From: Pietro Ghiglio <pietro.ghiglio@codeplay.com>
+Date: Wed, 15 May 2024 15:03:21 +0200
+Subject: [PATCH 08/12] [VPlan] Add scalar inferencing support for addrspace
+ cast (#92107)
+
+Fixes https://github.com/llvm/llvm-project/issues/91434
+
+PR: https://github.com/llvm/llvm-project/pull/92107
+---
+ .../Transforms/Vectorize/VPlanAnalysis.cpp    |  1 +
+ llvm/test/Transforms/LoopVectorize/as_cast.ll | 40 +++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+ create mode 100644 llvm/test/Transforms/LoopVectorize/as_cast.ll
+
+diff --git a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp
+index 97a8a1803bbf5..2f9fb68469b9f 100644
+--- a/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp
++++ b/llvm/lib/Transforms/Vectorize/VPlanAnalysis.cpp
+@@ -160,6 +160,7 @@ Type *VPTypeAnalysis::inferScalarTypeForRecipe(const VPReplicateRecipe *R) {
+   case Instruction::ICmp:
+   case Instruction::FCmp:
+     return IntegerType::get(Ctx, 1);
++  case Instruction::AddrSpaceCast:
+   case Instruction::Alloca:
+   case Instruction::BitCast:
+   case Instruction::Trunc:
+diff --git a/llvm/test/Transforms/LoopVectorize/as_cast.ll b/llvm/test/Transforms/LoopVectorize/as_cast.ll
+new file mode 100644
+index 0000000000000..58a8c3d078f02
+--- /dev/null
++++ b/llvm/test/Transforms/LoopVectorize/as_cast.ll
+@@ -0,0 +1,40 @@
++; RUN: opt -passes=loop-vectorize %s -force-vector-width=1 -force-vector-interleave=2 -S -o - | FileCheck %s
++
++define void @foo(ptr addrspace(1) %in) {
++entry:
++  br label %loop
++
++loop:
++  %iter = phi i64 [ %next, %loop ], [ 0, %entry ]
++  %ascast = addrspacecast ptr addrspace(1) %in to ptr
++  %next = add i64 %iter, 1
++  %arrayidx = getelementptr inbounds i64, ptr %ascast, i64 %next
++  store i64 %next, ptr %arrayidx, align 4
++
++; check that we find the two interleaved blocks with ascast, gep and store:
++; CHECK: pred.store.if:
++; CHECK: [[ID1:%.*]] = add i64 %{{.*}}, 1
++; CHECK: [[AS1:%.*]] = addrspacecast ptr addrspace(1) %{{.*}} to ptr
++; CHECK: [[GEP1:%.*]] = getelementptr inbounds i64, ptr [[AS1]], i64 [[ID1]]
++; CHECK: store i64 [[ID1]], ptr [[GEP1]]
++
++; CHECK: pred.store.if1:
++; CHECK: [[ID2:%.*]] = add i64 %{{.*}}, 1
++; CHECK: [[AS2:%.*]] = addrspacecast ptr addrspace(1) %in to ptr
++; CHECK: [[GEP2:%.*]] = getelementptr inbounds i64, ptr [[AS2]], i64 [[ID2]]
++; CHECK: store i64 [[ID2]], ptr %9, align 4
++
++  %cmp = icmp eq i64 %next, 7
++  br i1 %cmp, label %exit, label %loop
++
++; check that we branch to the exit block
++; CHECK: middle.block:
++; CHECK: br i1 true, label %exit, label %scalar.ph
++
++exit:
++  ret void
++; CHECK: exit:
++; CHECK:   ret void
++}
++
++; CHECK: !{{[0-9]*}} = !{!"llvm.loop.isvectorized", i32 1}
+
+From ed30d043a240d06bb6e010a41086e75713156f4f Mon Sep 17 00:00:00 2001
+From: Arthur Eubanks <aeubanks@google.com>
+Date: Tue, 16 Apr 2024 13:48:04 -0600
+Subject: [PATCH 09/12] [X86] Change how we treat functions with explicit
+ sections as small/large (#88172)
+
+Following #78348, we should treat functions with an explicit section as
+small, unless the section name is (or has the prefix) ".ltext".
+
+Clang emits global initializers into a ".text.startup" section on Linux.
+If we mix small/medium code model object files with large code model
+object files, we'll end up mixing sections with and without the large
+section flag.
+
+Reland of #87838 with a check for non-ELF platforms in
+TargetMachine::isLargeGlobalValue(), otherwise MCJIT on Windows tests
+fail.
+---
+ llvm/lib/Target/TargetMachine.cpp             | 26 ++++++++++++++-----
+ .../X86/code-model-elf-text-sections.ll       | 23 ++++++++++++++++
+ 2 files changed, 43 insertions(+), 6 deletions(-)
+
+diff --git a/llvm/lib/Target/TargetMachine.cpp b/llvm/lib/Target/TargetMachine.cpp
+index 0839fb22d35a8..661a9ebc7c8ff 100644
+--- a/llvm/lib/Target/TargetMachine.cpp
++++ b/llvm/lib/Target/TargetMachine.cpp
+@@ -43,6 +43,12 @@ bool TargetMachine::isLargeGlobalValue(const GlobalValue *GVal) const {
+   if (getTargetTriple().getArch() != Triple::x86_64)
+     return false;
+ 
++  // Remaining logic below is ELF-specific. For other object file formats where
++  // the large code model is mostly used for JIT compilation, just look at the
++  // code model.
++  if (!getTargetTriple().isOSBinFormatELF())
++    return getCodeModel() == CodeModel::Large;
++
+   auto *GO = GVal->getAliaseeObject();
+ 
+   // Be conservative if we can't find an underlying GlobalObject.
+@@ -51,9 +57,20 @@ bool TargetMachine::isLargeGlobalValue(const GlobalValue *GVal) const {
+ 
+   auto *GV = dyn_cast<GlobalVariable>(GO);
+ 
++  auto IsPrefix = [](StringRef Name, StringRef Prefix) {
++    return Name.consume_front(Prefix) && (Name.empty() || Name[0] == '.');
++  };
++
+   // Functions/GlobalIFuncs are only large under the large code model.
+-  if (!GV)
++  if (!GV) {
++    // Handle explicit sections as we do for GlobalVariables with an explicit
++    // section, see comments below.
++    if (GO->hasSection()) {
++      StringRef Name = GO->getSection();
++      return IsPrefix(Name, ".ltext");
++    }
+     return getCodeModel() == CodeModel::Large;
++  }
+ 
+   if (GV->isThreadLocal())
+     return false;
+@@ -73,11 +90,8 @@ bool TargetMachine::isLargeGlobalValue(const GlobalValue *GVal) const {
+   // data sections. The code model attribute overrides this above.
+   if (GV->hasSection()) {
+     StringRef Name = GV->getSection();
+-    auto IsPrefix = [&](StringRef Prefix) {
+-      StringRef S = Name;
+-      return S.consume_front(Prefix) && (S.empty() || S[0] == '.');
+-    };
+-    return IsPrefix(".lbss") || IsPrefix(".ldata") || IsPrefix(".lrodata");
++    return IsPrefix(Name, ".lbss") || IsPrefix(Name, ".ldata") ||
++           IsPrefix(Name, ".lrodata");
+   }
+ 
+   // Respect large data threshold for medium and large code models.
+diff --git a/llvm/test/CodeGen/X86/code-model-elf-text-sections.ll b/llvm/test/CodeGen/X86/code-model-elf-text-sections.ll
+index 016c9a4d7b839..66a6fd3767542 100644
+--- a/llvm/test/CodeGen/X86/code-model-elf-text-sections.ll
++++ b/llvm/test/CodeGen/X86/code-model-elf-text-sections.ll
+@@ -13,9 +13,20 @@
+ ; RUN: llvm-readelf -S %t | FileCheck %s --check-prefix=LARGE-DS
+ 
+ ; SMALL: .text {{.*}} AX {{.*}}
++; SMALL: .ltext {{.*}} AXl {{.*}}
++; SMALL: .ltext.2 {{.*}} AXl {{.*}}
++; SMALL: .foo {{.*}} AX {{.*}}
+ ; SMALL-DS: .text.func {{.*}} AX {{.*}}
++; SMALL-DS: .ltext {{.*}} AXl {{.*}}
++; SMALL-DS: .ltext.2 {{.*}} AXl {{.*}}
++; SMALL-DS: .foo {{.*}} AX {{.*}}
+ ; LARGE: .ltext {{.*}} AXl {{.*}}
++; LARGE: .ltext.2 {{.*}} AXl {{.*}}
++; LARGE: .foo {{.*}} AX {{.*}}
+ ; LARGE-DS: .ltext.func {{.*}} AXl {{.*}}
++; LARGE-DS: .ltext {{.*}} AXl {{.*}}
++; LARGE-DS: .ltext.2 {{.*}} AXl {{.*}}
++; LARGE-DS: .foo {{.*}} AX {{.*}}
+ 
+ target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+ target triple = "x86_64--linux"
+@@ -23,3 +34,15 @@ target triple = "x86_64--linux"
+ define void @func() {
+   ret void
+ }
++
++define void @ltext() section ".ltext" {
++  ret void
++}
++
++define void @ltext2() section ".ltext.2" {
++  ret void
++}
++
++define void @foo() section ".foo" {
++  ret void
++}
+
+From fda127a2043591f50e025aff00137fd010ad0f89 Mon Sep 17 00:00:00 2001
+From: Gabriel Baraldi <baraldigabriel@gmail.com>
+Date: Tue, 2 Jul 2024 09:15:51 -0300
+Subject: [PATCH 10/12] Fix potential crash in SLPVectorizer caused by missing
+ check (#95937)
+
+I'm not super familiar with this code, but it seems that we were just
+missing a check.
+
+The original code that triggered this did not have uselistorders but
+llvm-reduce created them and it reproduces the same issue in a way more
+compact way.
+
+Fixes https://github.com/llvm/llvm-project/issues/95016
+
+(cherry picked from commit 380beaec8633bad0148aec02f03a85d9a59b2a2d)
+---
+ .../Transforms/Vectorize/SLPVectorizer.cpp    |  4 +-
+ .../SLPVectorizer/AArch64/uselistorder.ll     | 43 +++++++++++++++++++
+ 2 files changed, 45 insertions(+), 2 deletions(-)
+ create mode 100644 llvm/test/Transforms/SLPVectorizer/AArch64/uselistorder.ll
+
+diff --git a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp
+index 0a9e2c7f49f55..34b0f6635bb29 100644
+--- a/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp
++++ b/llvm/lib/Transforms/Vectorize/SLPVectorizer.cpp
+@@ -734,11 +734,11 @@ static InstructionsState getSameOpcode(ArrayRef<Value *> VL,
+         auto *CallBase = cast<CallInst>(IBase);
+         if (Call->getCalledFunction() != CallBase->getCalledFunction())
+           return InstructionsState(VL[BaseIndex], nullptr, nullptr);
+-        if (Call->hasOperandBundles() &&
++        if (Call->hasOperandBundles() && (!CallBase->hasOperandBundles() ||
+             !std::equal(Call->op_begin() + Call->getBundleOperandsStartIndex(),
+                         Call->op_begin() + Call->getBundleOperandsEndIndex(),
+                         CallBase->op_begin() +
+-                            CallBase->getBundleOperandsStartIndex()))
++                            CallBase->getBundleOperandsStartIndex())))
+           return InstructionsState(VL[BaseIndex], nullptr, nullptr);
+         Intrinsic::ID ID = getVectorIntrinsicIDForCall(Call, &TLI);
+         if (ID != BaseID)
+diff --git a/llvm/test/Transforms/SLPVectorizer/AArch64/uselistorder.ll b/llvm/test/Transforms/SLPVectorizer/AArch64/uselistorder.ll
+new file mode 100644
+index 0000000000000..3a68a37c9f82c
+--- /dev/null
++++ b/llvm/test/Transforms/SLPVectorizer/AArch64/uselistorder.ll
+@@ -0,0 +1,43 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
++; RUN: opt < %s -passes=slp-vectorizer -S -pass-remarks-missed=slp-vectorizer 2>&1 | FileCheck %s
++
++target datalayout = "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
++target triple = "aarch64-unknown-linux-gnu"
++
++; This test has UB but the crash in #95016 only happens with it
++define void @uselistorder_test() {
++; CHECK-LABEL: @uselistorder_test(
++; CHECK-NEXT:    [[TMP1:%.*]] = insertelement <2 x double> poison, double 0.000000e+00, i32 0
++; CHECK-NEXT:    [[TMP2:%.*]] = insertelement <2 x double> [[TMP1]], double 0.000000e+00, i32 1
++; CHECK-NEXT:    [[TMP3:%.*]] = fadd <2 x double> [[TMP2]], zeroinitializer
++; CHECK-NEXT:    [[TMP4:%.*]] = fmul <2 x double> zeroinitializer, [[TMP3]]
++; CHECK-NEXT:    [[TMP5:%.*]] = fmul <2 x double> [[TMP4]], zeroinitializer
++; CHECK-NEXT:    [[TMP6:%.*]] = select <2 x i1> zeroinitializer, <2 x double> zeroinitializer, <2 x double> [[TMP5]]
++; CHECK-NEXT:    [[TMP7:%.*]] = fmul <2 x double> [[TMP6]], zeroinitializer
++; CHECK-NEXT:    [[TMP8:%.*]] = fadd <2 x double> [[TMP7]], zeroinitializer
++; CHECK-NEXT:    store <2 x double> [[TMP8]], ptr null, align 8
++; CHECK-NEXT:    ret void
++;
++  %max1 = call double @llvm.maximum.f64(double 0.000000e+00, double 0.000000e+00) [ "a_list"(ptr null) ]
++  %add1 = fadd double %max1, 0.000000e+00
++  %mul1 = fmul double 0.000000e+00, %add1
++  %mul2 = fmul double %mul1, 0.000000e+00
++  %sel1 = select i1 false, double 0.000000e+00, double %mul2
++  %max2 = call double @llvm.maximum.f64(double 0.000000e+00, double 0.000000e+00)
++  %add2 = fadd double %max2, 0.000000e+00
++  %mul3 = fmul double 0.000000e+00, %add2
++  %mul4 = fmul double %mul3, 0.000000e+00
++  %sel2 = select i1 false, double 0.000000e+00, double %mul4
++  %mul5 = fmul double %sel2, 0.000000e+00
++  %add3 = fadd double 0.000000e+00, %mul5
++  %gep1 = getelementptr { double, [1 x [2 x double]] }, ptr null, i64 0, i32 1
++  store double %add3, ptr %gep1, align 8
++  %mul6 = fmul double %sel1, 0.000000e+00
++  %add4 = fadd double %mul6, 0.000000e+00
++  store double %add4, ptr null, align 8
++  ret void
++}
++
++declare double @llvm.maximum.f64(double, double) #0
++
++attributes #0 = { nocallback nofree nosync nounwind speculatable willreturn memory(none) }
+
+From 907734ec3579c6b031b8c129fc4512d6197ebb7a Mon Sep 17 00:00:00 2001
+From: Tim Besard <tim.besard@gmail.com>
+Date: Fri, 9 May 2025 14:57:56 +0200
+Subject: [PATCH 11/12] [ORC] Fix the prototype of a C API function.
+
+---
+ llvm/include/llvm-c/Orc.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/llvm/include/llvm-c/Orc.h b/llvm/include/llvm-c/Orc.h
+index 304833cca2d43..2874b77f5e8d9 100644
+--- a/llvm/include/llvm-c/Orc.h
++++ b/llvm/include/llvm-c/Orc.h
+@@ -1068,7 +1068,7 @@ LLVMErrorRef LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
+  */
+ LLVMErrorRef LLVMOrcCreateStaticLibrarySearchGeneratorForPath(
+     LLVMOrcDefinitionGeneratorRef *Result, LLVMOrcObjectLayerRef ObjLayer,
+-    const char *FileName, const char *TargetTriple);
++    const char *FileName);
+ 
+ /**
+  * Create a ThreadSafeContext containing a new LLVMContext.
+
+From 32719222d3ea71ed0b19c2cb75fa6f76713fda20 Mon Sep 17 00:00:00 2001
+From: Dominik Adamski <dominik.adamski@amd.com>
+Date: Thu, 10 Apr 2025 12:23:53 +0200
+Subject: [PATCH 12/12] [LLVM][MemCpyOpt] Unify alias tags if we optimize
+ allocas (#129537)
+
+Optimization of alloca instructions may lead to invalid alias tags.
+Incorrect alias tags can result in incorrect optimization outcomes for
+Fortran source code compiled by Flang with flags: `-O3 -mmlir
+-local-alloc-tbaa -flto`.
+
+This commit removes alias tags when memcpy optimization replaces two
+arrays with one array, thus ensuring correct compilation of Fortran
+source code using flags: `-O3 -mmlir -local-alloc-tbaa -flto`.
+
+This commit is also a proposal to fix the reported issue:
+https://github.com/llvm/llvm-project/issues/133984
+
+---------
+
+Co-authored-by: Shilei Tian <i@tianshilei.me>
+(cherry picked from commit 716b02d8c575afde7af1af13df145019659abca2)
+---
+ .../lib/Transforms/Scalar/MemCpyOptimizer.cpp | 19 ++++++++++++-------
+ 1 file changed, 12 insertions(+), 7 deletions(-)
+
+diff --git a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp
+index 805bbe40bd7c7..c9133d02da57b 100644
+--- a/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp
++++ b/llvm/lib/Transforms/Scalar/MemCpyOptimizer.cpp
+@@ -1466,7 +1466,7 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,
+   // to remove them.
+ 
+   SmallVector<Instruction *, 4> LifetimeMarkers;
+-  SmallSet<Instruction *, 4> NoAliasInstrs;
++  SmallSet<Instruction *, 4> AAMetadataInstrs;
+   bool SrcNotDom = false;
+ 
+   // Recursively track the user and check whether modified alias exist.
+@@ -1521,8 +1521,8 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,
+               continue;
+             }
+           }
+-          if (UI->hasMetadata(LLVMContext::MD_noalias))
+-            NoAliasInstrs.insert(UI);
++          AAMetadataInstrs.insert(UI);
++
+           if (!ModRefCallback(UI))
+             return false;
+         }
+@@ -1627,11 +1627,16 @@ bool MemCpyOptPass::performStackMoveOptzn(Instruction *Load, Instruction *Store,
+   }
+ 
+   // As this transformation can cause memory accesses that didn't previously
+-  // alias to begin to alias one another, we remove !noalias metadata from any
+-  // uses of either alloca. This is conservative, but more precision doesn't
+-  // seem worthwhile right now.
+-  for (Instruction *I : NoAliasInstrs)
++  // alias to begin to alias one another, we remove !alias.scope, !noalias,
++  // !tbaa and !tbaa_struct metadata from any uses of either alloca.
++  // This is conservative, but more precision doesn't seem worthwhile
++  // right now.
++  for (Instruction *I : AAMetadataInstrs) {
++    I->setMetadata(LLVMContext::MD_alias_scope, nullptr);
+     I->setMetadata(LLVMContext::MD_noalias, nullptr);
++    I->setMetadata(LLVMContext::MD_tbaa, nullptr);
++    I->setMetadata(LLVMContext::MD_tbaa_struct, nullptr);
++  }
+ 
+   LLVM_DEBUG(dbgs() << "Stack Move: Performed staack-move optimization\n");
+   NumStackMove++;
