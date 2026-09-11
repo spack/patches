@@ -1,0 +1,3234 @@
+From 4a09c40ea4dce975eaca82f1d8a2b7c2486baf17 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Sat, 19 May 2018 11:56:55 -0400
+Subject: [PATCH 01/19] Allow for custom address spaces
+
+Julia uses addressspaces for GC and we want these to be sanitized as well.
+
+(cherry picked from commit 3f53397f402b67341afe2bcb3a3316606b47d15c)
+(cherry picked from commit 58df73b7d510d59462d56092595cf9c91404c601)
+(cherry picked from commit d0b13036b299406cf4b7c14f6cea112a5bc03f5c)
+(cherry picked from commit bd7a76cbf620d90bc0022a39b4366436db10d1e2)
+(cherry picked from commit 5e712dcf4baa475c4b26a74c2235e10280552e27)
+---
+ llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+index 7deaac5e59a28..e430ebc078cc9 100644
+--- a/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
++++ b/llvm/lib/Transforms/Instrumentation/ThreadSanitizer.cpp
+@@ -371,7 +371,9 @@ static bool shouldInstrumentReadWriteFromAddress(const Module *M, Value *Addr) {
+   // with them.
+   if (Addr) {
+     Type *PtrTy = cast<PointerType>(Addr->getType()->getScalarType());
+-    if (PtrTy->getPointerAddressSpace() != 0)
++    auto AS = PtrTy->getPointerAddressSpace();
++    // Allow for custom addresspaces
++    if (AS != 0 && AS < 10)
+       return false;
+   }
+ 
+
+From 1bd7c1ded4cf375e22ebee0a04e37e805bf59ecc Mon Sep 17 00:00:00 2001
+From: Keno Fischer <kfischer@college.harvard.edu>
+Date: Sat, 30 Apr 2022 19:00:11 +0100
+Subject: [PATCH 02/19] Add support for unwinding during prologue/epilogue
+
+(cherry picked from commit 5393efbd8a4c7555b9f9fdf185c486c6b05f0c19)
+(cherry picked from commit befad70c8aa422a2415fdb5b2667f2379b9f029b)
+(cherry picked from commit 463ddeed1155b20ba1d6ca9ae3d4e68e36844290)
+(cherry picked from commit 7bb5d8a302ff36cf42cdf2cd32a6324377f4ce84)
+---
+ libunwind/src/CompactUnwinder.hpp | 156 ++++++++++++++++++++++++++++++
+ 1 file changed, 156 insertions(+)
+
+diff --git a/libunwind/src/CompactUnwinder.hpp b/libunwind/src/CompactUnwinder.hpp
+index a7a8a153d86a4..ac8837aa37ec5 100644
+--- a/libunwind/src/CompactUnwinder.hpp
++++ b/libunwind/src/CompactUnwinder.hpp
+@@ -311,6 +311,50 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingRBPFrame(
+   uint32_t savedRegistersLocations =
+       EXTRACT_BITS(compactEncoding, UNWIND_X86_64_RBP_FRAME_REGISTERS);
+ 
++  // If we have not stored EBP yet
++  if (functionStart == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp+8);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp));
++
++    return UNW_STEP_SUCCESS;
++  } else if (functionStart + 1 == registers.getIP()) {
++    uint64_t rsp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rsp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rsp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  // If we're about to return, we've already popped the base pointer
++  uint8_t b = addressSpace.get8(registers.getIP());
++
++  // This is a hack to detect VZEROUPPER but in between popq rbp and ret
++  // It's not pretty but it works
++  if (b == 0xC5) {
++    if ((b = addressSpace.get8(registers.getIP() + 1)) == 0xF8 &&
++        (b = addressSpace.get8(registers.getIP() + 2)) == 0x77)
++      b = addressSpace.get8(registers.getIP() + 3);
++    else
++      goto skip_ret;
++  }
++
++  if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++    uint64_t rbp = registers.getSP();
++    // old esp is ebp less return address
++    registers.setSP(rbp + 16);
++    // pop return address into eip
++    registers.setIP(addressSpace.get64(rbp + 8));
++
++    return UNW_STEP_SUCCESS;
++  }
++
++  skip_ret:
++
+   uint64_t savedRegisters = registers.getRBP() - 8 * savedRegistersOffset;
+   for (int i = 0; i < 5; ++i) {
+     switch (savedRegistersLocations & 0x7) {
+@@ -431,6 +475,118 @@ int CompactUnwinder_x86_64<A>::stepWithCompactEncodingFrameless(
+       }
+     }
+   }
++
++  // Note that the order of these registers is so that
++  // registersSaved[0] is the one that will be pushed onto the stack last.
++  // Thus, if we want to walk this from the top, we need to go in reverse.
++  assert(regCount <= 6);
++
++  // check whether we are still in the prologue
++  uint64_t curAddr = functionStart;
++  if (regCount > 0) {
++    for (int8_t i = (int8_t)(regCount) - 1; i >= 0; --i) {
++      if (registers.getIP() == curAddr) {
++        // None of the registers have been modified yet, so we don't need to reload them
++        framelessUnwind(addressSpace, registers.getSP() + 8 * (regCount - (uint64_t)(i + 1)), registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        assert(curAddr < registers.getIP());
++      }
++
++
++      // pushq %rbp and pushq %rbx is 1 byte. Everything else 2
++      if ((UNWIND_X86_64_REG_RBP == registersSaved[i]) ||
++          (UNWIND_X86_64_REG_RBX == registersSaved[i]))
++        curAddr += 1;
++      else
++        curAddr += 2;
++    }
++  }
++  if (registers.getIP() == curAddr) {
++    // None of the registers have been modified yet, so we don't need to reload them
++    framelessUnwind(addressSpace, registers.getSP() + 8*regCount, registers);
++    return UNW_STEP_SUCCESS;
++  } else {
++    assert(curAddr < registers.getIP());
++  }
++
++
++  // And now for the epilogue
++  {
++    uint8_t  i  = 0;
++    uint64_t p  = registers.getIP();
++    uint8_t  b  = 0;
++
++    while (true) {
++      b = addressSpace.get8(p++);
++      // This is a hack to detect VZEROUPPER but in between the popq's and ret
++      // It's not pretty but it works
++      if (b == 0xC5) {
++        if ((b = addressSpace.get8(p++)) == 0xF8 && (b = addressSpace.get8(p++)) == 0x77)
++          b = addressSpace.get8(p++);
++        else
++          break;
++      }
++      //  popq %rbx    popq %rbp
++      if (b == 0x5B || b == 0x5D) {
++        i++;
++      } else if (b == 0x41) {
++        b = addressSpace.get8(p++);
++        if (b == 0x5C || b == 0x5D || b == 0x5E || b == 0x5F)
++          i++;
++        else
++          break;
++      } else if (b == 0xC3 || b == 0xCB || b == 0xC2 || b == 0xCA) {
++        // i pop's haven't happened yet
++        uint64_t savedRegisters = registers.getSP() + 8 * i;
++        if (regCount > 0) {
++          for (int8_t j = (int8_t)(regCount) - 1; j >= (int8_t)(regCount) - i; --j) {
++            uint64_t addr = savedRegisters - 8 * (regCount - (uint64_t)(j));
++            switch (registersSaved[j]) {
++              case UNWIND_X86_64_REG_RBX:
++                registers.setRBX(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R12:
++                registers.setR12(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R13:
++                registers.setR13(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R14:
++                registers.setR14(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_R15:
++                registers.setR15(addressSpace.get64(addr));
++                break;
++              case UNWIND_X86_64_REG_RBP:
++                registers.setRBP(addressSpace.get64(addr));
++                break;
++              default:
++                _LIBUNWIND_DEBUG_LOG("bad register for frameless, encoding=%08X for "
++                             "function starting at 0x%llX",
++                              encoding, functionStart);
++                _LIBUNWIND_ABORT("invalid compact unwind encoding");
++            }
++          }
++        }
++        framelessUnwind(addressSpace, savedRegisters, registers);
++        return UNW_STEP_SUCCESS;
++      } else {
++        break;
++      }
++    }
++  }
++
++  /*
++   0x10fe2733a:  5b                             popq   %rbx
++   0x10fe2733b:  41 5c                          popq   %r12
++   0x10fe2733d:  41 5d                          popq   %r13
++   0x10fe2733f:  41 5e                          popq   %r14
++   0x10fe27341:  41 5f                          popq   %r15
++   0x10fe27343:  5d                             popq   %rbp
++   */
++
++
+   uint64_t savedRegisters = registers.getSP() + stackSize - 8 - 8 * regCount;
+   for (uint32_t i = 0; i < regCount; ++i) {
+     switch (registersSaved[i]) {
+
+From 195b3ad9c56ee70b4712b61e9155a080e23a886a Mon Sep 17 00:00:00 2001
+From: Cody Tapscott <cody+github@tapscott.me>
+Date: Mon, 24 May 2021 16:36:06 -0700
+Subject: [PATCH 03/19] Force `.eh_frame` emission on AArch64
+
+We need to force the emission of the EH Frame section (currently done via SupportsCompactUnwindWithoutEHFrame in the MCObjectFileInfo for the target), since libunwind doesn't yet support dynamically registering compact unwind information at run-time.
+
+(cherry picked from commit 60e041894288848e37870c42749a1aabcc2c2274)
+(cherry picked from commit 6275013da5e8cd5e552bd5bb7d85c7b0524ca69d)
+(cherry picked from commit b62bce122191cef0079a1bea7d990c1225de488f)
+(cherry picked from commit e2adfc20509b970c1726ae15230e982d4be2b918)
+(cherry picked from commit 702f88a8d281645305547da38189e90606b9e61d)
+---
+ llvm/lib/MC/MCObjectFileInfo.cpp | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/llvm/lib/MC/MCObjectFileInfo.cpp b/llvm/lib/MC/MCObjectFileInfo.cpp
+index 150e38a94db6a..e63b4270f6e94 100644
+--- a/llvm/lib/MC/MCObjectFileInfo.cpp
++++ b/llvm/lib/MC/MCObjectFileInfo.cpp
+@@ -69,10 +69,11 @@ void MCObjectFileInfo::initMachOMCObjectFileInfo(const Triple &T) {
+           MachO::S_ATTR_STRIP_STATIC_SYMS | MachO::S_ATTR_LIVE_SUPPORT,
+       SectionKind::getReadOnly());
+ 
+-  if (T.isOSDarwin() &&
+-      (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32 ||
+-      T.isSimulatorEnvironment()))
+-    SupportsCompactUnwindWithoutEHFrame = true;
++  // Disabled for now, since we need to emit EH Frames for stack unwinding in the JIT
++  //if (T.isOSDarwin() &&
++  //    (T.getArch() == Triple::aarch64 || T.getArch() == Triple::aarch64_32 ||
++  //    T.isSimulatorEnvironment()))
++  //  SupportsCompactUnwindWithoutEHFrame = true;
+ 
+   switch (Ctx->emitDwarfUnwindInfo()) {
+   case EmitDwarfUnwindType::Always:
+
+From 53240d5d00b7736fa44f13b938b5caf76ab4a7f0 Mon Sep 17 00:00:00 2001
+From: Elliot Saba <staticfloat@gmail.com>
+Date: Mon, 27 Mar 2023 17:43:54 -0700
+Subject: [PATCH 04/19] Disable pathologically expensive `SimplifySelectOps`
+ optimization
+
+`SimplifySelectOps` is a late optimization in LLVM that attempts to
+translate `select(C, load(A), load(B))` into `load(select(C, A, B))`.
+However, in order for it to do this optimization, it needs to check that
+`C` does not depend on the result of `load(A)` or `load(B)`.
+Unfortunately (unlikely Julia and LLVM at the IR level), LLVM does not
+have a topological order of statements computed at this stage of the
+compiler, so LLVM needs to iterate through all statements in the
+function in order to perform this legality check. For large functions,
+this is extremely expensive, accounting for the majority of all
+compilation time for such functions. On the other hand, the optimization
+itself is minor, allowing at most the elision of one additional load
+(and doesn't fire particularly often, because the middle end can perform
+similar optimizations). Until there is a proper solution in LLVM, simply
+disable this optimizations, making LLVM several orders of magnitude
+faster on real world benchmarks.
+
+X-ref: https://github.com/llvm/llvm-project/issues/60132
+(cherry picked from commit 8a2c8f5770440a08240aa240c972204b950662cd)
+(cherry picked from commit d7563d0e8e9334df4aa8e702bf00fa5e31e985b3)
+(cherry picked from commit 6968daa23591bb4abac056a61914531b9897cd3f)
+---
+ llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+index e921ced8326b1..9b763ea015fdf 100644
+--- a/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
++++ b/llvm/lib/CodeGen/SelectionDAG/DAGCombiner.cpp
+@@ -27871,6 +27871,7 @@ bool DAGCombiner::SimplifySelectOps(SDNode *TheSelect, SDValue LHS,
+         !TLI.isOperationLegalOrCustom(TheSelect->getOpcode(),
+                                       LLD->getBasePtr().getValueType()))
+       return false;
++    return false;
+ 
+     // The loads must not depend on one another.
+     if (LLD->isPredecessorOf(RLD) || RLD->isPredecessorOf(LLD))
+
+From 4e689c99018357b08fe4ef5f5fd6215e80f08405 Mon Sep 17 00:00:00 2001
+From: Jameson Nash <vtjnash@gmail.com>
+Date: Fri, 7 Feb 2025 02:01:39 -0500
+Subject: [PATCH 05/19] [analyzer] Do not destruct fields of unions (#122330)
+
+The C++ standard prohibits this implicit destructor call, leading to
+incorrect reports from clang-analyzer. This causes projects that use
+std::option (including llvm) to fail the cplusplus.NewDelete test
+incorrectly when run through the analyzer.
+
+Fixes #119415
+
+(cherry picked from commit 9b8297bc7ea8f217a3f701afedd2c953a4ad7867)
+(cherry picked from commit 199140a4b5d301a2e932f97da0ca9a8753262ad2)
+---
+ clang/lib/Analysis/CFG.cpp                    |  2 +
+ .../test/Analysis/NewDelete-checker-test.cpp  | 28 ++++++++++++++
+ clang/test/Analysis/dtor-union.cpp            | 38 +++++++++++++++++++
+ 3 files changed, 68 insertions(+)
+ create mode 100644 clang/test/Analysis/dtor-union.cpp
+
+diff --git a/clang/lib/Analysis/CFG.cpp b/clang/lib/Analysis/CFG.cpp
+index 304bbb2b422c6..3e144395cffc6 100644
+--- a/clang/lib/Analysis/CFG.cpp
++++ b/clang/lib/Analysis/CFG.cpp
+@@ -2041,6 +2041,8 @@ void CFGBuilder::addImplicitDtorsForDestructor(const CXXDestructorDecl *DD) {
+   }
+ 
+   // First destroy member objects.
++  if (RD->isUnion())
++    return;
+   for (auto *FI : RD->fields()) {
+     // Check for constant size array. Set type to array element type.
+     QualType QT = FI->getType();
+diff --git a/clang/test/Analysis/NewDelete-checker-test.cpp b/clang/test/Analysis/NewDelete-checker-test.cpp
+index 21b4cf817b5df..06754f669b1e6 100644
+--- a/clang/test/Analysis/NewDelete-checker-test.cpp
++++ b/clang/test/Analysis/NewDelete-checker-test.cpp
+@@ -441,3 +441,31 @@ void testLeakBecauseNTTPIsNotDeallocation() {
+   void* p = ::operator new(10);
+   deallocate_via_nttp<not_free>(p);
+ }  // leak-warning{{Potential leak of memory pointed to by 'p'}}
++
++namespace optional_union {
++  template <typename T>
++  class unique_ptr {
++    T *q;
++  public:
++    unique_ptr() : q(new T) {}
++    ~unique_ptr() {
++      delete q;
++    }
++  };
++
++  union custom_union_t {
++    unique_ptr<int> present;
++    char notpresent;
++    custom_union_t() : present(unique_ptr<int>()) {}
++    ~custom_union_t() {}
++  };
++
++  void testUnionCorrect() {
++    custom_union_t a;
++    a.present.~unique_ptr<int>();
++  }
++
++  void testUnionLeak() {
++    custom_union_t a;
++  } // leak-warning{{Potential leak of memory pointed to by 'a.present.q'}}
++}
+diff --git a/clang/test/Analysis/dtor-union.cpp b/clang/test/Analysis/dtor-union.cpp
+new file mode 100644
+index 0000000000000..dac366e6f9df8
+--- /dev/null
++++ b/clang/test/Analysis/dtor-union.cpp
+@@ -0,0 +1,38 @@
++// RUN: %clang_analyze_cc1 -analyzer-checker=core,debug.ExprInspection -analyzer-config c++-inlining=destructors -verify -std=c++11 %s
++// RUN: %clang_analyze_cc1 -analyzer-checker=core,debug.ExprInspection -analyzer-config c++-inlining=destructors -verify -std=c++17 %s
++
++void clang_analyzer_eval(bool);
++
++struct InlineDtor {
++  static int cnt;
++  static int dtorCalled;
++  ~InlineDtor() {
++    ++dtorCalled;
++  }
++};
++
++int InlineDtor::cnt = 0;
++int InlineDtor::dtorCalled = 0;
++
++void testUnionDtor() {
++  static int unionDtorCalled;
++  InlineDtor::cnt = 0;
++  InlineDtor::dtorCalled = 0;
++  unionDtorCalled = 0;
++  {
++      union UnionDtor {
++          InlineDtor kind1;
++          char kind2;
++          ~UnionDtor() { unionDtorCalled++; }
++      };
++      UnionDtor u1{.kind1{}};
++      UnionDtor u2{.kind2{}};
++      auto u3 = new UnionDtor{.kind1{}};
++      auto u4 = new UnionDtor{.kind2{}};
++      delete u3;
++      delete u4;
++  }
++
++  clang_analyzer_eval(unionDtorCalled == 4); // expected-warning {{TRUE}}
++  clang_analyzer_eval(InlineDtor::dtorCalled == 0); // expected-warning {{TRUE}}
++}
+
+From f3ce12e3772216780bb2cb87c01e6b46cf5f8f65 Mon Sep 17 00:00:00 2001
+From: Zentrik <llvm.zentrik@gmail.com>
+Date: Tue, 4 Feb 2025 00:23:54 +0000
+Subject: [PATCH 06/19] Fix build if ITTAPI_SOURCE_DIR is specified (#106924)
+
+de92615d68f allows specifying the source directory of ittapi. This
+change allows configuring the source directory of ittapi here as well.
+
+(cherry picked from commit f8287f6c373fcf993643dd6f0e30dde304c1be73)
+(cherry picked from commit 755d8d0d3f51fd98493b66e7f7311592e48e68a8)
+---
+ llvm/lib/ExecutionEngine/IntelJITEvents/CMakeLists.txt    | 5 ++++-
+ llvm/lib/ExecutionEngine/Orc/TargetProcess/CMakeLists.txt | 5 ++++-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/llvm/lib/ExecutionEngine/IntelJITEvents/CMakeLists.txt b/llvm/lib/ExecutionEngine/IntelJITEvents/CMakeLists.txt
+index b4fd04d65e263..56c529c08937c 100644
+--- a/llvm/lib/ExecutionEngine/IntelJITEvents/CMakeLists.txt
++++ b/llvm/lib/ExecutionEngine/IntelJITEvents/CMakeLists.txt
+@@ -1,5 +1,8 @@
+ include_directories( ${CMAKE_CURRENT_SOURCE_DIR}/.. )
+-include_directories( ${PROJECT_BINARY_DIR}/ittapi/include/ )
++if(NOT DEFINED ITTAPI_SOURCE_DIR)
++    set(ITTAPI_SOURCE_DIR ${PROJECT_BINARY_DIR})
++endif()
++include_directories( ${ITTAPI_SOURCE_DIR}/ittapi/include/ )
+ add_llvm_component_library(LLVMIntelJITEvents
+   IntelJITEventListener.cpp
+ 
+diff --git a/llvm/lib/ExecutionEngine/Orc/TargetProcess/CMakeLists.txt b/llvm/lib/ExecutionEngine/Orc/TargetProcess/CMakeLists.txt
+index 282d4cfc2ddad..9f3abac156adb 100644
+--- a/llvm/lib/ExecutionEngine/Orc/TargetProcess/CMakeLists.txt
++++ b/llvm/lib/ExecutionEngine/Orc/TargetProcess/CMakeLists.txt
+@@ -6,7 +6,10 @@ set(intel_jit_profiling )
+ if( LLVM_USE_INTEL_JITEVENTS )
+   set(intel_jit_profiling IntelJITProfiling)
+   include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../IntelJITProfiling)
+-  include_directories(${PROJECT_BINARY_DIR}/ittapi/include/ )
++  if(NOT DEFINED ITTAPI_SOURCE_DIR)
++      set(ITTAPI_SOURCE_DIR ${PROJECT_BINARY_DIR})
++  endif()
++  include_directories(${ITTAPI_SOURCE_DIR}/ittapi/include/ )
+ endif()
+ 
+ add_llvm_component_library(LLVMOrcTargetProcess
+
+From 15abb9b7ef56cf7b4f7ca76f28fe81c891b1e6ad Mon Sep 17 00:00:00 2001
+From: Zentrik <llvm.zentrik@gmail.com>
+Date: Wed, 9 Oct 2024 20:39:04 +0100
+Subject: [PATCH 07/19] [ittapi] Check out branch only if ITTAPI is cloned
+
+In claude we trust
+
+Fix by not setting working directory as ittapi source dir might not exist. Also, quote paths in case of whitespace
+
+(cherry picked from commit 5b3f2e83fe058b0679c57d389de4f40863b386b6)
+---
+ .../IntelJITEvents/CMakeLists.txt             |  4 +--
+ .../IntelJITProfiling/CMakeLists.txt          | 30 ++++++++++---------
+ .../Orc/TargetProcess/CMakeLists.txt          |  4 +--
+ 3 files changed, 20 insertions(+), 18 deletions(-)
+
+diff --git a/llvm/lib/ExecutionEngine/IntelJITEvents/CMakeLists.txt b/llvm/lib/ExecutionEngine/IntelJITEvents/CMakeLists.txt
+index 56c529c08937c..08ce4c9399f17 100644
+--- a/llvm/lib/ExecutionEngine/IntelJITEvents/CMakeLists.txt
++++ b/llvm/lib/ExecutionEngine/IntelJITEvents/CMakeLists.txt
+@@ -1,8 +1,8 @@
+ include_directories( ${CMAKE_CURRENT_SOURCE_DIR}/.. )
+ if(NOT DEFINED ITTAPI_SOURCE_DIR)
+-    set(ITTAPI_SOURCE_DIR ${PROJECT_BINARY_DIR})
++    set(ITTAPI_SOURCE_DIR ${PROJECT_BINARY_DIR}/ittapi)
+ endif()
+-include_directories( ${ITTAPI_SOURCE_DIR}/ittapi/include/ )
++include_directories( ${ITTAPI_SOURCE_DIR}/include/ )
+ add_llvm_component_library(LLVMIntelJITEvents
+   IntelJITEventListener.cpp
+ 
+diff --git a/llvm/lib/ExecutionEngine/IntelJITProfiling/CMakeLists.txt b/llvm/lib/ExecutionEngine/IntelJITProfiling/CMakeLists.txt
+index 0aedadc65df05..bf6416b7a48e2 100644
+--- a/llvm/lib/ExecutionEngine/IntelJITProfiling/CMakeLists.txt
++++ b/llvm/lib/ExecutionEngine/IntelJITProfiling/CMakeLists.txt
+@@ -9,26 +9,28 @@ if(NOT DEFINED ITTAPI_GIT_TAG)
+ endif()
+ 
+ if(NOT DEFINED ITTAPI_SOURCE_DIR)
+-    set(ITTAPI_SOURCE_DIR ${PROJECT_BINARY_DIR})
++    set(ITTAPI_SOURCE_DIR ${PROJECT_BINARY_DIR}/ittapi)
+ endif()
+ 
+-if(NOT EXISTS ${ITTAPI_SOURCE_DIR}/ittapi)
+-    execute_process(COMMAND ${GIT_EXECUTABLE} clone ${ITTAPI_GIT_REPOSITORY}
+-                    WORKING_DIRECTORY ${ITTAPI_SOURCE_DIR}
+-                    RESULT_VARIABLE GIT_CLONE_RESULT)
++if(NOT EXISTS "${ITTAPI_SOURCE_DIR}")
++    execute_process(
++        COMMAND "${GIT_EXECUTABLE}" clone "${ITTAPI_GIT_REPOSITORY}" "${ITTAPI_SOURCE_DIR}"
++        RESULT_VARIABLE GIT_CLONE_RESULT
++    )
+     if(NOT GIT_CLONE_RESULT EQUAL "0")
+-        message(FATAL_ERROR "git clone ${ITTAPI_GIT_REPOSITORY} failed with ${GIT_CLONE_RESULT}, please clone ${ITTAPI_GIT_REPOSITORY}")
++        message(FATAL_ERROR "git clone ${ITTAPI_GIT_REPOSITORY} failed with ${GIT_CLONE_RESULT}, please clone ${ITTAPI_GIT_REPOSITORY} manually")
+     endif()
+-endif()
+ 
+-execute_process(COMMAND ${GIT_EXECUTABLE} checkout ${ITTAPI_GIT_TAG}
+-                WORKING_DIRECTORY ${ITTAPI_SOURCE_DIR}/ittapi
+-                RESULT_VARIABLE GIT_CHECKOUT_RESULT)
+-if(NOT GIT_CHECKOUT_RESULT EQUAL "0")
+-    message(FATAL_ERROR "git checkout ${ITTAPI_GIT_TAG} failed with ${GIT_CHECKOUT_RESULT}, please checkout ${ITTAPI_GIT_TAG} at ${ITTAPI_SOURCE_DIR}/ittapi")
++    execute_process(
++        COMMAND "${GIT_EXECUTABLE}" -C "${ITTAPI_SOURCE_DIR}" checkout "${ITTAPI_GIT_TAG}"
++        RESULT_VARIABLE GIT_CHECKOUT_RESULT
++    )
++    if(NOT GIT_CHECKOUT_RESULT EQUAL "0")
++        message(FATAL_ERROR "git checkout ${ITTAPI_GIT_TAG} failed with ${GIT_CHECKOUT_RESULT}, please checkout ${ITTAPI_GIT_TAG} at ${ITTAPI_SOURCE_DIR} manually")
++    endif()
+ endif()
+ 
+-include_directories( ${ITTAPI_SOURCE_DIR}/ittapi/include/ )
++include_directories( ${ITTAPI_SOURCE_DIR}/include/ )
+ 
+ if( HAVE_LIBDL )
+     set(LLVM_INTEL_JIT_LIBS ${CMAKE_DL_LIBS})
+@@ -39,7 +41,7 @@ set(LLVM_INTEL_JIT_LIBS ${LLVM_PTHREAD_LIB} ${LLVM_INTEL_JIT_LIBS})
+ 
+ add_llvm_component_library(LLVMIntelJITProfiling
+   jitprofiling.c
+-  ${ITTAPI_SOURCE_DIR}/ittapi/src/ittnotify/ittnotify_static.c
++  ${ITTAPI_SOURCE_DIR}/src/ittnotify/ittnotify_static.c
+ 
+   LINK_LIBS ${LLVM_INTEL_JIT_LIBS}
+ 
+diff --git a/llvm/lib/ExecutionEngine/Orc/TargetProcess/CMakeLists.txt b/llvm/lib/ExecutionEngine/Orc/TargetProcess/CMakeLists.txt
+index 9f3abac156adb..fa2359ccca873 100644
+--- a/llvm/lib/ExecutionEngine/Orc/TargetProcess/CMakeLists.txt
++++ b/llvm/lib/ExecutionEngine/Orc/TargetProcess/CMakeLists.txt
+@@ -7,9 +7,9 @@ if( LLVM_USE_INTEL_JITEVENTS )
+   set(intel_jit_profiling IntelJITProfiling)
+   include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../../IntelJITProfiling)
+   if(NOT DEFINED ITTAPI_SOURCE_DIR)
+-      set(ITTAPI_SOURCE_DIR ${PROJECT_BINARY_DIR})
++      set(ITTAPI_SOURCE_DIR ${PROJECT_BINARY_DIR}/ittapi)
+   endif()
+-  include_directories(${ITTAPI_SOURCE_DIR}/ittapi/include/ )
++  include_directories(${ITTAPI_SOURCE_DIR}/include/ )
+ endif()
+ 
+ add_llvm_component_library(LLVMOrcTargetProcess
+
+From ea01b5a020e91a2084b2d4f6e99e1a3a2b008f7b Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Fri, 7 Mar 2025 06:39:03 +0100
+Subject: [PATCH 08/19] [X86] Use fence(seq_cst) in IdempotentRMWIntoFencedLoad
+ (#126521)
+
+This extends this optimization for scenarios where the subtarget
+has `!hasMFence` or we have SyncScope SingleThread, by avoiding
+the direct usage of `llvm.x64.sse2.mfence`.
+
+(cherry picked from commit ed6bde93f050b9314e54ecbc69c08ab78f4251af)
+---
+ llvm/lib/Target/X86/X86ISelLowering.cpp       |  17 +-
+ .../X86/atomic-idempotent-syncscope.ll        | 615 ++++++++++++++++++
+ llvm/test/CodeGen/X86/atomic-idempotent.ll    | 162 ++---
+ 3 files changed, 665 insertions(+), 129 deletions(-)
+ create mode 100644 llvm/test/CodeGen/X86/atomic-idempotent-syncscope.ll
+
+diff --git a/llvm/lib/Target/X86/X86ISelLowering.cpp b/llvm/lib/Target/X86/X86ISelLowering.cpp
+index 12c40b501f627..d31fb61157401 100644
+--- a/llvm/lib/Target/X86/X86ISelLowering.cpp
++++ b/llvm/lib/Target/X86/X86ISelLowering.cpp
+@@ -31789,21 +31789,10 @@ X86TargetLowering::lowerIdempotentRMWIntoFencedLoad(AtomicRMWInst *AI) const {
+   // otherwise, we might be able to be more aggressive on relaxed idempotent
+   // rmw. In practice, they do not look useful, so we don't try to be
+   // especially clever.
+-  if (SSID == SyncScope::SingleThread)
+-    // FIXME: we could just insert an ISD::MEMBARRIER here, except we are at
+-    // the IR level, so we must wrap it in an intrinsic.
+-    return nullptr;
+-
+-  if (!Subtarget.hasMFence())
+-    // FIXME: it might make sense to use a locked operation here but on a
+-    // different cache-line to prevent cache-line bouncing. In practice it
+-    // is probably a small win, and x86 processors without mfence are rare
+-    // enough that we do not bother.
+-    return nullptr;
+ 
+-  Function *MFence =
+-      llvm::Intrinsic::getOrInsertDeclaration(M, Intrinsic::x86_sse2_mfence);
+-  Builder.CreateCall(MFence, {});
++  // Use `fence seq_cst` over `llvm.x64.sse2.mfence` here to get the correct
++  // lowering for SSID == SyncScope::SingleThread and !hasMFence
++  Builder.CreateFence(AtomicOrdering::SequentiallyConsistent, SSID);
+ 
+   // Finally we can emit the atomic load.
+   LoadInst *Loaded = Builder.CreateAlignedLoad(
+diff --git a/llvm/test/CodeGen/X86/atomic-idempotent-syncscope.ll b/llvm/test/CodeGen/X86/atomic-idempotent-syncscope.ll
+new file mode 100644
+index 0000000000000..9e20fdb59f552
+--- /dev/null
++++ b/llvm/test/CodeGen/X86/atomic-idempotent-syncscope.ll
+@@ -0,0 +1,615 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
++; RUN: llc < %s -mtriple=x86_64-- -verify-machineinstrs                           | FileCheck %s --check-prefix=X64
++; RUN: llc < %s -mtriple=i686-- -verify-machineinstrs           -mattr=+sse2      | FileCheck %s --check-prefixes=X86,X86-GENERIC,X86-SSE2
++; RUN: llc < %s -mtriple=i686-- -verify-machineinstrs -mcpu=slm -mattr=-sse2      | FileCheck %s --check-prefixes=X86,X86-GENERIC,X86-SLM
++; RUN: llc < %s -mtriple=i686-- -verify-machineinstrs -mcpu=goldmont -mattr=-sse2 | FileCheck %s --check-prefixes=X86,X86-GENERIC,X86-SLM
++; RUN: llc < %s -mtriple=i686-- -verify-machineinstrs -mcpu=knl -mattr=-sse2      | FileCheck %s --check-prefixes=X86,X86-GENERIC,X86-SLM
++; RUN: llc < %s -mtriple=i686-- -verify-machineinstrs -mcpu=atom -mattr=-sse2     | FileCheck %s --check-prefixes=X86,X86-ATOM
++
++; On x86, an atomic rmw operation that does not modify the value in memory
++; (such as atomic add 0) can be replaced by an mfence followed by a mov.
++; This is explained (with the motivation for such an optimization) in
++; http://www.hpl.hp.com/techreports/2012/HPL-2012-68.pdf
++
++define i8 @add8(ptr %p) #0 {
++; X64-LABEL: add8:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    movzbl (%rdi), %eax
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: add8:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    movzbl (%eax), %eax
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: add8:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    movzbl (%eax), %eax
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  %1 = atomicrmw add ptr %p, i8 0 syncscope("singlethread") monotonic
++  ret i8 %1
++}
++
++define i16 @or16(ptr %p) #0 {
++; X64-LABEL: or16:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    movzwl (%rdi), %eax
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or16:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    movzwl (%eax), %eax
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: or16:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    movzwl (%eax), %eax
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  %1 = atomicrmw or ptr %p, i16 0 syncscope("singlethread") acquire
++  ret i16 %1
++}
++
++define i32 @xor32(ptr %p) #0 {
++; X64-LABEL: xor32:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    movl (%rdi), %eax
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: xor32:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    movl (%eax), %eax
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: xor32:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    movl (%eax), %eax
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  %1 = atomicrmw xor ptr %p, i32 0 syncscope("singlethread") release
++  ret i32 %1
++}
++
++define i64 @sub64(ptr %p) #0 {
++; X64-LABEL: sub64:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    movq (%rdi), %rax
++; X64-NEXT:    retq
++;
++; X86-LABEL: sub64:
++; X86:       # %bb.0:
++; X86-NEXT:    pushl %ebx
++; X86-NEXT:    pushl %esi
++; X86-NEXT:    movl {{[0-9]+}}(%esp), %esi
++; X86-NEXT:    movl (%esi), %eax
++; X86-NEXT:    movl 4(%esi), %edx
++; X86-NEXT:    .p2align 4
++; X86-NEXT:  .LBB3_1: # %atomicrmw.start
++; X86-NEXT:    # =>This Inner Loop Header: Depth=1
++; X86-NEXT:    movl %edx, %ecx
++; X86-NEXT:    movl %eax, %ebx
++; X86-NEXT:    lock cmpxchg8b (%esi)
++; X86-NEXT:    jne .LBB3_1
++; X86-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-NEXT:    popl %esi
++; X86-NEXT:    popl %ebx
++; X86-NEXT:    retl
++  %1 = atomicrmw sub ptr %p, i64 0 syncscope("singlethread") seq_cst
++  ret i64 %1
++}
++
++define i128 @or128(ptr %p) #0 {
++; X64-LABEL: or128:
++; X64:       # %bb.0:
++; X64-NEXT:    pushq %rax
++; X64-NEXT:    xorl %esi, %esi
++; X64-NEXT:    xorl %edx, %edx
++; X64-NEXT:    xorl %ecx, %ecx
++; X64-NEXT:    callq __atomic_fetch_or_16@PLT
++; X64-NEXT:    popq %rcx
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or128:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    pushl %ebp
++; X86-GENERIC-NEXT:    movl %esp, %ebp
++; X86-GENERIC-NEXT:    pushl %ebx
++; X86-GENERIC-NEXT:    pushl %edi
++; X86-GENERIC-NEXT:    pushl %esi
++; X86-GENERIC-NEXT:    andl $-16, %esp
++; X86-GENERIC-NEXT:    subl $48, %esp
++; X86-GENERIC-NEXT:    movl 12(%ebp), %edi
++; X86-GENERIC-NEXT:    movl 12(%edi), %ecx
++; X86-GENERIC-NEXT:    movl 8(%edi), %edx
++; X86-GENERIC-NEXT:    movl (%edi), %ebx
++; X86-GENERIC-NEXT:    movl 4(%edi), %esi
++; X86-GENERIC-NEXT:    .p2align 4
++; X86-GENERIC-NEXT:  .LBB4_1: # %atomicrmw.start
++; X86-GENERIC-NEXT:    # =>This Inner Loop Header: Depth=1
++; X86-GENERIC-NEXT:    movl %ebx, (%esp)
++; X86-GENERIC-NEXT:    movl %esi, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %edx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %ecx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %ecx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %edx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %esi, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %ebx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    pushl $0
++; X86-GENERIC-NEXT:    pushl $0
++; X86-GENERIC-NEXT:    leal {{[0-9]+}}(%esp), %eax
++; X86-GENERIC-NEXT:    pushl %eax
++; X86-GENERIC-NEXT:    leal {{[0-9]+}}(%esp), %eax
++; X86-GENERIC-NEXT:    pushl %eax
++; X86-GENERIC-NEXT:    pushl %edi
++; X86-GENERIC-NEXT:    pushl $16
++; X86-GENERIC-NEXT:    calll __atomic_compare_exchange@PLT
++; X86-GENERIC-NEXT:    addl $24, %esp
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %ecx
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %edx
++; X86-GENERIC-NEXT:    movl (%esp), %ebx
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %esi
++; X86-GENERIC-NEXT:    testb %al, %al
++; X86-GENERIC-NEXT:    je .LBB4_1
++; X86-GENERIC-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-GENERIC-NEXT:    movl 8(%ebp), %eax
++; X86-GENERIC-NEXT:    movl %ebx, (%eax)
++; X86-GENERIC-NEXT:    movl %esi, 4(%eax)
++; X86-GENERIC-NEXT:    movl %edx, 8(%eax)
++; X86-GENERIC-NEXT:    movl %ecx, 12(%eax)
++; X86-GENERIC-NEXT:    leal -12(%ebp), %esp
++; X86-GENERIC-NEXT:    popl %esi
++; X86-GENERIC-NEXT:    popl %edi
++; X86-GENERIC-NEXT:    popl %ebx
++; X86-GENERIC-NEXT:    popl %ebp
++; X86-GENERIC-NEXT:    retl $4
++;
++; X86-ATOM-LABEL: or128:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    pushl %ebp
++; X86-ATOM-NEXT:    movl %esp, %ebp
++; X86-ATOM-NEXT:    pushl %ebx
++; X86-ATOM-NEXT:    pushl %edi
++; X86-ATOM-NEXT:    pushl %esi
++; X86-ATOM-NEXT:    andl $-16, %esp
++; X86-ATOM-NEXT:    leal -{{[0-9]+}}(%esp), %esp
++; X86-ATOM-NEXT:    movl 12(%ebp), %edi
++; X86-ATOM-NEXT:    movl 12(%edi), %ecx
++; X86-ATOM-NEXT:    movl 8(%edi), %edx
++; X86-ATOM-NEXT:    movl (%edi), %esi
++; X86-ATOM-NEXT:    movl 4(%edi), %ebx
++; X86-ATOM-NEXT:    .p2align 4
++; X86-ATOM-NEXT:  .LBB4_1: # %atomicrmw.start
++; X86-ATOM-NEXT:    # =>This Inner Loop Header: Depth=1
++; X86-ATOM-NEXT:    movl %esi, (%esp)
++; X86-ATOM-NEXT:    movl %ebx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %edx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %ecx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %ecx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %edx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %ebx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %esi, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    pushl $0
++; X86-ATOM-NEXT:    pushl $0
++; X86-ATOM-NEXT:    leal {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    pushl %eax
++; X86-ATOM-NEXT:    leal {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    pushl %eax
++; X86-ATOM-NEXT:    pushl %edi
++; X86-ATOM-NEXT:    pushl $16
++; X86-ATOM-NEXT:    calll __atomic_compare_exchange@PLT
++; X86-ATOM-NEXT:    leal {{[0-9]+}}(%esp), %esp
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %edx
++; X86-ATOM-NEXT:    testb %al, %al
++; X86-ATOM-NEXT:    movl (%esp), %esi
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %ebx
++; X86-ATOM-NEXT:    je .LBB4_1
++; X86-ATOM-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-ATOM-NEXT:    movl 8(%ebp), %eax
++; X86-ATOM-NEXT:    movl %esi, (%eax)
++; X86-ATOM-NEXT:    movl %ebx, 4(%eax)
++; X86-ATOM-NEXT:    movl %edx, 8(%eax)
++; X86-ATOM-NEXT:    movl %ecx, 12(%eax)
++; X86-ATOM-NEXT:    leal -12(%ebp), %esp
++; X86-ATOM-NEXT:    popl %esi
++; X86-ATOM-NEXT:    popl %edi
++; X86-ATOM-NEXT:    popl %ebx
++; X86-ATOM-NEXT:    popl %ebp
++; X86-ATOM-NEXT:    retl $4
++  %1 = atomicrmw or ptr %p, i128 0 syncscope("singlethread") monotonic
++  ret i128 %1
++}
++
++; For 'and', the idempotent value is (-1)
++define i32 @and32 (ptr %p) #0 {
++; X64-LABEL: and32:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    movl (%rdi), %eax
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: and32:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    movl (%eax), %eax
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: and32:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    movl (%eax), %eax
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  %1 = atomicrmw and ptr %p, i32 -1 syncscope("singlethread") acq_rel
++  ret i32 %1
++}
++
++define void @or32_nouse_monotonic(ptr %p) #0 {
++; X64-LABEL: or32_nouse_monotonic:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or32_nouse_monotonic:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: or32_nouse_monotonic:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  atomicrmw or ptr %p, i32 0 syncscope("singlethread") monotonic
++  ret void
++}
++
++
++define void @or32_nouse_acquire(ptr %p) #0 {
++; X64-LABEL: or32_nouse_acquire:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or32_nouse_acquire:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: or32_nouse_acquire:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  atomicrmw or ptr %p, i32 0 acquire
++  ret void
++}
++
++define void @or32_nouse_release(ptr %p) #0 {
++; X64-LABEL: or32_nouse_release:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or32_nouse_release:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: or32_nouse_release:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  atomicrmw or ptr %p, i32 0 syncscope("singlethread") release
++  ret void
++}
++
++define void @or32_nouse_acq_rel(ptr %p) #0 {
++; X64-LABEL: or32_nouse_acq_rel:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or32_nouse_acq_rel:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: or32_nouse_acq_rel:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  atomicrmw or ptr %p, i32 0 syncscope("singlethread") acq_rel
++  ret void
++}
++
++define void @or32_nouse_seq_cst(ptr %p) #0 {
++; X64-LABEL: or32_nouse_seq_cst:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or32_nouse_seq_cst:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: or32_nouse_seq_cst:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  atomicrmw or ptr %p, i32 0 syncscope("singlethread") seq_cst
++  ret void
++}
++
++; TODO: The value isn't used on 32 bit, so the cmpxchg8b is unneeded
++define void @or64_nouse_seq_cst(ptr %p) #0 {
++; X64-LABEL: or64_nouse_seq_cst:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    retq
++;
++; X86-LABEL: or64_nouse_seq_cst:
++; X86:       # %bb.0:
++; X86-NEXT:    pushl %ebx
++; X86-NEXT:    pushl %esi
++; X86-NEXT:    movl {{[0-9]+}}(%esp), %esi
++; X86-NEXT:    movl (%esi), %eax
++; X86-NEXT:    movl 4(%esi), %edx
++; X86-NEXT:    .p2align 4
++; X86-NEXT:  .LBB11_1: # %atomicrmw.start
++; X86-NEXT:    # =>This Inner Loop Header: Depth=1
++; X86-NEXT:    movl %edx, %ecx
++; X86-NEXT:    movl %eax, %ebx
++; X86-NEXT:    lock cmpxchg8b (%esi)
++; X86-NEXT:    jne .LBB11_1
++; X86-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-NEXT:    popl %esi
++; X86-NEXT:    popl %ebx
++; X86-NEXT:    retl
++  atomicrmw or ptr %p, i64 0 syncscope("singlethread") seq_cst
++  ret void
++}
++
++; TODO: Don't need to lower as sync_and_fetch call
++define void @or128_nouse_seq_cst(ptr %p) #0 {
++; X64-LABEL: or128_nouse_seq_cst:
++; X64:       # %bb.0:
++; X64-NEXT:    pushq %rax
++; X64-NEXT:    xorl %esi, %esi
++; X64-NEXT:    xorl %edx, %edx
++; X64-NEXT:    movl $5, %ecx
++; X64-NEXT:    callq __atomic_fetch_or_16@PLT
++; X64-NEXT:    popq %rax
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or128_nouse_seq_cst:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    pushl %ebp
++; X86-GENERIC-NEXT:    movl %esp, %ebp
++; X86-GENERIC-NEXT:    pushl %ebx
++; X86-GENERIC-NEXT:    pushl %edi
++; X86-GENERIC-NEXT:    pushl %esi
++; X86-GENERIC-NEXT:    andl $-16, %esp
++; X86-GENERIC-NEXT:    subl $48, %esp
++; X86-GENERIC-NEXT:    movl 8(%ebp), %esi
++; X86-GENERIC-NEXT:    movl 12(%esi), %ecx
++; X86-GENERIC-NEXT:    movl 8(%esi), %edi
++; X86-GENERIC-NEXT:    movl (%esi), %edx
++; X86-GENERIC-NEXT:    movl 4(%esi), %ebx
++; X86-GENERIC-NEXT:    .p2align 4
++; X86-GENERIC-NEXT:  .LBB12_1: # %atomicrmw.start
++; X86-GENERIC-NEXT:    # =>This Inner Loop Header: Depth=1
++; X86-GENERIC-NEXT:    movl %edx, (%esp)
++; X86-GENERIC-NEXT:    movl %ebx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %edi, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %ecx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %ecx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %edi, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %ebx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    movl %edx, {{[0-9]+}}(%esp)
++; X86-GENERIC-NEXT:    pushl $5
++; X86-GENERIC-NEXT:    pushl $5
++; X86-GENERIC-NEXT:    leal {{[0-9]+}}(%esp), %eax
++; X86-GENERIC-NEXT:    pushl %eax
++; X86-GENERIC-NEXT:    leal {{[0-9]+}}(%esp), %eax
++; X86-GENERIC-NEXT:    pushl %eax
++; X86-GENERIC-NEXT:    pushl %esi
++; X86-GENERIC-NEXT:    pushl $16
++; X86-GENERIC-NEXT:    calll __atomic_compare_exchange@PLT
++; X86-GENERIC-NEXT:    addl $24, %esp
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %ecx
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %edi
++; X86-GENERIC-NEXT:    movl (%esp), %edx
++; X86-GENERIC-NEXT:    movl {{[0-9]+}}(%esp), %ebx
++; X86-GENERIC-NEXT:    testb %al, %al
++; X86-GENERIC-NEXT:    je .LBB12_1
++; X86-GENERIC-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-GENERIC-NEXT:    leal -12(%ebp), %esp
++; X86-GENERIC-NEXT:    popl %esi
++; X86-GENERIC-NEXT:    popl %edi
++; X86-GENERIC-NEXT:    popl %ebx
++; X86-GENERIC-NEXT:    popl %ebp
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: or128_nouse_seq_cst:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    pushl %ebp
++; X86-ATOM-NEXT:    movl %esp, %ebp
++; X86-ATOM-NEXT:    pushl %ebx
++; X86-ATOM-NEXT:    pushl %edi
++; X86-ATOM-NEXT:    pushl %esi
++; X86-ATOM-NEXT:    andl $-16, %esp
++; X86-ATOM-NEXT:    leal -{{[0-9]+}}(%esp), %esp
++; X86-ATOM-NEXT:    movl 8(%ebp), %esi
++; X86-ATOM-NEXT:    movl %esp, %ebx
++; X86-ATOM-NEXT:    movl 12(%esi), %ecx
++; X86-ATOM-NEXT:    movl 8(%esi), %edx
++; X86-ATOM-NEXT:    movl (%esi), %eax
++; X86-ATOM-NEXT:    movl 4(%esi), %edi
++; X86-ATOM-NEXT:    .p2align 4
++; X86-ATOM-NEXT:  .LBB12_1: # %atomicrmw.start
++; X86-ATOM-NEXT:    # =>This Inner Loop Header: Depth=1
++; X86-ATOM-NEXT:    movl %eax, (%esp)
++; X86-ATOM-NEXT:    movl %edi, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %edx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %ecx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %ecx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %edx, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %edi, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    movl %eax, {{[0-9]+}}(%esp)
++; X86-ATOM-NEXT:    pushl $5
++; X86-ATOM-NEXT:    pushl $5
++; X86-ATOM-NEXT:    leal {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    pushl %eax
++; X86-ATOM-NEXT:    pushl %ebx
++; X86-ATOM-NEXT:    pushl %esi
++; X86-ATOM-NEXT:    pushl $16
++; X86-ATOM-NEXT:    calll __atomic_compare_exchange@PLT
++; X86-ATOM-NEXT:    leal {{[0-9]+}}(%esp), %esp
++; X86-ATOM-NEXT:    testb %al, %al
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %edx
++; X86-ATOM-NEXT:    movl (%esp), %eax
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %edi
++; X86-ATOM-NEXT:    je .LBB12_1
++; X86-ATOM-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-ATOM-NEXT:    leal -12(%ebp), %esp
++; X86-ATOM-NEXT:    popl %esi
++; X86-ATOM-NEXT:    popl %edi
++; X86-ATOM-NEXT:    popl %ebx
++; X86-ATOM-NEXT:    popl %ebp
++; X86-ATOM-NEXT:    retl
++  atomicrmw or ptr %p, i128 0 syncscope("singlethread") seq_cst
++  ret void
++}
++
++
++define void @or16_nouse_seq_cst(ptr %p) #0 {
++; X64-LABEL: or16_nouse_seq_cst:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or16_nouse_seq_cst:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: or16_nouse_seq_cst:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  atomicrmw or ptr %p, i16 0 syncscope("singlethread") seq_cst
++  ret void
++}
++
++define void @or8_nouse_seq_cst(ptr %p) #0 {
++; X64-LABEL: or8_nouse_seq_cst:
++; X64:       # %bb.0:
++; X64-NEXT:    #MEMBARRIER
++; X64-NEXT:    retq
++;
++; X86-GENERIC-LABEL: or8_nouse_seq_cst:
++; X86-GENERIC:       # %bb.0:
++; X86-GENERIC-NEXT:    #MEMBARRIER
++; X86-GENERIC-NEXT:    retl
++;
++; X86-ATOM-LABEL: or8_nouse_seq_cst:
++; X86-ATOM:       # %bb.0:
++; X86-ATOM-NEXT:    #MEMBARRIER
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    retl
++  atomicrmw or ptr %p, i8 0 syncscope("singlethread") seq_cst
++  ret void
++}
++
++attributes #0 = { nounwind }
++
++;; NOTE: These prefixes are unused and the list is autogenerated. Do not add tests below this line:
++; X86-SLM: {{.*}}
++; X86-SSE2: {{.*}}
+diff --git a/llvm/test/CodeGen/X86/atomic-idempotent.ll b/llvm/test/CodeGen/X86/atomic-idempotent.ll
+index 55b4d1af094f6..91355bd64cade 100644
+--- a/llvm/test/CodeGen/X86/atomic-idempotent.ll
++++ b/llvm/test/CodeGen/X86/atomic-idempotent.ll
+@@ -11,7 +11,7 @@
+ ; This is explained (with the motivation for such an optimization) in
+ ; http://www.hpl.hp.com/techreports/2012/HPL-2012-68.pdf
+ 
+-define i8 @add8(ptr %p) {
++define i8 @add8(ptr %p) #0 {
+ ; X64-LABEL: add8:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    mfence
+@@ -27,18 +27,16 @@ define i8 @add8(ptr %p) {
+ ;
+ ; X86-SLM-LABEL: add8:
+ ; X86-SLM:       # %bb.0:
+-; X86-SLM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+-; X86-SLM-NEXT:    xorl %eax, %eax
+-; X86-SLM-NEXT:    lock xaddb %al, (%ecx)
+-; X86-SLM-NEXT:    # kill: def $al killed $al killed $eax
++; X86-SLM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-SLM-NEXT:    lock orl $0, (%esp)
++; X86-SLM-NEXT:    movzbl (%eax), %eax
+ ; X86-SLM-NEXT:    retl
+ ;
+ ; X86-ATOM-LABEL: add8:
+ ; X86-ATOM:       # %bb.0:
+-; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+-; X86-ATOM-NEXT:    xorl %eax, %eax
+-; X86-ATOM-NEXT:    lock xaddb %al, (%ecx)
+-; X86-ATOM-NEXT:    # kill: def $al killed $al killed $eax
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    lock orl $0, (%esp)
++; X86-ATOM-NEXT:    movzbl (%eax), %eax
+ ; X86-ATOM-NEXT:    nop
+ ; X86-ATOM-NEXT:    nop
+ ; X86-ATOM-NEXT:    retl
+@@ -46,7 +44,7 @@ define i8 @add8(ptr %p) {
+   ret i8 %1
+ }
+ 
+-define i16 @or16(ptr %p) {
++define i16 @or16(ptr %p) #0 {
+ ; X64-LABEL: or16:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    mfence
+@@ -62,32 +60,24 @@ define i16 @or16(ptr %p) {
+ ;
+ ; X86-SLM-LABEL: or16:
+ ; X86-SLM:       # %bb.0:
+-; X86-SLM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+-; X86-SLM-NEXT:    movzwl (%ecx), %eax
+-; X86-SLM-NEXT:    .p2align 4
+-; X86-SLM-NEXT:  .LBB1_1: # %atomicrmw.start
+-; X86-SLM-NEXT:    # =>This Inner Loop Header: Depth=1
+-; X86-SLM-NEXT:    lock cmpxchgw %ax, (%ecx)
+-; X86-SLM-NEXT:    jne .LBB1_1
+-; X86-SLM-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-SLM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-SLM-NEXT:    lock orl $0, (%esp)
++; X86-SLM-NEXT:    movzwl (%eax), %eax
+ ; X86-SLM-NEXT:    retl
+ ;
+ ; X86-ATOM-LABEL: or16:
+ ; X86-ATOM:       # %bb.0:
+-; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+-; X86-ATOM-NEXT:    movzwl (%ecx), %eax
+-; X86-ATOM-NEXT:    .p2align 4
+-; X86-ATOM-NEXT:  .LBB1_1: # %atomicrmw.start
+-; X86-ATOM-NEXT:    # =>This Inner Loop Header: Depth=1
+-; X86-ATOM-NEXT:    lock cmpxchgw %ax, (%ecx)
+-; X86-ATOM-NEXT:    jne .LBB1_1
+-; X86-ATOM-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    lock orl $0, (%esp)
++; X86-ATOM-NEXT:    movzwl (%eax), %eax
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
+ ; X86-ATOM-NEXT:    retl
+   %1 = atomicrmw or ptr %p, i16 0 acquire
+   ret i16 %1
+ }
+ 
+-define i32 @xor32(ptr %p) {
++define i32 @xor32(ptr %p) #0 {
+ ; X64-LABEL: xor32:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    mfence
+@@ -103,32 +93,24 @@ define i32 @xor32(ptr %p) {
+ ;
+ ; X86-SLM-LABEL: xor32:
+ ; X86-SLM:       # %bb.0:
+-; X86-SLM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+-; X86-SLM-NEXT:    movl (%ecx), %eax
+-; X86-SLM-NEXT:    .p2align 4
+-; X86-SLM-NEXT:  .LBB2_1: # %atomicrmw.start
+-; X86-SLM-NEXT:    # =>This Inner Loop Header: Depth=1
+-; X86-SLM-NEXT:    lock cmpxchgl %eax, (%ecx)
+-; X86-SLM-NEXT:    jne .LBB2_1
+-; X86-SLM-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-SLM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-SLM-NEXT:    lock orl $0, (%esp)
++; X86-SLM-NEXT:    movl (%eax), %eax
+ ; X86-SLM-NEXT:    retl
+ ;
+ ; X86-ATOM-LABEL: xor32:
+ ; X86-ATOM:       # %bb.0:
+-; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+-; X86-ATOM-NEXT:    movl (%ecx), %eax
+-; X86-ATOM-NEXT:    .p2align 4
+-; X86-ATOM-NEXT:  .LBB2_1: # %atomicrmw.start
+-; X86-ATOM-NEXT:    # =>This Inner Loop Header: Depth=1
+-; X86-ATOM-NEXT:    lock cmpxchgl %eax, (%ecx)
+-; X86-ATOM-NEXT:    jne .LBB2_1
+-; X86-ATOM-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    lock orl $0, (%esp)
++; X86-ATOM-NEXT:    movl (%eax), %eax
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
+ ; X86-ATOM-NEXT:    retl
+   %1 = atomicrmw xor ptr %p, i32 0 release
+   ret i32 %1
+ }
+ 
+-define i64 @sub64(ptr %p) {
++define i64 @sub64(ptr %p) #0 {
+ ; X64-LABEL: sub64:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    mfence
+@@ -138,11 +120,7 @@ define i64 @sub64(ptr %p) {
+ ; X86-LABEL: sub64:
+ ; X86:       # %bb.0:
+ ; X86-NEXT:    pushl %ebx
+-; X86-NEXT:    .cfi_def_cfa_offset 8
+ ; X86-NEXT:    pushl %esi
+-; X86-NEXT:    .cfi_def_cfa_offset 12
+-; X86-NEXT:    .cfi_offset %esi, -12
+-; X86-NEXT:    .cfi_offset %ebx, -8
+ ; X86-NEXT:    movl {{[0-9]+}}(%esp), %esi
+ ; X86-NEXT:    movl (%esi), %eax
+ ; X86-NEXT:    movl 4(%esi), %edx
+@@ -155,42 +133,32 @@ define i64 @sub64(ptr %p) {
+ ; X86-NEXT:    jne .LBB3_1
+ ; X86-NEXT:  # %bb.2: # %atomicrmw.end
+ ; X86-NEXT:    popl %esi
+-; X86-NEXT:    .cfi_def_cfa_offset 8
+ ; X86-NEXT:    popl %ebx
+-; X86-NEXT:    .cfi_def_cfa_offset 4
+ ; X86-NEXT:    retl
+   %1 = atomicrmw sub ptr %p, i64 0 seq_cst
+   ret i64 %1
+ }
+ 
+-define i128 @or128(ptr %p) {
++define i128 @or128(ptr %p) #0 {
+ ; X64-LABEL: or128:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    pushq %rax
+-; X64-NEXT:    .cfi_def_cfa_offset 16
+ ; X64-NEXT:    xorl %esi, %esi
+ ; X64-NEXT:    xorl %edx, %edx
+ ; X64-NEXT:    xorl %ecx, %ecx
+ ; X64-NEXT:    callq __atomic_fetch_or_16@PLT
+ ; X64-NEXT:    popq %rcx
+-; X64-NEXT:    .cfi_def_cfa_offset 8
+ ; X64-NEXT:    retq
+ ;
+ ; X86-GENERIC-LABEL: or128:
+ ; X86-GENERIC:       # %bb.0:
+ ; X86-GENERIC-NEXT:    pushl %ebp
+-; X86-GENERIC-NEXT:    .cfi_def_cfa_offset 8
+-; X86-GENERIC-NEXT:    .cfi_offset %ebp, -8
+ ; X86-GENERIC-NEXT:    movl %esp, %ebp
+-; X86-GENERIC-NEXT:    .cfi_def_cfa_register %ebp
+ ; X86-GENERIC-NEXT:    pushl %ebx
+ ; X86-GENERIC-NEXT:    pushl %edi
+ ; X86-GENERIC-NEXT:    pushl %esi
+ ; X86-GENERIC-NEXT:    andl $-16, %esp
+ ; X86-GENERIC-NEXT:    subl $48, %esp
+-; X86-GENERIC-NEXT:    .cfi_offset %esi, -20
+-; X86-GENERIC-NEXT:    .cfi_offset %edi, -16
+-; X86-GENERIC-NEXT:    .cfi_offset %ebx, -12
+ ; X86-GENERIC-NEXT:    movl 12(%ebp), %edi
+ ; X86-GENERIC-NEXT:    movl 12(%edi), %ecx
+ ; X86-GENERIC-NEXT:    movl 8(%edi), %edx
+@@ -234,24 +202,17 @@ define i128 @or128(ptr %p) {
+ ; X86-GENERIC-NEXT:    popl %edi
+ ; X86-GENERIC-NEXT:    popl %ebx
+ ; X86-GENERIC-NEXT:    popl %ebp
+-; X86-GENERIC-NEXT:    .cfi_def_cfa %esp, 4
+ ; X86-GENERIC-NEXT:    retl $4
+ ;
+ ; X86-ATOM-LABEL: or128:
+ ; X86-ATOM:       # %bb.0:
+ ; X86-ATOM-NEXT:    pushl %ebp
+-; X86-ATOM-NEXT:    .cfi_def_cfa_offset 8
+-; X86-ATOM-NEXT:    .cfi_offset %ebp, -8
+ ; X86-ATOM-NEXT:    movl %esp, %ebp
+-; X86-ATOM-NEXT:    .cfi_def_cfa_register %ebp
+ ; X86-ATOM-NEXT:    pushl %ebx
+ ; X86-ATOM-NEXT:    pushl %edi
+ ; X86-ATOM-NEXT:    pushl %esi
+ ; X86-ATOM-NEXT:    andl $-16, %esp
+ ; X86-ATOM-NEXT:    leal -{{[0-9]+}}(%esp), %esp
+-; X86-ATOM-NEXT:    .cfi_offset %esi, -20
+-; X86-ATOM-NEXT:    .cfi_offset %edi, -16
+-; X86-ATOM-NEXT:    .cfi_offset %ebx, -12
+ ; X86-ATOM-NEXT:    movl 12(%ebp), %edi
+ ; X86-ATOM-NEXT:    movl 12(%edi), %ecx
+ ; X86-ATOM-NEXT:    movl 8(%edi), %edx
+@@ -295,14 +256,13 @@ define i128 @or128(ptr %p) {
+ ; X86-ATOM-NEXT:    popl %edi
+ ; X86-ATOM-NEXT:    popl %ebx
+ ; X86-ATOM-NEXT:    popl %ebp
+-; X86-ATOM-NEXT:    .cfi_def_cfa %esp, 4
+ ; X86-ATOM-NEXT:    retl $4
+   %1 = atomicrmw or ptr %p, i128 0 monotonic
+   ret i128 %1
+ }
+ 
+ ; For 'and', the idempotent value is (-1)
+-define i32 @and32 (ptr %p) {
++define i32 @and32 (ptr %p) #0 {
+ ; X64-LABEL: and32:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    mfence
+@@ -318,32 +278,24 @@ define i32 @and32 (ptr %p) {
+ ;
+ ; X86-SLM-LABEL: and32:
+ ; X86-SLM:       # %bb.0:
+-; X86-SLM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+-; X86-SLM-NEXT:    movl (%ecx), %eax
+-; X86-SLM-NEXT:    .p2align 4
+-; X86-SLM-NEXT:  .LBB5_1: # %atomicrmw.start
+-; X86-SLM-NEXT:    # =>This Inner Loop Header: Depth=1
+-; X86-SLM-NEXT:    lock cmpxchgl %eax, (%ecx)
+-; X86-SLM-NEXT:    jne .LBB5_1
+-; X86-SLM-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-SLM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-SLM-NEXT:    lock orl $0, (%esp)
++; X86-SLM-NEXT:    movl (%eax), %eax
+ ; X86-SLM-NEXT:    retl
+ ;
+ ; X86-ATOM-LABEL: and32:
+ ; X86-ATOM:       # %bb.0:
+-; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %ecx
+-; X86-ATOM-NEXT:    movl (%ecx), %eax
+-; X86-ATOM-NEXT:    .p2align 4
+-; X86-ATOM-NEXT:  .LBB5_1: # %atomicrmw.start
+-; X86-ATOM-NEXT:    # =>This Inner Loop Header: Depth=1
+-; X86-ATOM-NEXT:    lock cmpxchgl %eax, (%ecx)
+-; X86-ATOM-NEXT:    jne .LBB5_1
+-; X86-ATOM-NEXT:  # %bb.2: # %atomicrmw.end
++; X86-ATOM-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-ATOM-NEXT:    lock orl $0, (%esp)
++; X86-ATOM-NEXT:    movl (%eax), %eax
++; X86-ATOM-NEXT:    nop
++; X86-ATOM-NEXT:    nop
+ ; X86-ATOM-NEXT:    retl
+   %1 = atomicrmw and ptr %p, i32 -1 acq_rel
+   ret i32 %1
+ }
+ 
+-define void @or32_nouse_monotonic(ptr %p) {
++define void @or32_nouse_monotonic(ptr %p) #0 {
+ ; X64-LABEL: or32_nouse_monotonic:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    #MEMBARRIER
+@@ -371,7 +323,7 @@ define void @or32_nouse_monotonic(ptr %p) {
+ }
+ 
+ 
+-define void @or32_nouse_acquire(ptr %p) {
++define void @or32_nouse_acquire(ptr %p) #0 {
+ ; X64-LABEL: or32_nouse_acquire:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    #MEMBARRIER
+@@ -398,7 +350,7 @@ define void @or32_nouse_acquire(ptr %p) {
+   ret void
+ }
+ 
+-define void @or32_nouse_release(ptr %p) {
++define void @or32_nouse_release(ptr %p) #0 {
+ ; X64-LABEL: or32_nouse_release:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    #MEMBARRIER
+@@ -425,7 +377,7 @@ define void @or32_nouse_release(ptr %p) {
+   ret void
+ }
+ 
+-define void @or32_nouse_acq_rel(ptr %p) {
++define void @or32_nouse_acq_rel(ptr %p) #0 {
+ ; X64-LABEL: or32_nouse_acq_rel:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    #MEMBARRIER
+@@ -452,7 +404,7 @@ define void @or32_nouse_acq_rel(ptr %p) {
+   ret void
+ }
+ 
+-define void @or32_nouse_seq_cst(ptr %p) {
++define void @or32_nouse_seq_cst(ptr %p) #0 {
+ ; X64-LABEL: or32_nouse_seq_cst:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+@@ -478,7 +430,7 @@ define void @or32_nouse_seq_cst(ptr %p) {
+ }
+ 
+ ; TODO: The value isn't used on 32 bit, so the cmpxchg8b is unneeded
+-define void @or64_nouse_seq_cst(ptr %p) {
++define void @or64_nouse_seq_cst(ptr %p) #0 {
+ ; X64-LABEL: or64_nouse_seq_cst:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+@@ -487,11 +439,7 @@ define void @or64_nouse_seq_cst(ptr %p) {
+ ; X86-LABEL: or64_nouse_seq_cst:
+ ; X86:       # %bb.0:
+ ; X86-NEXT:    pushl %ebx
+-; X86-NEXT:    .cfi_def_cfa_offset 8
+ ; X86-NEXT:    pushl %esi
+-; X86-NEXT:    .cfi_def_cfa_offset 12
+-; X86-NEXT:    .cfi_offset %esi, -12
+-; X86-NEXT:    .cfi_offset %ebx, -8
+ ; X86-NEXT:    movl {{[0-9]+}}(%esp), %esi
+ ; X86-NEXT:    movl (%esi), %eax
+ ; X86-NEXT:    movl 4(%esi), %edx
+@@ -504,43 +452,33 @@ define void @or64_nouse_seq_cst(ptr %p) {
+ ; X86-NEXT:    jne .LBB11_1
+ ; X86-NEXT:  # %bb.2: # %atomicrmw.end
+ ; X86-NEXT:    popl %esi
+-; X86-NEXT:    .cfi_def_cfa_offset 8
+ ; X86-NEXT:    popl %ebx
+-; X86-NEXT:    .cfi_def_cfa_offset 4
+ ; X86-NEXT:    retl
+   atomicrmw or ptr %p, i64 0 seq_cst
+   ret void
+ }
+ 
+ ; TODO: Don't need to lower as sync_and_fetch call
+-define void @or128_nouse_seq_cst(ptr %p) {
++define void @or128_nouse_seq_cst(ptr %p) #0 {
+ ; X64-LABEL: or128_nouse_seq_cst:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    pushq %rax
+-; X64-NEXT:    .cfi_def_cfa_offset 16
+ ; X64-NEXT:    xorl %esi, %esi
+ ; X64-NEXT:    xorl %edx, %edx
+ ; X64-NEXT:    movl $5, %ecx
+ ; X64-NEXT:    callq __atomic_fetch_or_16@PLT
+ ; X64-NEXT:    popq %rax
+-; X64-NEXT:    .cfi_def_cfa_offset 8
+ ; X64-NEXT:    retq
+ ;
+ ; X86-GENERIC-LABEL: or128_nouse_seq_cst:
+ ; X86-GENERIC:       # %bb.0:
+ ; X86-GENERIC-NEXT:    pushl %ebp
+-; X86-GENERIC-NEXT:    .cfi_def_cfa_offset 8
+-; X86-GENERIC-NEXT:    .cfi_offset %ebp, -8
+ ; X86-GENERIC-NEXT:    movl %esp, %ebp
+-; X86-GENERIC-NEXT:    .cfi_def_cfa_register %ebp
+ ; X86-GENERIC-NEXT:    pushl %ebx
+ ; X86-GENERIC-NEXT:    pushl %edi
+ ; X86-GENERIC-NEXT:    pushl %esi
+ ; X86-GENERIC-NEXT:    andl $-16, %esp
+ ; X86-GENERIC-NEXT:    subl $48, %esp
+-; X86-GENERIC-NEXT:    .cfi_offset %esi, -20
+-; X86-GENERIC-NEXT:    .cfi_offset %edi, -16
+-; X86-GENERIC-NEXT:    .cfi_offset %ebx, -12
+ ; X86-GENERIC-NEXT:    movl 8(%ebp), %esi
+ ; X86-GENERIC-NEXT:    movl 12(%esi), %ecx
+ ; X86-GENERIC-NEXT:    movl 8(%esi), %edi
+@@ -579,24 +517,17 @@ define void @or128_nouse_seq_cst(ptr %p) {
+ ; X86-GENERIC-NEXT:    popl %edi
+ ; X86-GENERIC-NEXT:    popl %ebx
+ ; X86-GENERIC-NEXT:    popl %ebp
+-; X86-GENERIC-NEXT:    .cfi_def_cfa %esp, 4
+ ; X86-GENERIC-NEXT:    retl
+ ;
+ ; X86-ATOM-LABEL: or128_nouse_seq_cst:
+ ; X86-ATOM:       # %bb.0:
+ ; X86-ATOM-NEXT:    pushl %ebp
+-; X86-ATOM-NEXT:    .cfi_def_cfa_offset 8
+-; X86-ATOM-NEXT:    .cfi_offset %ebp, -8
+ ; X86-ATOM-NEXT:    movl %esp, %ebp
+-; X86-ATOM-NEXT:    .cfi_def_cfa_register %ebp
+ ; X86-ATOM-NEXT:    pushl %ebx
+ ; X86-ATOM-NEXT:    pushl %edi
+ ; X86-ATOM-NEXT:    pushl %esi
+ ; X86-ATOM-NEXT:    andl $-16, %esp
+ ; X86-ATOM-NEXT:    leal -{{[0-9]+}}(%esp), %esp
+-; X86-ATOM-NEXT:    .cfi_offset %esi, -20
+-; X86-ATOM-NEXT:    .cfi_offset %edi, -16
+-; X86-ATOM-NEXT:    .cfi_offset %ebx, -12
+ ; X86-ATOM-NEXT:    movl 8(%ebp), %esi
+ ; X86-ATOM-NEXT:    movl %esp, %ebx
+ ; X86-ATOM-NEXT:    movl 12(%esi), %ecx
+@@ -635,14 +566,13 @@ define void @or128_nouse_seq_cst(ptr %p) {
+ ; X86-ATOM-NEXT:    popl %edi
+ ; X86-ATOM-NEXT:    popl %ebx
+ ; X86-ATOM-NEXT:    popl %ebp
+-; X86-ATOM-NEXT:    .cfi_def_cfa %esp, 4
+ ; X86-ATOM-NEXT:    retl
+   atomicrmw or ptr %p, i128 0 seq_cst
+   ret void
+ }
+ 
+ 
+-define void @or16_nouse_seq_cst(ptr %p) {
++define void @or16_nouse_seq_cst(ptr %p) #0 {
+ ; X64-LABEL: or16_nouse_seq_cst:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+@@ -667,7 +597,7 @@ define void @or16_nouse_seq_cst(ptr %p) {
+   ret void
+ }
+ 
+-define void @or8_nouse_seq_cst(ptr %p) {
++define void @or8_nouse_seq_cst(ptr %p) #0 {
+ ; X64-LABEL: or8_nouse_seq_cst:
+ ; X64:       # %bb.0:
+ ; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+@@ -691,3 +621,5 @@ define void @or8_nouse_seq_cst(ptr %p) {
+   atomicrmw or ptr %p, i8 0 seq_cst
+   ret void
+ }
++
++attributes #0 = { nounwind }
+
+From 32ff748f2d2b66f447ab1ce168ab481076139d6f Mon Sep 17 00:00:00 2001
+From: Kazu Hirata <kazu@google.com>
+Date: Thu, 6 Mar 2025 23:28:28 -0800
+Subject: [PATCH 09/19] [X86] Fix a warning
+
+This patch fixes:
+
+  llvm/lib/Target/X86/X86ISelLowering.cpp:31886:11: error: unused
+  variable 'M' [-Werror,-Wunused-variable]
+
+(cherry picked from commit f83eeacc9d344eaac117fe55c4d084954216d5ba)
+---
+ llvm/lib/Target/X86/X86ISelLowering.cpp | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/llvm/lib/Target/X86/X86ISelLowering.cpp b/llvm/lib/Target/X86/X86ISelLowering.cpp
+index d31fb61157401..e599c7be5148f 100644
+--- a/llvm/lib/Target/X86/X86ISelLowering.cpp
++++ b/llvm/lib/Target/X86/X86ISelLowering.cpp
+@@ -31767,7 +31767,6 @@ X86TargetLowering::lowerIdempotentRMWIntoFencedLoad(AtomicRMWInst *AI) const {
+ 
+   IRBuilder<> Builder(AI);
+   Builder.CollectMetadataToCopy(AI, {LLVMContext::MD_pcsections});
+-  Module *M = Builder.GetInsertBlock()->getParent()->getParent();
+   auto SSID = AI->getSyncScopeID();
+   // We must restrict the ordering to avoid generating loads with Release or
+   // ReleaseAcquire orderings.
+
+From 8730abea9d91aab4922e837e49b0cb331981cb37 Mon Sep 17 00:00:00 2001
+From: Simon Pilgrim <llvm-dev@redking.me.uk>
+Date: Fri, 7 Mar 2025 10:34:39 +0000
+Subject: [PATCH 10/19] [X86] mfence.ll - add COMMON prefix + replace X32 with
+ X86 prefix
+
+We try to only use X32 for gnux32 triple
+
+Noticed while reviewing #106555
+
+(cherry picked from commit bd3bde8900a05d2418f680bb19fced189a564efd)
+---
+ llvm/test/CodeGen/X86/mfence.ll | 29 ++++++++++++-----------------
+ 1 file changed, 12 insertions(+), 17 deletions(-)
+
+diff --git a/llvm/test/CodeGen/X86/mfence.ll b/llvm/test/CodeGen/X86/mfence.ll
+index f34657b3f240c..8c29af8648712 100644
+--- a/llvm/test/CodeGen/X86/mfence.ll
++++ b/llvm/test/CodeGen/X86/mfence.ll
+@@ -1,30 +1,25 @@
+ ; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
+-; RUN: llc < %s -mtriple=i386-unknown-unknown -mattr=+sse2 | FileCheck %s --check-prefix=X32
+-; RUN: llc < %s -mtriple=x86_64-unknown-unknown -mattr=-sse2 | FileCheck %s --check-prefix=X64
++; RUN: llc < %s -mtriple=i386-unknown-unknown -mattr=+sse2 | FileCheck %s --check-prefixes=CHECK,X86
++; RUN: llc < %s -mtriple=x86_64-unknown-unknown -mattr=-sse2 | FileCheck %s --check-prefixes=CHECK,X64
+ 
+ ; It doesn't matter if an x86-64 target has specified "no-sse2"; we still can use mfence.
+ 
+ define void @test() {
+-; X32-LABEL: test:
+-; X32:       # %bb.0:
+-; X32-NEXT:    mfence
+-; X32-NEXT:    retl
+-;
+-; X64-LABEL: test:
+-; X64:       # %bb.0:
+-; X64-NEXT:    mfence
+-; X64-NEXT:    retq
++; CHECK-LABEL: test:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:    mfence
++; CHECK-NEXT:    ret{{[l|q]}}
+   fence seq_cst
+   ret void
+ }
+ 
+ define i32 @fence(ptr %ptr) {
+-; X32-LABEL: fence:
+-; X32:       # %bb.0:
+-; X32-NEXT:    movl {{[0-9]+}}(%esp), %eax
+-; X32-NEXT:    mfence
+-; X32-NEXT:    movl (%eax), %eax
+-; X32-NEXT:    retl
++; X86-LABEL: fence:
++; X86:       # %bb.0:
++; X86-NEXT:    movl {{[0-9]+}}(%esp), %eax
++; X86-NEXT:    mfence
++; X86-NEXT:    movl (%eax), %eax
++; X86-NEXT:    retl
+ ;
+ ; X64-LABEL: fence:
+ ; X64:       # %bb.0:
+
+From 1dcaa8d726dffb0c77a1f2e688e7cf27e6380eb8 Mon Sep 17 00:00:00 2001
+From: Valentin Churavy <v.churavy@gmail.com>
+Date: Tue, 11 Mar 2025 16:12:23 +0100
+Subject: [PATCH 11/19] [X86] Prefer `lock or` over mfence (#106555)
+
+Originally discussed in https://reviews.llvm.org/D129947
+
+LLVM currently emits `mfence` for `__atomic_thread_fence(seq_cst)`. On
+modern CPUs lock or is more efficient and provides the same sequential
+consistency. GCC 11 made this switch as well (see
+https://gcc.gnu.org/pipermail/gcc-cvs/2020-July/314418.html)
+and https://reviews.llvm.org/D61863 and https://reviews.llvm.org/D58632
+moved into this direction as well, but didn't touch fence seq_cst.
+
+This switches to `lock or` on all x64 systems, and leaves  `__builtin_ia32_mfence` for folks who
+want this precise instruction.
+
+(cherry picked from commit b334321678d4df2d8b1572301c827cae4d4097e2)
+---
+ llvm/lib/Target/X86/X86ISelLowering.cpp      |  4 +--
+ llvm/lib/Target/X86/X86Subtarget.h           |  3 ++
+ llvm/test/CodeGen/X86/atomic-idempotent.ll   | 10 +++----
+ llvm/test/CodeGen/X86/atomic-unordered.ll    | 10 +++----
+ llvm/test/CodeGen/X86/implicit-null-check.ll |  3 +-
+ llvm/test/CodeGen/X86/membarrier.ll          |  4 +--
+ llvm/test/CodeGen/X86/mfence.ll              | 30 ++++++++++++++++----
+ 7 files changed, 44 insertions(+), 20 deletions(-)
+
+diff --git a/llvm/lib/Target/X86/X86ISelLowering.cpp b/llvm/lib/Target/X86/X86ISelLowering.cpp
+index e599c7be5148f..bb63284f24460 100644
+--- a/llvm/lib/Target/X86/X86ISelLowering.cpp
++++ b/llvm/lib/Target/X86/X86ISelLowering.cpp
+@@ -31790,7 +31790,7 @@ X86TargetLowering::lowerIdempotentRMWIntoFencedLoad(AtomicRMWInst *AI) const {
+   // especially clever.
+ 
+   // Use `fence seq_cst` over `llvm.x64.sse2.mfence` here to get the correct
+-  // lowering for SSID == SyncScope::SingleThread and !hasMFence
++  // lowering for SSID == SyncScope::SingleThread and avoidMFence || !hasMFence
+   Builder.CreateFence(AtomicOrdering::SequentiallyConsistent, SSID);
+ 
+   // Finally we can emit the atomic load.
+@@ -31879,7 +31879,7 @@ static SDValue LowerATOMIC_FENCE(SDValue Op, const X86Subtarget &Subtarget,
+   // cross-thread fence.
+   if (FenceOrdering == AtomicOrdering::SequentiallyConsistent &&
+       FenceSSID == SyncScope::System) {
+-    if (Subtarget.hasMFence())
++    if (!Subtarget.avoidMFence() && Subtarget.hasMFence())
+       return DAG.getNode(X86ISD::MFENCE, dl, MVT::Other, Op.getOperand(0));
+ 
+     SDValue Chain = Op.getOperand(0);
+diff --git a/llvm/lib/Target/X86/X86Subtarget.h b/llvm/lib/Target/X86/X86Subtarget.h
+index 722076ca88c9c..8f2d326a69398 100644
+--- a/llvm/lib/Target/X86/X86Subtarget.h
++++ b/llvm/lib/Target/X86/X86Subtarget.h
+@@ -280,6 +280,9 @@ class X86Subtarget final : public X86GenSubtargetInfo {
+   /// supports it.
+   bool hasMFence() const { return hasSSE2() || is64Bit(); }
+ 
++  /// Avoid use of `mfence` for`fence seq_cst`, and instead use `lock or`.
++  bool avoidMFence() const { return is64Bit(); }
++
+   const Triple &getTargetTriple() const { return TargetTriple; }
+ 
+   bool isTargetDarwin() const { return TargetTriple.isOSDarwin(); }
+diff --git a/llvm/test/CodeGen/X86/atomic-idempotent.ll b/llvm/test/CodeGen/X86/atomic-idempotent.ll
+index 91355bd64cade..020f9eb793102 100644
+--- a/llvm/test/CodeGen/X86/atomic-idempotent.ll
++++ b/llvm/test/CodeGen/X86/atomic-idempotent.ll
+@@ -14,7 +14,7 @@
+ define i8 @add8(ptr %p) #0 {
+ ; X64-LABEL: add8:
+ ; X64:       # %bb.0:
+-; X64-NEXT:    mfence
++; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; X64-NEXT:    movzbl (%rdi), %eax
+ ; X64-NEXT:    retq
+ ;
+@@ -47,7 +47,7 @@ define i8 @add8(ptr %p) #0 {
+ define i16 @or16(ptr %p) #0 {
+ ; X64-LABEL: or16:
+ ; X64:       # %bb.0:
+-; X64-NEXT:    mfence
++; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; X64-NEXT:    movzwl (%rdi), %eax
+ ; X64-NEXT:    retq
+ ;
+@@ -80,7 +80,7 @@ define i16 @or16(ptr %p) #0 {
+ define i32 @xor32(ptr %p) #0 {
+ ; X64-LABEL: xor32:
+ ; X64:       # %bb.0:
+-; X64-NEXT:    mfence
++; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; X64-NEXT:    movl (%rdi), %eax
+ ; X64-NEXT:    retq
+ ;
+@@ -113,7 +113,7 @@ define i32 @xor32(ptr %p) #0 {
+ define i64 @sub64(ptr %p) #0 {
+ ; X64-LABEL: sub64:
+ ; X64:       # %bb.0:
+-; X64-NEXT:    mfence
++; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; X64-NEXT:    movq (%rdi), %rax
+ ; X64-NEXT:    retq
+ ;
+@@ -265,7 +265,7 @@ define i128 @or128(ptr %p) #0 {
+ define i32 @and32 (ptr %p) #0 {
+ ; X64-LABEL: and32:
+ ; X64:       # %bb.0:
+-; X64-NEXT:    mfence
++; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; X64-NEXT:    movl (%rdi), %eax
+ ; X64-NEXT:    retq
+ ;
+diff --git a/llvm/test/CodeGen/X86/atomic-unordered.ll b/llvm/test/CodeGen/X86/atomic-unordered.ll
+index 3fb994cdb751a..e8e0ee0b7ef49 100644
+--- a/llvm/test/CodeGen/X86/atomic-unordered.ll
++++ b/llvm/test/CodeGen/X86/atomic-unordered.ll
+@@ -2096,7 +2096,7 @@ define i64 @nofold_fence(ptr %p) {
+ ; CHECK-LABEL: nofold_fence:
+ ; CHECK:       # %bb.0:
+ ; CHECK-NEXT:    movq (%rdi), %rax
+-; CHECK-NEXT:    mfence
++; CHECK-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; CHECK-NEXT:    addq $15, %rax
+ ; CHECK-NEXT:    retq
+   %v = load atomic i64, ptr %p unordered, align 8
+@@ -2170,7 +2170,7 @@ define i64 @fold_constant_fence(i64 %arg) {
+ ; CHECK-LABEL: fold_constant_fence:
+ ; CHECK:       # %bb.0:
+ ; CHECK-NEXT:    movq Constant(%rip), %rax
+-; CHECK-NEXT:    mfence
++; CHECK-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; CHECK-NEXT:    addq %rdi, %rax
+ ; CHECK-NEXT:    retq
+   %v = load atomic i64, ptr @Constant unordered, align 8
+@@ -2197,7 +2197,7 @@ define i64 @fold_invariant_fence(ptr dereferenceable(8) %p, i64 %arg) {
+ ; CHECK-LABEL: fold_invariant_fence:
+ ; CHECK:       # %bb.0:
+ ; CHECK-NEXT:    movq (%rdi), %rax
+-; CHECK-NEXT:    mfence
++; CHECK-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; CHECK-NEXT:    addq %rsi, %rax
+ ; CHECK-NEXT:    retq
+   %v = load atomic i64, ptr %p unordered, align 8, !invariant.load !{}
+@@ -2321,7 +2321,7 @@ define i1 @fold_cmp_over_fence(ptr %p, i32 %v1) {
+ ; CHECK-O0-LABEL: fold_cmp_over_fence:
+ ; CHECK-O0:       # %bb.0:
+ ; CHECK-O0-NEXT:    movl (%rdi), %eax
+-; CHECK-O0-NEXT:    mfence
++; CHECK-O0-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; CHECK-O0-NEXT:    cmpl %eax, %esi
+ ; CHECK-O0-NEXT:    jne .LBB116_2
+ ; CHECK-O0-NEXT:  # %bb.1: # %taken
+@@ -2335,7 +2335,7 @@ define i1 @fold_cmp_over_fence(ptr %p, i32 %v1) {
+ ; CHECK-O3-LABEL: fold_cmp_over_fence:
+ ; CHECK-O3:       # %bb.0:
+ ; CHECK-O3-NEXT:    movl (%rdi), %eax
+-; CHECK-O3-NEXT:    mfence
++; CHECK-O3-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; CHECK-O3-NEXT:    cmpl %eax, %esi
+ ; CHECK-O3-NEXT:    jne .LBB116_2
+ ; CHECK-O3-NEXT:  # %bb.1: # %taken
+diff --git a/llvm/test/CodeGen/X86/implicit-null-check.ll b/llvm/test/CodeGen/X86/implicit-null-check.ll
+index fc81f703f5d40..de63c9ae209df 100644
+--- a/llvm/test/CodeGen/X86/implicit-null-check.ll
++++ b/llvm/test/CodeGen/X86/implicit-null-check.ll
+@@ -1,3 +1,4 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py UTC_ARGS: --version 5
+ ; RUN: llc -verify-machineinstrs -O3 -mtriple=x86_64-apple-macosx -enable-implicit-null-checks < %s | FileCheck %s
+ 
+ define i32 @imp_null_check_load(ptr %x) {
+@@ -465,7 +466,7 @@ define i32 @imp_null_check_load_fence2(ptr %x) {
+ ; CHECK-NEXT:    testq %rdi, %rdi
+ ; CHECK-NEXT:    je LBB17_1
+ ; CHECK-NEXT:  ## %bb.2: ## %not_null
+-; CHECK-NEXT:    mfence
++; CHECK-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; CHECK-NEXT:    movl (%rdi), %eax
+ ; CHECK-NEXT:    retq
+ ; CHECK-NEXT:  LBB17_1: ## %is_null
+diff --git a/llvm/test/CodeGen/X86/membarrier.ll b/llvm/test/CodeGen/X86/membarrier.ll
+index 55f2a2f210139..2773f01f7ab82 100644
+--- a/llvm/test/CodeGen/X86/membarrier.ll
++++ b/llvm/test/CodeGen/X86/membarrier.ll
+@@ -6,9 +6,9 @@ define i32 @t() {
+ ; CHECK-LABEL: t:
+ ; CHECK:       # %bb.0:
+ ; CHECK-NEXT:    movl $1, -{{[0-9]+}}(%rsp)
+-; CHECK-NEXT:    mfence
++; CHECK-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; CHECK-NEXT:    lock decl -{{[0-9]+}}(%rsp)
+-; CHECK-NEXT:    mfence
++; CHECK-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; CHECK-NEXT:    xorl %eax, %eax
+ ; CHECK-NEXT:    retq
+   %i = alloca i32, align 4
+diff --git a/llvm/test/CodeGen/X86/mfence.ll b/llvm/test/CodeGen/X86/mfence.ll
+index 8c29af8648712..ce74d2dd69f9b 100644
+--- a/llvm/test/CodeGen/X86/mfence.ll
++++ b/llvm/test/CodeGen/X86/mfence.ll
+@@ -5,10 +5,15 @@
+ ; It doesn't matter if an x86-64 target has specified "no-sse2"; we still can use mfence.
+ 
+ define void @test() {
+-; CHECK-LABEL: test:
+-; CHECK:       # %bb.0:
+-; CHECK-NEXT:    mfence
+-; CHECK-NEXT:    ret{{[l|q]}}
++; X86-LABEL: test:
++; X86:       # %bb.0:
++; X86-NEXT:    mfence
++; X86-NEXT:    retl
++;
++; X64-LABEL: test:
++; X64:       # %bb.0:
++; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
++; X64-NEXT:    retq
+   fence seq_cst
+   ret void
+ }
+@@ -23,10 +28,25 @@ define i32 @fence(ptr %ptr) {
+ ;
+ ; X64-LABEL: fence:
+ ; X64:       # %bb.0:
+-; X64-NEXT:    mfence
++; X64-NEXT:    lock orl $0, -{{[0-9]+}}(%rsp)
+ ; X64-NEXT:    movl (%rdi), %eax
+ ; X64-NEXT:    retq
+   %atomic = atomicrmw add ptr %ptr, i32 0 seq_cst
+   ret i32 %atomic
+ }
+ 
++define void @mfence() nounwind {
++; X32-LABEL: mfence:
++; X32:       # %bb.0:
++; X32-NEXT:    mfence
++; X32-NEXT:    retl
++;
++; CHECK-LABEL: mfence:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:    mfence
++; CHECK-NEXT:    ret{{[l|q]}}
++  call void @llvm.x86.sse2.mfence()
++  ret void
++}
++declare void @llvm.x86.sse2.mfence() nounwind readnone
++
+
+From ee44f1028376d565b5a8b41f25d6691fbf751074 Mon Sep 17 00:00:00 2001
+From: Tim Besard <tim.besard@gmail.com>
+Date: Fri, 9 May 2025 14:57:56 +0200
+Subject: [PATCH 12/19] [ORC] Fix the prototype of a C API function.
+
+---
+ llvm/include/llvm-c/Orc.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/llvm/include/llvm-c/Orc.h b/llvm/include/llvm-c/Orc.h
+index 8609a8a6d9e9d..743ba1d581782 100644
+--- a/llvm/include/llvm-c/Orc.h
++++ b/llvm/include/llvm-c/Orc.h
+@@ -1059,7 +1059,7 @@ LLVMErrorRef LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
+  */
+ LLVMErrorRef LLVMOrcCreateStaticLibrarySearchGeneratorForPath(
+     LLVMOrcDefinitionGeneratorRef *Result, LLVMOrcObjectLayerRef ObjLayer,
+-    const char *FileName, const char *TargetTriple);
++    const char *FileName);
+ 
+ /**
+  * Create a ThreadSafeContext containing a new LLVMContext.
+
+From 5b9f96366ce26dfc8ca91697ef0a57894791d95e Mon Sep 17 00:00:00 2001
+From: Keno Fischer <keno@juliahub.com>
+Date: Mon, 28 Jul 2025 23:57:03 +0000
+Subject: [PATCH 13/19] [IRCE] Check loop clone legality before attempting to
+ do so
+
+Not all loop bodies are safe to clone. For example, they may have
+`noduplicate` call in them. Additionally, if the transformation may
+cause any of the cloned loop bodies to execute conditionally, we
+must also disallow `convergent` calls, as well as any call that
+returns a token that is used outside of the loop. The loop unswitching
+pass had an appropriate legality check for this, but IRCE did not,
+causing issues downstream (https://github.com/JuliaLang/julia/issues/48918).
+
+As a particular example, consider the test case in this commit, where
+`opt -passes=irce`, creates invalid IR:
+```
+opt --passes=irce llvm/test/Transforms/IRCE/pre_post_loops_clone.ll
+WARNING: You're attempting to print out a bitcode file.
+This is inadvisable as it may cause display problems. If
+you REALLY want to taste LLVM bitcode first-hand, you
+can force output with the `-f' option.
+
+Instruction does not dominate all uses!
+  %token = call token @llvm.source_token()
+  call void @llvm.sink_token(token %token)
+Instruction does not dominate all uses!
+  %token = call token @llvm.source_token()
+  call void @llvm.sink_token(token %token)
+LLVM ERROR: Broken module found, compilation aborted!
+```
+
+Fix this by factoring out the legality check from the loop unswitch
+pass and using it in IRCE as well. I personally don't have any code
+that is `noduplicate` or `convergent`, but I don't see any reason
+why IRCE would be different here.
+
+I will also mention #56243 as related, which contains some related
+discussion of LCSSA in the presence of tokens.
+
+Fixes #63984
+---
+ llvm/include/llvm/Analysis/LoopInfo.h         |  6 ++
+ llvm/lib/Analysis/LoopInfo.cpp                | 60 +++++++++++++-----
+ .../Transforms/Scalar/SimpleLoopUnswitch.cpp  | 17 ++----
+ llvm/lib/Transforms/Utils/LoopConstrainer.cpp |  7 +++
+ .../Transforms/IRCE/pre_post_loops_clone.ll   | 61 +++++++++++++++++++
+ 5 files changed, 123 insertions(+), 28 deletions(-)
+ create mode 100644 llvm/test/Transforms/IRCE/pre_post_loops_clone.ll
+
+diff --git a/llvm/include/llvm/Analysis/LoopInfo.h b/llvm/include/llvm/Analysis/LoopInfo.h
+index abc0bb8588fa8..ec99795d11907 100644
+--- a/llvm/include/llvm/Analysis/LoopInfo.h
++++ b/llvm/include/llvm/Analysis/LoopInfo.h
+@@ -326,6 +326,12 @@ class LLVM_ABI Loop : public LoopBase<BasicBlock, Loop> {
+   /// Return true if the loop body is safe to clone in practice.
+   bool isSafeToClone() const;
+ 
++  /// Like `isSafeToClone`, but also checks whether we may form phis for all
++  /// values that are live-out from the loop. This is required if either of
++  /// the cloned loop bodies may run conditionally.
++  bool isSafeToCloneConditionally(const DominatorTree &DT,
++                                  bool AllowConvergent = false) const;
++
+   /// Returns true if the loop is annotated parallel.
+   ///
+   /// A parallel loop can be assumed to not contain any dependencies between
+diff --git a/llvm/lib/Analysis/LoopInfo.cpp b/llvm/lib/Analysis/LoopInfo.cpp
+index 0eaf1dca59675..279b5744f17fb 100644
+--- a/llvm/lib/Analysis/LoopInfo.cpp
++++ b/llvm/lib/Analysis/LoopInfo.cpp
+@@ -428,6 +428,27 @@ bool Loop::isCanonical(ScalarEvolution &SE) const {
+   return true;
+ }
+ 
++static bool loopContainsUser(const Loop &L, const BasicBlock &BB, const Use &U,
++                             const DominatorTree &DT) {
++  const Instruction *UI = cast<Instruction>(U.getUser());
++  const BasicBlock *UserBB = UI->getParent();
++
++  // For practical purposes, we consider that the use in a PHI
++  // occurs in the respective predecessor block. For more info,
++  // see the `phi` doc in LangRef and the LCSSA doc.
++  if (const PHINode *P = dyn_cast<PHINode>(UI))
++    UserBB = P->getIncomingBlock(U);
++
++  // Check the current block, as a fast-path, before checking whether
++  // the use is anywhere in the loop.  Most values are used in the same
++  // block they are defined in.  Also, blocks not reachable from the
++  // entry are special; uses in them don't need to go through PHIs.
++  if (UserBB != &BB && !L.contains(UserBB) && DT.isReachableFromEntry(UserBB))
++    return false;
++
++  return true;
++}
++
+ // Check that 'BB' doesn't have any uses outside of the 'L'
+ static bool isBlockInLCSSAForm(const Loop &L, const BasicBlock &BB,
+                                const DominatorTree &DT, bool IgnoreTokens) {
+@@ -439,21 +460,7 @@ static bool isBlockInLCSSAForm(const Loop &L, const BasicBlock &BB,
+       continue;
+ 
+     for (const Use &U : I.uses()) {
+-      const Instruction *UI = cast<Instruction>(U.getUser());
+-      const BasicBlock *UserBB = UI->getParent();
+-
+-      // For practical purposes, we consider that the use in a PHI
+-      // occurs in the respective predecessor block. For more info,
+-      // see the `phi` doc in LangRef and the LCSSA doc.
+-      if (const PHINode *P = dyn_cast<PHINode>(UI))
+-        UserBB = P->getIncomingBlock(U);
+-
+-      // Check the current block, as a fast-path, before checking whether
+-      // the use is anywhere in the loop.  Most values are used in the same
+-      // block they are defined in.  Also, blocks not reachable from the
+-      // entry are special; uses in them don't need to go through PHIs.
+-      if (UserBB != &BB && !L.contains(UserBB) &&
+-          DT.isReachableFromEntry(UserBB))
++      if (!loopContainsUser(L, BB, U, DT))
+         return false;
+     }
+   }
+@@ -499,6 +506,29 @@ bool Loop::isSafeToClone() const {
+   return true;
+ }
+ 
++bool Loop::isSafeToCloneConditionally(const DominatorTree &DT,
++                                      bool AllowConvergent) const {
++  // Return false if any loop blocks contain indirectbrs, or there are any calls
++  // to noduplicate functions.
++  for (BasicBlock *BB : this->blocks()) {
++    if (isa<IndirectBrInst>(BB->getTerminator()))
++      return false;
++
++    for (Instruction &I : *BB) {
++      if (I.getType()->isTokenTy()) {
++        for (const Use &U : I.uses()) {
++          if (!loopContainsUser(*this, *BB, U, DT))
++            return false;
++        }
++      }
++      if (auto *CB = dyn_cast<CallBase>(&I))
++        if (CB->cannotDuplicate() || (AllowConvergent || CB->isConvergent()))
++          return false;
++    }
++  }
++  return true;
++}
++
+ MDNode *Loop::getLoopID() const {
+   MDNode *LoopID = nullptr;
+ 
+diff --git a/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp b/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
+index 4f7956514b7b5..6a48c5116acc4 100644
+--- a/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
++++ b/llvm/lib/Transforms/Scalar/SimpleLoopUnswitch.cpp
+@@ -3271,19 +3271,10 @@ static bool collectUnswitchCandidatesWithInjections(
+   return Found;
+ }
+ 
+-static bool isSafeForNoNTrivialUnswitching(Loop &L, LoopInfo &LI) {
+-  if (!L.isSafeToClone())
++static bool isSafeForNoNTrivialUnswitching(const DominatorTree &DT, Loop &L,
++                                           LoopInfo &LI) {
++  if (!L.isSafeToCloneConditionally(DT))
+     return false;
+-  for (auto *BB : L.blocks())
+-    for (auto &I : *BB) {
+-      if (I.getType()->isTokenTy() && I.isUsedOutsideOfBlock(BB))
+-        return false;
+-      if (auto *CB = dyn_cast<CallBase>(&I)) {
+-        assert(!CB->cannotDuplicate() && "Checked by L.isSafeToClone().");
+-        if (CB->isConvergent())
+-          return false;
+-      }
+-    }
+ 
+   // Check if there are irreducible CFG cycles in this loop. If so, we cannot
+   // easily unswitch non-trivial edges out of the loop. Doing so might turn the
+@@ -3661,7 +3652,7 @@ static bool unswitchLoop(Loop &L, DominatorTree &DT, LoopInfo &LI,
+   }
+ 
+   // Perform legality checks.
+-  if (!isSafeForNoNTrivialUnswitching(L, LI))
++  if (!isSafeForNoNTrivialUnswitching(DT, L, LI))
+     return false;
+ 
+   // For non-trivial unswitching, because it often creates new loops, we rely on
+diff --git a/llvm/lib/Transforms/Utils/LoopConstrainer.cpp b/llvm/lib/Transforms/Utils/LoopConstrainer.cpp
+index 8f103153059e8..56e806222e764 100644
+--- a/llvm/lib/Transforms/Utils/LoopConstrainer.cpp
++++ b/llvm/lib/Transforms/Utils/LoopConstrainer.cpp
+@@ -750,6 +750,13 @@ bool LoopConstrainer::run() {
+   const SCEVConstant *MinusOneS =
+       cast<SCEVConstant>(SE.getConstant(IVTy, -1, true /* isSigned */));
+ 
++  if ((NeedsPreLoop || NeedsPostLoop) &&
++      !OriginalLoop.isSafeToCloneConditionally(DT)) {
++    LLVM_DEBUG(dbgs() << "cannot clone loop " << OriginalLoop.getName()
++                      << " because it is not safe to clone.\n");
++    return false;
++  }
++
+   if (NeedsPreLoop) {
+     const SCEV *ExitPreLoopAtSCEV = nullptr;
+ 
+diff --git a/llvm/test/Transforms/IRCE/pre_post_loops_clone.ll b/llvm/test/Transforms/IRCE/pre_post_loops_clone.ll
+new file mode 100644
+index 0000000000000..2ad20c15b569d
+--- /dev/null
++++ b/llvm/test/Transforms/IRCE/pre_post_loops_clone.ll
+@@ -0,0 +1,61 @@
++; RUN: opt -verify-loop-info -irce-print-changed-loops -passes=irce -S < %s 2>&1 | FileCheck %s
++; This test is the same as pre_post_loops.ll, except that the loop body contains a token-generating
++; call. We need to ensure that IRCE does not try to introduce a PHI or otherwise generate invalid IE.
++
++declare token @llvm.source_token()
++declare void @llvm.sink_token(token)
++
++; CHECK: define void @test_01
++define void @test_01(ptr %arr, ptr %a_len_ptr) {
++entry:
++  %len = load i32, ptr %a_len_ptr, !range !0
++  br label %loop
++
++loop:
++  %idx = phi i32 [ 0, %entry ], [ %idx.next, %in.bounds ]
++  %idx.next = add i32 %idx, 1
++  %abc = icmp slt i32 %idx, %len
++  %token = call token @llvm.source_token()
++  br i1 %abc, label %in.bounds, label %out.of.bounds
++
++in.bounds:
++  %addr = getelementptr i32, ptr %arr, i32 %idx
++  store i32 0, ptr %addr
++  %next = icmp slt i32 %idx.next, 2147483647
++  br i1 %next, label %loop, label %exit
++
++out.of.bounds:
++  ret void
++
++exit:
++  call void @llvm.sink_token(token %token)
++  ret void
++}
++
++define void @test_02(ptr %arr, ptr %a_len_ptr) {
++entry:
++  %len = load i32, ptr %a_len_ptr, !range !0
++  br label %loop
++
++loop:
++  %idx = phi i32 [ 2147483647, %entry ], [ %idx.next, %in.bounds ]
++  %idx.next = add i32 %idx, -1
++  %abc = icmp slt i32 %idx, %len
++  %token = call token @llvm.source_token()
++  br i1 %abc, label %in.bounds, label %out.of.bounds
++
++in.bounds:
++  %addr = getelementptr i32, ptr %arr, i32 %idx
++  store i32 0, ptr %addr
++  %next = icmp sgt i32 %idx.next, -1
++  br i1 %next, label %loop, label %exit
++
++out.of.bounds:
++  ret void
++
++exit:
++  call void @llvm.sink_token(token %token)
++  ret void
++}
++
++!0 = !{i32 0, i32 50}
+
+From 2947a034f64dccc2ffbf2fcf9261eb37134fee2f Mon Sep 17 00:00:00 2001
+From: William Moses <gh@wsmoses.com>
+Date: Mon, 15 Sep 2025 10:33:25 -0500
+Subject: [PATCH 14/19] [SimplifyCFG] Refine metadata handling during
+ instruction hoisting (llvm#158448)
+
+Co-authored-by: Nikita Popov <npopov@redhat.com>
+(cherry picked from commit c44e015)
+---
+ llvm/lib/Transforms/Utils/SimplifyCFG.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp
+index 12dd49da279b9..427d7a3d510d2 100644
+--- a/llvm/lib/Transforms/Utils/SimplifyCFG.cpp
++++ b/llvm/lib/Transforms/Utils/SimplifyCFG.cpp
+@@ -3439,7 +3439,7 @@ bool SimplifyCFGOpt::speculativelyExecuteBB(BranchInst *BI,
+     if (!SpeculatedStoreValue || &I != SpeculatedStore) {
+       // Don't update the DILocation of dbg.assign intrinsics.
+       if (!isa<DbgAssignIntrinsic>(&I))
+-        I.setDebugLoc(DebugLoc());
++        I.dropLocation();
+     }
+     I.dropUBImplyingAttrsAndMetadata();
+ 
+
+From 23150fafda0e3a3bbdcc8d02af2076adf1ed799d Mon Sep 17 00:00:00 2001
+From: David Green <david.green@arm.com>
+Date: Thu, 23 Jul 2026 12:50:34 +0200
+Subject: [PATCH 15/19] [VectorCombine] Fix transitive Uses in
+ foldShuffleToIdentity (#188989)
+
+The Uses in foldShuffleToIdentity is intended to detect where an operand
+is used to distinguish between splats, identities and concats of the
+same value. When looking through multiple unsimplified shuffles the same
+Use could be both a splat and a identity though. This patch changes the
+Use to a Value and an original Use, so that even if we are looking
+through multiple vectors we recognise the splat vs identity vs concat of
+each use correctly.
+
+Fixes #180338
+
+(cherry picked from commit fd40c606652137706bc336ef80ed1814ab3d3680,
+resolving conflicts against release/20.x. The LoongArch test update was
+dropped as the test does not exist on this branch, and the CHECK lines
+for the new shuffle_different_lanes test were regenerated: this branch
+does not perform that (independently correct) fold)
+---
+ .../Transforms/Vectorize/VectorCombine.cpp    | 155 +++++++++---------
+ .../AArch64/shuffletoidentity.ll              | 132 +++++++++++++++
+ 2 files changed, 214 insertions(+), 73 deletions(-)
+
+diff --git a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp
+index 1deaaca05d98f..5d496c6a0525b 100644
+--- a/llvm/lib/Transforms/Vectorize/VectorCombine.cpp
++++ b/llvm/lib/Transforms/Vectorize/VectorCombine.cpp
+@@ -2156,24 +2156,24 @@ bool VectorCombine::foldShuffleOfIntrinsics(Instruction &I) {
+   return true;
+ }
+ 
+-using InstLane = std::pair<Use *, int>;
++using InstLane = std::pair<Value *, int>;
+ 
+-static InstLane lookThroughShuffles(Use *U, int Lane) {
+-  while (auto *SV = dyn_cast<ShuffleVectorInst>(U->get())) {
++static InstLane lookThroughShuffles(Value *V, int Lane) {
++  while (auto *SV = dyn_cast<ShuffleVectorInst>(V)) {
+     unsigned NumElts =
+         cast<FixedVectorType>(SV->getOperand(0)->getType())->getNumElements();
+     int M = SV->getMaskValue(Lane);
+     if (M < 0)
+       return {nullptr, PoisonMaskElem};
+     if (static_cast<unsigned>(M) < NumElts) {
+-      U = &SV->getOperandUse(0);
++      V = SV->getOperand(0);
+       Lane = M;
+     } else {
+-      U = &SV->getOperandUse(1);
++      V = SV->getOperand(1);
+       Lane = M - NumElts;
+     }
+   }
+-  return InstLane{U, Lane};
++  return InstLane{V, Lane};
+ }
+ 
+ static SmallVector<InstLane>
+@@ -2182,8 +2182,7 @@ generateInstLaneVectorFromOperand(ArrayRef<InstLane> Item, int Op) {
+   for (InstLane IL : Item) {
+     auto [U, Lane] = IL;
+     InstLane OpLane =
+-        U ? lookThroughShuffles(&cast<Instruction>(U->get())->getOperandUse(Op),
+-                                Lane)
++        U ? lookThroughShuffles(cast<Instruction>(U)->getOperand(Op), Lane)
+           : InstLane{nullptr, PoisonMaskElem};
+     NItem.emplace_back(OpLane);
+   }
+@@ -2193,7 +2192,7 @@ generateInstLaneVectorFromOperand(ArrayRef<InstLane> Item, int Op) {
+ /// Detect concat of multiple values into a vector
+ static bool isFreeConcat(ArrayRef<InstLane> Item, TTI::TargetCostKind CostKind,
+                          const TargetTransformInfo &TTI) {
+-  auto *Ty = cast<FixedVectorType>(Item.front().first->get()->getType());
++  auto *Ty = cast<FixedVectorType>(Item.front().first->getType());
+   unsigned NumElts = Ty->getNumElements();
+   if (Item.size() == NumElts || NumElts == 1 || Item.size() % NumElts != 0)
+     return false;
+@@ -2211,39 +2210,39 @@ static bool isFreeConcat(ArrayRef<InstLane> Item, TTI::TargetCostKind CostKind,
+   if (!isPowerOf2_32(NumSlices))
+     return false;
+   for (unsigned Slice = 0; Slice < NumSlices; ++Slice) {
+-    Use *SliceV = Item[Slice * NumElts].first;
+-    if (!SliceV || SliceV->get()->getType() != Ty)
++    Value *SliceV = Item[Slice * NumElts].first;
++    if (!SliceV || SliceV->getType() != Ty)
+       return false;
+     for (unsigned Elt = 0; Elt < NumElts; ++Elt) {
+       auto [V, Lane] = Item[Slice * NumElts + Elt];
+-      if (Lane != static_cast<int>(Elt) || SliceV->get() != V->get())
++      if (Lane != static_cast<int>(Elt) || SliceV != V)
+         return false;
+     }
+   }
+   return true;
+ }
+ 
+-static Value *generateNewInstTree(ArrayRef<InstLane> Item, FixedVectorType *Ty,
+-                                  const SmallPtrSet<Use *, 4> &IdentityLeafs,
+-                                  const SmallPtrSet<Use *, 4> &SplatLeafs,
+-                                  const SmallPtrSet<Use *, 4> &ConcatLeafs,
+-                                  IRBuilder<> &Builder,
+-                                  const TargetTransformInfo *TTI) {
+-  auto [FrontU, FrontLane] = Item.front();
++static Value *
++generateNewInstTree(ArrayRef<InstLane> Item, Use *From, FixedVectorType *Ty,
++                    const DenseSet<std::pair<Value *, Use *>> &IdentityLeafs,
++                    const DenseSet<std::pair<Value *, Use *>> &SplatLeafs,
++                    const DenseSet<std::pair<Value *, Use *>> &ConcatLeafs,
++                    IRBuilder<> &Builder, const TargetTransformInfo *TTI) {
++  auto [FrontV, FrontLane] = Item.front();
+ 
+-  if (IdentityLeafs.contains(FrontU)) {
+-    return FrontU->get();
++  if (IdentityLeafs.contains(std::make_pair(FrontV, From))) {
++    return FrontV;
+   }
+-  if (SplatLeafs.contains(FrontU)) {
++  if (SplatLeafs.contains(std::make_pair(FrontV, From))) {
+     SmallVector<int, 16> Mask(Ty->getNumElements(), FrontLane);
+-    return Builder.CreateShuffleVector(FrontU->get(), Mask);
++    return Builder.CreateShuffleVector(FrontV, Mask);
+   }
+-  if (ConcatLeafs.contains(FrontU)) {
++  if (ConcatLeafs.contains(std::make_pair(FrontV, From))) {
+     unsigned NumElts =
+-        cast<FixedVectorType>(FrontU->get()->getType())->getNumElements();
++        cast<FixedVectorType>(FrontV->getType())->getNumElements();
+     SmallVector<Value *> Values(Item.size() / NumElts, nullptr);
+     for (unsigned S = 0; S < Values.size(); ++S)
+-      Values[S] = Item[S * NumElts].first->get();
++      Values[S] = Item[S * NumElts].first;
+ 
+     while (Values.size() > 1) {
+       NumElts *= 2;
+@@ -2258,7 +2257,7 @@ static Value *generateNewInstTree(ArrayRef<InstLane> Item, FixedVectorType *Ty,
+     return Values[0];
+   }
+ 
+-  auto *I = cast<Instruction>(FrontU->get());
++  auto *I = cast<Instruction>(FrontV);
+   auto *II = dyn_cast<IntrinsicInst>(I);
+   unsigned NumOps = I->getNumOperands() - (II ? 1 : 0);
+   SmallVector<Value *> Ops(NumOps);
+@@ -2269,14 +2268,14 @@ static Value *generateNewInstTree(ArrayRef<InstLane> Item, FixedVectorType *Ty,
+       continue;
+     }
+     Ops[Idx] = generateNewInstTree(generateInstLaneVectorFromOperand(Item, Idx),
+-                                   Ty, IdentityLeafs, SplatLeafs, ConcatLeafs,
+-                                   Builder, TTI);
++                                   &I->getOperandUse(Idx), Ty, IdentityLeafs,
++                                   SplatLeafs, ConcatLeafs, Builder, TTI);
+   }
+ 
+   SmallVector<Value *, 8> ValueList;
+   for (const auto &Lane : Item)
+     if (Lane.first)
+-      ValueList.push_back(Lane.first->get());
++      ValueList.push_back(Lane.first);
+ 
+   Type *DstTy =
+       FixedVectorType::get(I->getType()->getScalarType(), Ty->getNumElements());
+@@ -2324,22 +2323,24 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
+ 
+   SmallVector<InstLane> Start(Ty->getNumElements());
+   for (unsigned M = 0, E = Ty->getNumElements(); M < E; ++M)
+-    Start[M] = lookThroughShuffles(&*I.use_begin(), M);
++    Start[M] = lookThroughShuffles(&I, M);
+ 
+-  SmallVector<SmallVector<InstLane>> Worklist;
+-  Worklist.push_back(Start);
+-  SmallPtrSet<Use *, 4> IdentityLeafs, SplatLeafs, ConcatLeafs;
++  SmallVector<std::pair<SmallVector<InstLane>, Use *>> Worklist;
++  Worklist.push_back(std::make_pair(Start, &*I.use_begin()));
++  DenseSet<std::pair<Value *, Use *>> IdentityLeafs, SplatLeafs, ConcatLeafs;
+   unsigned NumVisited = 0;
+ 
+   while (!Worklist.empty()) {
+     if (++NumVisited > MaxInstrsToScan)
+       return false;
+ 
+-    SmallVector<InstLane> Item = Worklist.pop_back_val();
+-    auto [FrontU, FrontLane] = Item.front();
++    auto ItemFrom = Worklist.pop_back_val();
++    auto Item = ItemFrom.first;
++    auto From = ItemFrom.second;
++    auto [FrontV, FrontLane] = Item.front();
+ 
+     // If we found an undef first lane then bail out to keep things simple.
+-    if (!FrontU)
++    if (!FrontV)
+       return false;
+ 
+     // Helper to peek through bitcasts to the same value.
+@@ -2350,46 +2351,46 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
+ 
+     // Look for an identity value.
+     if (FrontLane == 0 &&
+-        cast<FixedVectorType>(FrontU->get()->getType())->getNumElements() ==
++        cast<FixedVectorType>(FrontV->getType())->getNumElements() ==
+             Ty->getNumElements() &&
+         all_of(drop_begin(enumerate(Item)), [IsEquiv, Item](const auto &E) {
+-          Value *FrontV = Item.front().first->get();
+-          return !E.value().first || (IsEquiv(E.value().first->get(), FrontV) &&
++          Value *FrontV = Item.front().first;
++          return !E.value().first || (IsEquiv(E.value().first, FrontV) &&
+                                       E.value().second == (int)E.index());
+         })) {
+-      IdentityLeafs.insert(FrontU);
++      IdentityLeafs.insert(std::make_pair(FrontV, From));
+       continue;
+     }
+     // Look for constants, for the moment only supporting constant splats.
+-    if (auto *C = dyn_cast<Constant>(FrontU);
++    if (auto *C = dyn_cast<Constant>(FrontV);
+         C && C->getSplatValue() &&
+         all_of(drop_begin(Item), [Item](InstLane &IL) {
+-          Value *FrontV = Item.front().first->get();
+-          Use *U = IL.first;
+-          return !U || (isa<Constant>(U->get()) &&
+-                        cast<Constant>(U->get())->getSplatValue() ==
++          Value *FrontV = Item.front().first;
++          Value *V = IL.first;
++          return !V || (isa<Constant>(V) &&
++                        cast<Constant>(V)->getSplatValue() ==
+                             cast<Constant>(FrontV)->getSplatValue());
+         })) {
+-      SplatLeafs.insert(FrontU);
++      SplatLeafs.insert(std::make_pair(FrontV, From));
+       continue;
+     }
+     // Look for a splat value.
+     if (all_of(drop_begin(Item), [Item](InstLane &IL) {
+-          auto [FrontU, FrontLane] = Item.front();
+-          auto [U, Lane] = IL;
+-          return !U || (U->get() == FrontU->get() && Lane == FrontLane);
++          auto [FrontV, FrontLane] = Item.front();
++          auto [V, Lane] = IL;
++          return !V || (V == FrontV && Lane == FrontLane);
+         })) {
+-      SplatLeafs.insert(FrontU);
++      SplatLeafs.insert(std::make_pair(FrontV, From));
+       continue;
+     }
+ 
+     // We need each element to be the same type of value, and check that each
+     // element has a single use.
+     auto CheckLaneIsEquivalentToFirst = [Item](InstLane IL) {
+-      Value *FrontV = Item.front().first->get();
++      Value *FrontV = Item.front().first;
+       if (!IL.first)
+         return true;
+-      Value *V = IL.first->get();
++      Value *V = IL.first;
+       if (auto *I = dyn_cast<Instruction>(V); I && !I->hasOneUse())
+         return false;
+       if (V->getValueID() != FrontV->getValueID())
+@@ -2416,55 +2417,63 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
+     };
+     if (all_of(drop_begin(Item), CheckLaneIsEquivalentToFirst)) {
+       // Check the operator is one that we support.
+-      if (isa<BinaryOperator, CmpInst>(FrontU)) {
++      if (isa<BinaryOperator, CmpInst>(FrontV)) {
+         //  We exclude div/rem in case they hit UB from poison lanes.
+-        if (auto *BO = dyn_cast<BinaryOperator>(FrontU);
++        if (auto *BO = dyn_cast<BinaryOperator>(FrontV);
+             BO && BO->isIntDivRem())
+           return false;
+-        Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
+-        Worklist.push_back(generateInstLaneVectorFromOperand(Item, 1));
++        Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 0),
++                              &cast<Instruction>(FrontV)->getOperandUse(0));
++        Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 1),
++                              &cast<Instruction>(FrontV)->getOperandUse(1));
+         continue;
+       } else if (isa<UnaryOperator, TruncInst, ZExtInst, SExtInst, FPToSIInst,
+-                     FPToUIInst, SIToFPInst, UIToFPInst>(FrontU)) {
+-        Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
++                     FPToUIInst, SIToFPInst, UIToFPInst>(FrontV)) {
++        Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 0),
++                              &cast<Instruction>(FrontV)->getOperandUse(0));
+         continue;
+-      } else if (auto *BitCast = dyn_cast<BitCastInst>(FrontU)) {
++      } else if (auto *BitCast = dyn_cast<BitCastInst>(FrontV)) {
+         // TODO: Handle vector widening/narrowing bitcasts.
+         auto *DstTy = dyn_cast<FixedVectorType>(BitCast->getDestTy());
+         auto *SrcTy = dyn_cast<FixedVectorType>(BitCast->getSrcTy());
+         if (DstTy && SrcTy &&
+             SrcTy->getNumElements() == DstTy->getNumElements()) {
+-          Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
++          Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 0),
++                                &BitCast->getOperandUse(0));
+           continue;
+         }
+-      } else if (isa<SelectInst>(FrontU)) {
+-        Worklist.push_back(generateInstLaneVectorFromOperand(Item, 0));
+-        Worklist.push_back(generateInstLaneVectorFromOperand(Item, 1));
+-        Worklist.push_back(generateInstLaneVectorFromOperand(Item, 2));
++      } else if (auto *Sel = dyn_cast<SelectInst>(FrontV)) {
++        Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 0),
++                              &Sel->getOperandUse(0));
++        Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 1),
++                              &Sel->getOperandUse(1));
++        Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, 2),
++                              &Sel->getOperandUse(2));
+         continue;
+-      } else if (auto *II = dyn_cast<IntrinsicInst>(FrontU);
++      } else if (auto *II = dyn_cast<IntrinsicInst>(FrontV);
+                  II && isTriviallyVectorizable(II->getIntrinsicID()) &&
+                  !II->hasOperandBundles()) {
+         for (unsigned Op = 0, E = II->getNumOperands() - 1; Op < E; Op++) {
+           if (isVectorIntrinsicWithScalarOpAtArg(II->getIntrinsicID(), Op,
+                                                  &TTI)) {
+             if (!all_of(drop_begin(Item), [Item, Op](InstLane &IL) {
+-                  Value *FrontV = Item.front().first->get();
+-                  Use *U = IL.first;
+-                  return !U || (cast<Instruction>(U->get())->getOperand(Op) ==
++                  Value *FrontV = Item.front().first;
++                  Value *V = IL.first;
++                  return !V || (cast<Instruction>(V)->getOperand(Op) ==
+                                 cast<Instruction>(FrontV)->getOperand(Op));
+                 }))
+               return false;
+             continue;
+           }
+-          Worklist.push_back(generateInstLaneVectorFromOperand(Item, Op));
++          Worklist.emplace_back(generateInstLaneVectorFromOperand(Item, Op),
++                                &cast<Instruction>(FrontV)->getOperandUse(Op));
+         }
+         continue;
+       }
+     }
+ 
+     if (isFreeConcat(Item, CostKind, TTI)) {
+-      ConcatLeafs.insert(FrontU);
++      ConcatLeafs.insert(std::make_pair(FrontV, From));
+       continue;
+     }
+ 
+@@ -2479,8 +2488,8 @@ bool VectorCombine::foldShuffleToIdentity(Instruction &I) {
+   // If we got this far, we know the shuffles are superfluous and can be
+   // removed. Scan through again and generate the new tree of instructions.
+   Builder.SetInsertPoint(&I);
+-  Value *V = generateNewInstTree(Start, Ty, IdentityLeafs, SplatLeafs,
+-                                 ConcatLeafs, Builder, &TTI);
++  Value *V = generateNewInstTree(Start, &*I.use_begin(), Ty, IdentityLeafs,
++                                 SplatLeafs, ConcatLeafs, Builder, &TTI);
+   replaceValue(I, *V);
+   return true;
+ }
+diff --git a/llvm/test/Transforms/VectorCombine/AArch64/shuffletoidentity.ll b/llvm/test/Transforms/VectorCombine/AArch64/shuffletoidentity.ll
+index 09875c5e0af40..c11a5fc6648ce 100644
+--- a/llvm/test/Transforms/VectorCombine/AArch64/shuffletoidentity.ll
++++ b/llvm/test/Transforms/VectorCombine/AArch64/shuffletoidentity.ll
+@@ -1226,5 +1226,137 @@ define <32 x half> @cast_types(<32 x i16> %wide.vec) {
+   ret <32 x half> %interleaved.vec
+ }
+ 
++define i32 @shuffle_different_lanes(<2 x i64> %0) {
++; CHECK-LABEL: @shuffle_different_lanes(
++; CHECK-NEXT:  entry:
++; CHECK-NEXT:    [[SHUFFLE:%.*]] = shufflevector <2 x i64> [[TMP0:%.*]], <2 x i64> poison, <4 x i32> <i32 0, i32 0, i32 1, i32 1>
++; CHECK-NEXT:    [[CONV:%.*]] = trunc <4 x i64> [[SHUFFLE]] to <4 x i16>
++; CHECK-NEXT:    [[VECINIT4_I:%.*]] = shufflevector <4 x i16> [[CONV]], <4 x i16> poison, <4 x i32> <i32 2, i32 poison, i32 2, i32 poison>
++; CHECK-NEXT:    [[SUB_I:%.*]] = sub <4 x i16> [[CONV]], [[VECINIT4_I]]
++; CHECK-NEXT:    [[SHUFFLE_I:%.*]] = shufflevector <4 x i16> [[SUB_I]], <4 x i16> poison, <2 x i32> <i32 0, i32 2>
++; CHECK-NEXT:    [[TMP3:%.*]] = bitcast <2 x i16> [[SHUFFLE_I]] to i32
++; CHECK-NEXT:    ret i32 [[TMP3]]
++;
++entry:
++  %shuffle = shufflevector <2 x i64> %0, <2 x i64> poison, <4 x i32> <i32 0, i32 0, i32 1, i32 1>
++  %conv = trunc <4 x i64> %shuffle to <4 x i16>
++  %vecinit4.i = shufflevector <4 x i16> %conv, <4 x i16> poison, <4 x i32> <i32 2, i32 poison, i32 2, i32 poison>
++  %sub.i = sub <4 x i16> %conv, %vecinit4.i
++  %shuffle.i = shufflevector <4 x i16> %sub.i, <4 x i16> poison, <2 x i32> <i32 0, i32 2>
++  %1 = bitcast <2 x i16> %shuffle.i to i32
++  ret i32 %1
++}
++
++define <48 x i8> @concat_splats(<64 x i8> %wide.vec, <64 x i8> %wide.vec117) {
++; CHECK-LABEL: @concat_splats(
++; CHECK-NEXT:    [[STRIDED_VEC:%.*]] = shufflevector <64 x i8> [[WIDE_VEC:%.*]], <64 x i8> poison, <16 x i32> <i32 0, i32 4, i32 8, i32 12, i32 16, i32 20, i32 24, i32 28, i32 32, i32 36, i32 40, i32 44, i32 48, i32 52, i32 56, i32 60>
++; CHECK-NEXT:    [[STRIDED_VEC114:%.*]] = shufflevector <64 x i8> [[WIDE_VEC]], <64 x i8> poison, <16 x i32> <i32 1, i32 5, i32 9, i32 13, i32 17, i32 21, i32 25, i32 29, i32 33, i32 37, i32 41, i32 45, i32 49, i32 53, i32 57, i32 61>
++; CHECK-NEXT:    [[STRIDED_VEC115:%.*]] = shufflevector <64 x i8> [[WIDE_VEC]], <64 x i8> poison, <16 x i32> <i32 2, i32 6, i32 10, i32 14, i32 18, i32 22, i32 26, i32 30, i32 34, i32 38, i32 42, i32 46, i32 50, i32 54, i32 58, i32 62>
++; CHECK-NEXT:    [[STRIDED_VEC116:%.*]] = shufflevector <64 x i8> [[WIDE_VEC]], <64 x i8> poison, <16 x i32> <i32 3, i32 7, i32 11, i32 15, i32 19, i32 23, i32 27, i32 31, i32 35, i32 39, i32 43, i32 47, i32 51, i32 55, i32 59, i32 63>
++; CHECK-NEXT:    [[TMP1:%.*]] = zext <16 x i8> [[STRIDED_VEC]] to <16 x i32>
++; CHECK-NEXT:    [[TMP2:%.*]] = mul nuw nsw <16 x i32> [[TMP1]], splat (i32 3)
++; CHECK-NEXT:    [[TMP3:%.*]] = zext <16 x i8> [[STRIDED_VEC114]] to <16 x i32>
++; CHECK-NEXT:    [[TMP4:%.*]] = zext <16 x i8> [[STRIDED_VEC115]] to <16 x i32>
++; CHECK-NEXT:    [[TMP5:%.*]] = zext <16 x i8> [[STRIDED_VEC116]] to <16 x i32>
++; CHECK-NEXT:    [[TMP6:%.*]] = mul nuw nsw <16 x i32> [[TMP5]], splat (i32 3)
++; CHECK-NEXT:    [[TMP7:%.*]] = add nuw nsw <16 x i32> [[TMP4]], splat (i32 2)
++; CHECK-NEXT:    [[TMP8:%.*]] = add nuw nsw <16 x i32> [[TMP7]], [[TMP6]]
++; CHECK-NEXT:    [[TMP9:%.*]] = lshr <16 x i32> [[TMP8]], splat (i32 2)
++; CHECK-NEXT:    [[STRIDED_VEC118:%.*]] = shufflevector <64 x i8> [[WIDE_VEC117:%.*]], <64 x i8> poison, <16 x i32> <i32 0, i32 4, i32 8, i32 12, i32 16, i32 20, i32 24, i32 28, i32 32, i32 36, i32 40, i32 44, i32 48, i32 52, i32 56, i32 60>
++; CHECK-NEXT:    [[STRIDED_VEC119:%.*]] = shufflevector <64 x i8> [[WIDE_VEC117]], <64 x i8> poison, <16 x i32> <i32 1, i32 5, i32 9, i32 13, i32 17, i32 21, i32 25, i32 29, i32 33, i32 37, i32 41, i32 45, i32 49, i32 53, i32 57, i32 61>
++; CHECK-NEXT:    [[STRIDED_VEC120:%.*]] = shufflevector <64 x i8> [[WIDE_VEC117]], <64 x i8> poison, <16 x i32> <i32 2, i32 6, i32 10, i32 14, i32 18, i32 22, i32 26, i32 30, i32 34, i32 38, i32 42, i32 46, i32 50, i32 54, i32 58, i32 62>
++; CHECK-NEXT:    [[STRIDED_VEC121:%.*]] = shufflevector <64 x i8> [[WIDE_VEC117]], <64 x i8> poison, <16 x i32> <i32 3, i32 7, i32 11, i32 15, i32 19, i32 23, i32 27, i32 31, i32 35, i32 39, i32 43, i32 47, i32 51, i32 55, i32 59, i32 63>
++; CHECK-NEXT:    [[TMP10:%.*]] = zext <16 x i8> [[STRIDED_VEC118]] to <16 x i32>
++; CHECK-NEXT:    [[TMP11:%.*]] = mul nuw nsw <16 x i32> [[TMP10]], splat (i32 3)
++; CHECK-NEXT:    [[TMP12:%.*]] = zext <16 x i8> [[STRIDED_VEC119]] to <16 x i32>
++; CHECK-NEXT:    [[TMP13:%.*]] = zext <16 x i8> [[STRIDED_VEC120]] to <16 x i32>
++; CHECK-NEXT:    [[TMP14:%.*]] = zext <16 x i8> [[STRIDED_VEC121]] to <16 x i32>
++; CHECK-NEXT:    [[TMP15:%.*]] = mul nuw nsw <16 x i32> [[TMP14]], splat (i32 3)
++; CHECK-NEXT:    [[TMP16:%.*]] = add nuw nsw <16 x i32> [[TMP13]], splat (i32 2)
++; CHECK-NEXT:    [[TMP17:%.*]] = add nuw nsw <16 x i32> [[TMP16]], [[TMP15]]
++; CHECK-NEXT:    [[TMP18:%.*]] = lshr <16 x i32> [[TMP17]], splat (i32 2)
++; CHECK-NEXT:    [[TMP19:%.*]] = mul nuw nsw <16 x i32> [[TMP9]], splat (i32 3)
++; CHECK-NEXT:    [[TMP20:%.*]] = add nuw nsw <16 x i32> [[TMP19]], splat (i32 2)
++; CHECK-NEXT:    [[TMP21:%.*]] = add nuw nsw <16 x i32> [[TMP20]], [[TMP18]]
++; CHECK-NEXT:    [[TMP22:%.*]] = lshr <16 x i32> [[TMP21]], splat (i32 2)
++; CHECK-NEXT:    [[TMP23:%.*]] = trunc nuw <16 x i32> [[TMP22]] to <16 x i8>
++; CHECK-NEXT:    [[TMP24:%.*]] = shufflevector <16 x i32> [[TMP3]], <16 x i32> [[TMP3]], <32 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31>
++; CHECK-NEXT:    [[TMP25:%.*]] = add nuw nsw <32 x i32> [[TMP24]], <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1>
++; CHECK-NEXT:    [[TMP26:%.*]] = shufflevector <16 x i32> [[TMP2]], <16 x i32> [[TMP4]], <32 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31>
++; CHECK-NEXT:    [[TMP27:%.*]] = add nuw nsw <32 x i32> [[TMP25]], [[TMP26]]
++; CHECK-NEXT:    [[TMP28:%.*]] = lshr <32 x i32> [[TMP27]], <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1>
++; CHECK-NEXT:    [[TMP29:%.*]] = mul nuw nsw <32 x i32> [[TMP28]], splat (i32 3)
++; CHECK-NEXT:    [[TMP30:%.*]] = add nuw nsw <32 x i32> [[TMP29]], splat (i32 2)
++; CHECK-NEXT:    [[TMP31:%.*]] = shufflevector <16 x i32> [[TMP12]], <16 x i32> [[TMP12]], <32 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31>
++; CHECK-NEXT:    [[TMP32:%.*]] = add nuw nsw <32 x i32> [[TMP31]], <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1>
++; CHECK-NEXT:    [[TMP33:%.*]] = shufflevector <16 x i32> [[TMP11]], <16 x i32> [[TMP13]], <32 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31>
++; CHECK-NEXT:    [[TMP34:%.*]] = add nuw nsw <32 x i32> [[TMP32]], [[TMP33]]
++; CHECK-NEXT:    [[TMP35:%.*]] = lshr <32 x i32> [[TMP34]], <i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 2, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1>
++; CHECK-NEXT:    [[TMP36:%.*]] = add nuw nsw <32 x i32> [[TMP30]], [[TMP35]]
++; CHECK-NEXT:    [[TMP37:%.*]] = lshr <32 x i32> [[TMP36]], splat (i32 2)
++; CHECK-NEXT:    [[TMP38:%.*]] = trunc nuw <32 x i32> [[TMP37]] to <32 x i8>
++; CHECK-NEXT:    [[TMP39:%.*]] = shufflevector <16 x i8> [[TMP23]], <16 x i8> poison, <32 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison>
++; CHECK-NEXT:    [[INTERLEAVED_VEC:%.*]] = shufflevector <32 x i8> [[TMP38]], <32 x i8> [[TMP39]], <48 x i32> <i32 0, i32 16, i32 32, i32 1, i32 17, i32 33, i32 2, i32 18, i32 34, i32 3, i32 19, i32 35, i32 4, i32 20, i32 36, i32 5, i32 21, i32 37, i32 6, i32 22, i32 38, i32 7, i32 23, i32 39, i32 8, i32 24, i32 40, i32 9, i32 25, i32 41, i32 10, i32 26, i32 42, i32 11, i32 27, i32 43, i32 12, i32 28, i32 44, i32 13, i32 29, i32 45, i32 14, i32 30, i32 46, i32 15, i32 31, i32 47>
++; CHECK-NEXT:    ret <48 x i8> [[INTERLEAVED_VEC]]
++;
++  %strided.vec = shufflevector <64 x i8> %wide.vec, <64 x i8> poison, <16 x i32> <i32 0, i32 4, i32 8, i32 12, i32 16, i32 20, i32 24, i32 28, i32 32, i32 36, i32 40, i32 44, i32 48, i32 52, i32 56, i32 60>
++  %strided.vec114 = shufflevector <64 x i8> %wide.vec, <64 x i8> poison, <16 x i32> <i32 1, i32 5, i32 9, i32 13, i32 17, i32 21, i32 25, i32 29, i32 33, i32 37, i32 41, i32 45, i32 49, i32 53, i32 57, i32 61>
++  %strided.vec115 = shufflevector <64 x i8> %wide.vec, <64 x i8> poison, <16 x i32> <i32 2, i32 6, i32 10, i32 14, i32 18, i32 22, i32 26, i32 30, i32 34, i32 38, i32 42, i32 46, i32 50, i32 54, i32 58, i32 62>
++  %strided.vec116 = shufflevector <64 x i8> %wide.vec, <64 x i8> poison, <16 x i32> <i32 3, i32 7, i32 11, i32 15, i32 19, i32 23, i32 27, i32 31, i32 35, i32 39, i32 43, i32 47, i32 51, i32 55, i32 59, i32 63>
++  %22 = zext <16 x i8> %strided.vec to <16 x i32>
++  %23 = mul nuw nsw <16 x i32> %22, splat (i32 3)
++  %24 = zext <16 x i8> %strided.vec114 to <16 x i32>
++  %25 = add nuw nsw <16 x i32> %24, splat (i32 2)
++  %26 = add nuw nsw <16 x i32> %25, %23
++  %27 = lshr <16 x i32> %26, splat (i32 2)
++  %28 = zext <16 x i8> %strided.vec115 to <16 x i32>
++  %29 = add nuw nsw <16 x i32> %24, splat (i32 1)
++  %30 = add nuw nsw <16 x i32> %29, %28
++  %31 = lshr <16 x i32> %30, splat (i32 1)
++  %32 = zext <16 x i8> %strided.vec116 to <16 x i32>
++  %33 = mul nuw nsw <16 x i32> %32, splat (i32 3)
++  %34 = add nuw nsw <16 x i32> %28, splat (i32 2)
++  %35 = add nuw nsw <16 x i32> %34, %33
++  %36 = lshr <16 x i32> %35, splat (i32 2)
++  %strided.vec118 = shufflevector <64 x i8> %wide.vec117, <64 x i8> poison, <16 x i32> <i32 0, i32 4, i32 8, i32 12, i32 16, i32 20, i32 24, i32 28, i32 32, i32 36, i32 40, i32 44, i32 48, i32 52, i32 56, i32 60>
++  %strided.vec119 = shufflevector <64 x i8> %wide.vec117, <64 x i8> poison, <16 x i32> <i32 1, i32 5, i32 9, i32 13, i32 17, i32 21, i32 25, i32 29, i32 33, i32 37, i32 41, i32 45, i32 49, i32 53, i32 57, i32 61>
++  %strided.vec120 = shufflevector <64 x i8> %wide.vec117, <64 x i8> poison, <16 x i32> <i32 2, i32 6, i32 10, i32 14, i32 18, i32 22, i32 26, i32 30, i32 34, i32 38, i32 42, i32 46, i32 50, i32 54, i32 58, i32 62>
++  %strided.vec121 = shufflevector <64 x i8> %wide.vec117, <64 x i8> poison, <16 x i32> <i32 3, i32 7, i32 11, i32 15, i32 19, i32 23, i32 27, i32 31, i32 35, i32 39, i32 43, i32 47, i32 51, i32 55, i32 59, i32 63>
++  %37 = zext <16 x i8> %strided.vec118 to <16 x i32>
++  %38 = mul nuw nsw <16 x i32> %37, splat (i32 3)
++  %39 = zext <16 x i8> %strided.vec119 to <16 x i32>
++  %40 = add nuw nsw <16 x i32> %39, splat (i32 2)
++  %41 = add nuw nsw <16 x i32> %40, %38
++  %42 = lshr <16 x i32> %41, splat (i32 2)
++  %43 = zext <16 x i8> %strided.vec120 to <16 x i32>
++  %44 = add nuw nsw <16 x i32> %39, splat (i32 1)
++  %45 = add nuw nsw <16 x i32> %44, %43
++  %46 = lshr <16 x i32> %45, splat (i32 1)
++  %47 = zext <16 x i8> %strided.vec121 to <16 x i32>
++  %48 = mul nuw nsw <16 x i32> %47, splat (i32 3)
++  %49 = add nuw nsw <16 x i32> %43, splat (i32 2)
++  %50 = add nuw nsw <16 x i32> %49, %48
++  %51 = lshr <16 x i32> %50, splat (i32 2)
++  %52 = mul nuw nsw <16 x i32> %27, splat (i32 3)
++  %53 = add nuw nsw <16 x i32> %52, splat (i32 2)
++  %54 = add nuw nsw <16 x i32> %53, %42
++  %55 = lshr <16 x i32> %54, splat (i32 2)
++  %56 = trunc nuw <16 x i32> %55 to <16 x i8>
++  %57 = mul nuw nsw <16 x i32> %31, splat (i32 3)
++  %58 = add nuw nsw <16 x i32> %57, splat (i32 2)
++  %59 = add nuw nsw <16 x i32> %58, %46
++  %60 = lshr <16 x i32> %59, splat (i32 2)
++  %61 = trunc nuw <16 x i32> %60 to <16 x i8>
++  %62 = mul nuw nsw <16 x i32> %36, splat (i32 3)
++  %63 = add nuw nsw <16 x i32> %62, splat (i32 2)
++  %64 = add nuw nsw <16 x i32> %63, %51
++  %65 = lshr <16 x i32> %64, splat (i32 2)
++  %66 = trunc nuw <16 x i32> %65 to <16 x i8>
++  %67 = shufflevector <16 x i8> %56, <16 x i8> %61, <32 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 16, i32 17, i32 18, i32 19, i32 20, i32 21, i32 22, i32 23, i32 24, i32 25, i32 26, i32 27, i32 28, i32 29, i32 30, i32 31>
++  %68 = shufflevector <16 x i8> %66, <16 x i8> poison, <32 x i32> <i32 0, i32 1, i32 2, i32 3, i32 4, i32 5, i32 6, i32 7, i32 8, i32 9, i32 10, i32 11, i32 12, i32 13, i32 14, i32 15, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison, i32 poison>
++  %interleaved.vec = shufflevector <32 x i8> %67, <32 x i8> %68, <48 x i32> <i32 0, i32 16, i32 32, i32 1, i32 17, i32 33, i32 2, i32 18, i32 34, i32 3, i32 19, i32 35, i32 4, i32 20, i32 36, i32 5, i32 21, i32 37, i32 6, i32 22, i32 38, i32 7, i32 23, i32 39, i32 8, i32 24, i32 40, i32 9, i32 25, i32 41, i32 10, i32 26, i32 42, i32 11, i32 27, i32 43, i32 12, i32 28, i32 44, i32 13, i32 29, i32 45, i32 14, i32 30, i32 46, i32 15, i32 31, i32 47>
++  ret <48 x i8> %interleaved.vec
++}
++
+ declare <4 x i64> @llvm.fshl.v4i64(<4 x i64>, <4 x i64>, <4 x i64>)
+ declare void @use(<4 x i8>)
+
+From f391048978428f629edbcd9f372705eb91a44c55 Mon Sep 17 00:00:00 2001
+From: Jason Hafer <jhafer@mathworks.com>
+Date: Fri, 3 Apr 2026 09:59:06 -0400
+Subject: [PATCH 16/19] [InstCombine] Add user-count bailout to
+ isAllocSiteRemovable
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+isAllocSiteRemovable() walks all transitive users of an allocation site, but sites with many users are almost never removable. Bail out after visiting 2048 users, and defer WeakTrackingVH conversion until the site is known to be removable.
+
+This backports llvm/llvm-project#190347 to release/20.x. The port keeps this branch’s bool-returning isAllocSiteRemovable signature and indexed Users loop.
+
+(cherry picked from commit 34a80c90e815c4b77cb963489618ba24528ea0cc, resolving conflicts against release/20.x)
+
+Fixes JuliaLang/julia#60313.
+---
+ .../InstCombine/InstructionCombining.cpp      | 19 +++++++++++---
+ .../allocsite-removable-few-users.ll          | 25 +++++++++++++++++++
+ 2 files changed, 41 insertions(+), 3 deletions(-)
+ create mode 100644 llvm/test/Transforms/InstCombine/allocsite-removable-few-users.ll
+
+diff --git a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp
+index 0f5e867877da2..575d6da4d9ae5 100644
+--- a/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp
++++ b/llvm/lib/Transforms/InstCombine/InstructionCombining.cpp
+@@ -142,6 +142,11 @@ static cl::opt<unsigned>
+ MaxArraySize("instcombine-maxarray-size", cl::init(1024),
+              cl::desc("Maximum array size considered when doing a combine"));
+ 
++static cl::opt<unsigned> MaxAllocSiteRemovableUsers(
++    "instcombine-max-allocsite-removable-users", cl::Hidden, cl::init(2048),
++    cl::desc("Maximum number of users to visit in alloc-site "
++             "removability analysis"));
++
+ // FIXME: Remove this flag when it is no longer necessary to convert
+ // llvm.dbg.declare to avoid inaccurate debug info. Setting this to false
+ // increases variable availability at the cost of accuracy. Variables that
+@@ -3214,7 +3219,7 @@ static bool isRemovableWrite(CallBase &CB, Value *UsedV,
+ }
+ 
+ static bool isAllocSiteRemovable(Instruction *AI,
+-                                 SmallVectorImpl<WeakTrackingVH> &Users,
++                                 SmallVectorImpl<Instruction *> &Users,
+                                  const TargetLibraryInfo &TLI) {
+   SmallVector<Instruction*, 4> Worklist;
+   const std::optional<StringRef> Family = getAllocationFamily(AI, &TLI);
+@@ -3224,6 +3229,8 @@ static bool isAllocSiteRemovable(Instruction *AI,
+     Instruction *PI = Worklist.pop_back_val();
+     for (User *U : PI->users()) {
+       Instruction *I = cast<Instruction>(U);
++      if (Users.size() >= MaxAllocSiteRemovableUsers)
++        return false;
+       switch (I->getOpcode()) {
+       default:
+         // Give up the moment we see something we can't handle.
+@@ -3350,7 +3357,11 @@ Instruction *InstCombinerImpl::visitAllocSite(Instruction &MI) {
+   // outputs of a program (when we convert a malloc to an alloca, the fact that
+   // the allocation is now on the stack is potentially visible, for example),
+   // but we believe in a permissible manner.
+-  SmallVector<WeakTrackingVH, 64> Users;
++  //
++  // Collect into Instruction* first to avoid expensive WeakTrackingVH
++  // register/unregister overhead; convert to WeakTrackingVH only when the
++  // site is actually removable.
++  SmallVector<Instruction *, 64> RawUsers;
+ 
+   // If we are removing an alloca with a dbg.declare, insert dbg.value calls
+   // before each store.
+@@ -3362,7 +3373,9 @@ Instruction *InstCombinerImpl::visitAllocSite(Instruction &MI) {
+     DIB.reset(new DIBuilder(*MI.getModule(), /*AllowUnresolved=*/false));
+   }
+ 
+-  if (isAllocSiteRemovable(&MI, Users, TLI)) {
++  bool Removable = isAllocSiteRemovable(&MI, RawUsers, TLI);
++  if (Removable) {
++    SmallVector<WeakTrackingVH, 64> Users(RawUsers.begin(), RawUsers.end());
+     for (unsigned i = 0, e = Users.size(); i != e; ++i) {
+       // Lowering all @llvm.objectsize calls first because they may
+       // use a bitcast/GEP of the alloca we are removing.
+diff --git a/llvm/test/Transforms/InstCombine/allocsite-removable-few-users.ll b/llvm/test/Transforms/InstCombine/allocsite-removable-few-users.ll
+new file mode 100644
+index 0000000000000..14f0940b182a7
+--- /dev/null
++++ b/llvm/test/Transforms/InstCombine/allocsite-removable-few-users.ll
+@@ -0,0 +1,25 @@
++; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
++; RUN: opt -passes=instcombine -S < %s | FileCheck %s --check-prefix=OPT
++; RUN: opt -passes=instcombine -instcombine-max-allocsite-removable-users=1 -S < %s | FileCheck %s --check-prefix=NOOPT
++
++; Test that alloca with few users is still removed by
++; isAllocSiteRemovable (not blocked by user-count bailout).
++; With a threshold of 1, the alloca is not removed.
++define i32 @test_few_users_still_removed() {
++; OPT-LABEL: @test_few_users_still_removed(
++; OPT-NEXT:    ret i32 0
++;
++; NOOPT-LABEL: @test_few_users_still_removed(
++; NOOPT-NEXT:    [[A:%.*]] = alloca [4 x i8], align 1
++; NOOPT-NEXT:    [[P1:%.*]] = getelementptr inbounds nuw i8, ptr [[A]], i64 1
++; NOOPT-NEXT:    store i8 0, ptr [[A]], align 1
++; NOOPT-NEXT:    store i8 1, ptr [[P1]], align 1
++; NOOPT-NEXT:    ret i32 0
++;
++  %a = alloca [4 x i8], align 1
++  %p0 = getelementptr inbounds [4 x i8], ptr %a, i64 0, i64 0
++  %p1 = getelementptr inbounds [4 x i8], ptr %a, i64 0, i64 1
++  store i8 0, ptr %p0, align 1
++  store i8 1, ptr %p1, align 1
++  ret i32 0
++}
+
+From e27b78b90025363b8d526f79e914534a8a8ceb6b Mon Sep 17 00:00:00 2001
+From: Tim Besard <tim.besard@gmail.com>
+Date: Mon, 17 Aug 2026 15:56:39 +0200
+Subject: [PATCH 17/19] [SROA] Reject illegal vector memset promotion
+
+Vector promotion rewrites a memset byte pattern through an integer splat.
+Reject promotion when the integer cannot be converted to the vector element
+type, as with non-integral pointers.
+
+This backports llvm/llvm-project#216772 (not yet merged upstream). Needed by
+Julia, whose GC-tracked pointers live in the non-integral address space 10;
+SROA would otherwise assert in convertValue ("Value not convertable to type").
+
+The port drops the VScale argument to canConvertValue, which release/20.x
+does not have yet.
+
+Assisted-by: Codex (GPT-5)
+Signed-off-by: Tim Besard <tim.besard@gmail.com>
+---
+ llvm/lib/Transforms/Scalar/SROA.cpp           |  5 +++++
+ .../non-integral-pointer-vector-memset.ll     | 21 +++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+ create mode 100644 llvm/test/Transforms/SROA/non-integral-pointer-vector-memset.ll
+
+diff --git a/llvm/lib/Transforms/Scalar/SROA.cpp b/llvm/lib/Transforms/Scalar/SROA.cpp
+index e88c130cccf20..3b4db29e040b9 100644
+--- a/llvm/lib/Transforms/Scalar/SROA.cpp
++++ b/llvm/lib/Transforms/Scalar/SROA.cpp
+@@ -2074,6 +2074,11 @@ static bool isVectorPromotionViableForSlice(Partition &P, const Slice &S,
+       return false;
+     if (!S.isSplittable())
+       return false; // Skip any unsplittable intrinsics.
++    if (isa<MemSetInst>(MI)) {
++      Type *SplatTy = Type::getIntNTy(Ty->getContext(), ElementSize * 8);
++      if (!canConvertValue(DL, SplatTy, Ty->getElementType()))
++        return false;
++    }
+   } else if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(U->getUser())) {
+     if (!II->isLifetimeStartOrEnd() && !II->isDroppable())
+       return false;
+diff --git a/llvm/test/Transforms/SROA/non-integral-pointer-vector-memset.ll b/llvm/test/Transforms/SROA/non-integral-pointer-vector-memset.ll
+new file mode 100644
+index 0000000000000..9cba9b4ef1eea
+--- /dev/null
++++ b/llvm/test/Transforms/SROA/non-integral-pointer-vector-memset.ll
+@@ -0,0 +1,21 @@
++; RUN: opt -passes=sroa -S %s | FileCheck %s
++
++; Do not convert a memset byte pattern to a non-integral pointer when
++; vector-promoting an alloca partition.
++
++; CHECK-LABEL: define <2 x ptr addrspace(10)> @vector_memset(
++; CHECK-NOT: inttoptr
++; CHECK-NOT: ptrtoint
++
++target datalayout = "e-ni:10"
++
++declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
++
++define <2 x ptr addrspace(10)> @vector_memset(<2 x ptr addrspace(10)> %v, i8 %byte) {
++  %a = alloca [2 x ptr addrspace(10)], align 8
++  store <2 x ptr addrspace(10)> %v, ptr %a, align 8
++  %p = getelementptr inbounds i8, ptr %a, i64 8
++  call void @llvm.memset.p0.i64(ptr %p, i8 %byte, i64 8, i1 false)
++  %r = load <2 x ptr addrspace(10)>, ptr %a, align 8
++  ret <2 x ptr addrspace(10)> %r
++}
+
+From de9eb4ef5ea7dd2b6201c9ded55692fb5caa7cbe Mon Sep 17 00:00:00 2001
+From: azwolski <antoni.zwolski@intel.com>
+Date: Mon, 22 Sep 2025 12:47:08 +0200
+Subject: [PATCH 18/19] [X86] Baseline test for "invalid operand order for fp16
+ vector comparison" issue (#159786)
+
+Despite the difference in the order of fcmp operands, `%lhs, %rhs` and`%rhs, %lhs`, generated assembly remains the same.
+
+This is a baseline test for #159723
+
+(cherry picked from commit ab766861956e43aa138aa97e34edace57bebfa89)
+---
+ llvm/test/CodeGen/X86/pr159723.ll | 131 ++++++++++++++++++++++++++++++
+ 1 file changed, 131 insertions(+)
+ create mode 100644 llvm/test/CodeGen/X86/pr159723.ll
+
+diff --git a/llvm/test/CodeGen/X86/pr159723.ll b/llvm/test/CodeGen/X86/pr159723.ll
+new file mode 100644
+index 0000000000000..cab4abb043639
+--- /dev/null
++++ b/llvm/test/CodeGen/X86/pr159723.ll
+@@ -0,0 +1,131 @@
++; NOTE: Assertions have been autogenerated by utils/update_llc_test_checks.py
++; RUN: llc < %s -mtriple=x86_64-unknown-unknown -mattr=+avx512fp16,+avx512vl| FileCheck %s
++
++declare <8 x half> @test_call_8()
++
++declare <16 x half> @test_call_16()
++
++declare <32 x half> @test_call_32()
++
++define <8 x i1> @test_cmp_v8half_ogt(<8 x half> %rhs, <8 x i1> %mask) nounwind {
++; CHECK-LABEL: test_cmp_v8half_ogt:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:    subq $40, %rsp
++; CHECK-NEXT:    vmovaps %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    vpsllw $15, %xmm1, %xmm0
++; CHECK-NEXT:    vpmovw2m %xmm0, %k1
++; CHECK-NEXT:    kmovw %k1, {{[-0-9]+}}(%r{{[sb]}}p) # 2-byte Spill
++; CHECK-NEXT:    callq test_call_8@PLT
++; CHECK-NEXT:    kmovw {{[-0-9]+}}(%r{{[sb]}}p), %k1 # 2-byte Reload
++; CHECK-NEXT:    vcmpltph {{[-0-9]+}}(%r{{[sb]}}p), %xmm0, %k0 {%k1} # 16-byte Folded Reload
++; CHECK-NEXT:    vpmovm2w %k0, %xmm0
++; CHECK-NEXT:    addq $40, %rsp
++; CHECK-NEXT:    retq
++    %lhs = call <8 x half> @test_call_8()
++    %comp = fcmp ogt <8 x half> %lhs, %rhs
++    %res = and <8 x i1> %comp, %mask
++    ret <8 x i1> %res
++}
++
++define <8 x i1> @test_cmp_v8half_ogt_commute(<8 x half> %rhs, <8 x i1> %mask) nounwind {
++; CHECK-LABEL: test_cmp_v8half_ogt_commute:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:    subq $40, %rsp
++; CHECK-NEXT:    vmovaps %xmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 16-byte Spill
++; CHECK-NEXT:    vpsllw $15, %xmm1, %xmm0
++; CHECK-NEXT:    vpmovw2m %xmm0, %k1
++; CHECK-NEXT:    kmovw %k1, {{[-0-9]+}}(%r{{[sb]}}p) # 2-byte Spill
++; CHECK-NEXT:    callq test_call_8@PLT
++; CHECK-NEXT:    kmovw {{[-0-9]+}}(%r{{[sb]}}p), %k1 # 2-byte Reload
++; CHECK-NEXT:    vcmpltph {{[-0-9]+}}(%r{{[sb]}}p), %xmm0, %k0 {%k1} # 16-byte Folded Reload
++; CHECK-NEXT:    vpmovm2w %k0, %xmm0
++; CHECK-NEXT:    addq $40, %rsp
++; CHECK-NEXT:    retq
++    %lhs = call <8 x half> @test_call_8()
++    %comp = fcmp ogt <8 x half> %rhs, %lhs
++    %res = and <8 x i1> %comp, %mask
++    ret <8 x i1> %res
++}
++
++
++define <16 x i1> @test_cmp_v16half_olt(<16 x half> %rhs, <16 x i1> %mask) nounwind {
++; CHECK-LABEL: test_cmp_v16half_olt:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:    subq $56, %rsp
++; CHECK-NEXT:    vmovups %ymm0, {{[-0-9]+}}(%r{{[sb]}}p) # 32-byte Spill
++; CHECK-NEXT:    vpsllw $7, %xmm1, %xmm0
++; CHECK-NEXT:    vpmovb2m %xmm0, %k1
++; CHECK-NEXT:    kmovw %k1, {{[-0-9]+}}(%r{{[sb]}}p) # 2-byte Spill
++; CHECK-NEXT:    callq test_call_16@PLT
++; CHECK-NEXT:    kmovw {{[-0-9]+}}(%r{{[sb]}}p), %k1 # 2-byte Reload
++; CHECK-NEXT:    vcmpltph {{[-0-9]+}}(%r{{[sb]}}p), %ymm0, %k0 {%k1} # 32-byte Folded Reload
++; CHECK-NEXT:    vpmovm2b %k0, %xmm0
++; CHECK-NEXT:    addq $56, %rsp
++; CHECK-NEXT:    vzeroupper
++; CHECK-NEXT:    retq
++    %lhs = call <16 x half> @test_call_16()
++    %comp = fcmp olt <16 x half> %lhs, %rhs
++    %res = and <16 x i1> %comp, %mask
++    ret <16 x i1> %res
++}
++
++define <16 x i1> @test_cmp_v16half_olt_commute(<16 x half> %rhs, <16 x i1> %mask) nounwind {
++; CHECK-LABEL: test_cmp_v16half_olt_commute:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:    subq $56, %rsp
++; CHECK-NEXT:    vmovups %ymm0, {{[-0-9]+}}(%r{{[sb]}}p) # 32-byte Spill
++; CHECK-NEXT:    vpsllw $7, %xmm1, %xmm0
++; CHECK-NEXT:    vpmovb2m %xmm0, %k1
++; CHECK-NEXT:    kmovw %k1, {{[-0-9]+}}(%r{{[sb]}}p) # 2-byte Spill
++; CHECK-NEXT:    callq test_call_16@PLT
++; CHECK-NEXT:    kmovw {{[-0-9]+}}(%r{{[sb]}}p), %k1 # 2-byte Reload
++; CHECK-NEXT:    vcmpltph {{[-0-9]+}}(%r{{[sb]}}p), %ymm0, %k0 {%k1} # 32-byte Folded Reload
++; CHECK-NEXT:    vpmovm2b %k0, %xmm0
++; CHECK-NEXT:    addq $56, %rsp
++; CHECK-NEXT:    vzeroupper
++; CHECK-NEXT:    retq
++    %lhs = call <16 x half> @test_call_16()
++    %comp = fcmp olt <16 x half> %rhs, %lhs
++    %res = and <16 x i1> %comp, %mask
++    ret <16 x i1> %res
++}
++
++define <32 x i1> @test_cmp_v32half_oge(<32 x half> %rhs, <32 x i1> %mask) nounwind {
++; CHECK-LABEL: test_cmp_v32half_oge:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:    subq $88, %rsp
++; CHECK-NEXT:    vmovups %zmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 64-byte Spill
++; CHECK-NEXT:    vpsllw $7, %ymm1, %ymm0
++; CHECK-NEXT:    vpmovb2m %ymm0, %k1
++; CHECK-NEXT:    kmovd %k1, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    callq test_call_32@PLT
++; CHECK-NEXT:    kmovd {{[-0-9]+}}(%r{{[sb]}}p), %k1 # 4-byte Reload
++; CHECK-NEXT:    vcmpleph {{[-0-9]+}}(%r{{[sb]}}p), %zmm0, %k0 {%k1} # 64-byte Folded Reload
++; CHECK-NEXT:    vpmovm2b %k0, %ymm0
++; CHECK-NEXT:    addq $88, %rsp
++; CHECK-NEXT:    retq
++    %lhs = call <32 x half> @test_call_32()
++    %comp = fcmp oge <32 x half> %lhs, %rhs
++    %res = and <32 x i1> %comp, %mask
++    ret <32 x i1> %res
++}
++
++define <32 x i1> @test_cmp_v32half_oge_commute(<32 x half> %rhs, <32 x i1> %mask) nounwind {
++; CHECK-LABEL: test_cmp_v32half_oge_commute:
++; CHECK:       # %bb.0:
++; CHECK-NEXT:    subq $88, %rsp
++; CHECK-NEXT:    vmovups %zmm0, {{[-0-9]+}}(%r{{[sb]}}p) # 64-byte Spill
++; CHECK-NEXT:    vpsllw $7, %ymm1, %ymm0
++; CHECK-NEXT:    vpmovb2m %ymm0, %k1
++; CHECK-NEXT:    kmovd %k1, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
++; CHECK-NEXT:    callq test_call_32@PLT
++; CHECK-NEXT:    kmovd {{[-0-9]+}}(%r{{[sb]}}p), %k1 # 4-byte Reload
++; CHECK-NEXT:    vcmpleph {{[-0-9]+}}(%r{{[sb]}}p), %zmm0, %k0 {%k1} # 64-byte Folded Reload
++; CHECK-NEXT:    vpmovm2b %k0, %ymm0
++; CHECK-NEXT:    addq $88, %rsp
++; CHECK-NEXT:    retq
++    %lhs = call <32 x half> @test_call_32()
++    %comp = fcmp oge <32 x half> %rhs, %lhs
++    %res = and <32 x i1> %comp, %mask
++    ret <32 x i1> %res
++}
+
+From 24bdfdd813f4117f0464fd0dac5b4bce43ed1388 Mon Sep 17 00:00:00 2001
+From: azwolski <antoni.zwolski@intel.com>
+Date: Tue, 23 Sep 2025 17:24:59 +0200
+Subject: [PATCH 19/19] [X86] Invalid fp16 comparison fix (#160304)
+
+Missing `VCMPPHZrrik`, `VCMPPHZ128rrik`, and `VCMPPHZ256rrik` opcodes in
+`commuteInstructionImpl` and `findCommutedOpIndices` led to improper
+handling of compare instruction during optimization. Operands were
+commuted, but swapping of the immediate was not called.
+
+ Fixes: #159723
+
+(cherry picked from commit 6d4bb2088818784c89eea8ecc799852ea48e086b)
+---
+ llvm/lib/Target/X86/X86InstrInfo.cpp | 8 +++++++-
+ llvm/test/CodeGen/X86/pr159723.ll    | 6 +++---
+ 2 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/llvm/lib/Target/X86/X86InstrInfo.cpp b/llvm/lib/Target/X86/X86InstrInfo.cpp
+index 794aa921ca254..cf3a94453fc7b 100644
+--- a/llvm/lib/Target/X86/X86InstrInfo.cpp
++++ b/llvm/lib/Target/X86/X86InstrInfo.cpp
+@@ -2587,10 +2587,13 @@ MachineInstr *X86InstrInfo::commuteInstructionImpl(MachineInstr &MI, bool NewMI,
+   case X86::VCMPPSZ256rri:
+   case X86::VCMPPDZrrik:
+   case X86::VCMPPSZrrik:
++  case X86::VCMPPHZrrik:
+   case X86::VCMPPDZ128rrik:
+   case X86::VCMPPSZ128rrik:
++  case X86::VCMPPHZ128rrik:
+   case X86::VCMPPDZ256rrik:
+   case X86::VCMPPSZ256rrik:
++  case X86::VCMPPHZ256rrik:
+     WorkingMI = CloneIfNew(MI);
+     WorkingMI->getOperand(MI.getNumExplicitOperands() - 1)
+         .setImm(X86::getSwappedVCMPImm(
+@@ -2844,10 +2847,13 @@ bool X86InstrInfo::findCommutedOpIndices(const MachineInstr &MI,
+   case X86::VCMPPSZ256rri:
+   case X86::VCMPPDZrrik:
+   case X86::VCMPPSZrrik:
++  case X86::VCMPPHZrrik:
+   case X86::VCMPPDZ128rrik:
+   case X86::VCMPPSZ128rrik:
++  case X86::VCMPPHZ128rrik:
+   case X86::VCMPPDZ256rrik:
+-  case X86::VCMPPSZ256rrik: {
++  case X86::VCMPPSZ256rrik:
++  case X86::VCMPPHZ256rrik: {
+     unsigned OpOffset = X86II::isKMasked(Desc.TSFlags) ? 1 : 0;
+ 
+     // Float comparison can be safely commuted for
+diff --git a/llvm/test/CodeGen/X86/pr159723.ll b/llvm/test/CodeGen/X86/pr159723.ll
+index cab4abb043639..c66b101fff990 100644
+--- a/llvm/test/CodeGen/X86/pr159723.ll
++++ b/llvm/test/CodeGen/X86/pr159723.ll
+@@ -17,7 +17,7 @@ define <8 x i1> @test_cmp_v8half_ogt(<8 x half> %rhs, <8 x i1> %mask) nounwind {
+ ; CHECK-NEXT:    kmovw %k1, {{[-0-9]+}}(%r{{[sb]}}p) # 2-byte Spill
+ ; CHECK-NEXT:    callq test_call_8@PLT
+ ; CHECK-NEXT:    kmovw {{[-0-9]+}}(%r{{[sb]}}p), %k1 # 2-byte Reload
+-; CHECK-NEXT:    vcmpltph {{[-0-9]+}}(%r{{[sb]}}p), %xmm0, %k0 {%k1} # 16-byte Folded Reload
++; CHECK-NEXT:    vcmpgtph {{[-0-9]+}}(%r{{[sb]}}p), %xmm0, %k0 {%k1} # 16-byte Folded Reload
+ ; CHECK-NEXT:    vpmovm2w %k0, %xmm0
+ ; CHECK-NEXT:    addq $40, %rsp
+ ; CHECK-NEXT:    retq
+@@ -79,7 +79,7 @@ define <16 x i1> @test_cmp_v16half_olt_commute(<16 x half> %rhs, <16 x i1> %mask
+ ; CHECK-NEXT:    kmovw %k1, {{[-0-9]+}}(%r{{[sb]}}p) # 2-byte Spill
+ ; CHECK-NEXT:    callq test_call_16@PLT
+ ; CHECK-NEXT:    kmovw {{[-0-9]+}}(%r{{[sb]}}p), %k1 # 2-byte Reload
+-; CHECK-NEXT:    vcmpltph {{[-0-9]+}}(%r{{[sb]}}p), %ymm0, %k0 {%k1} # 32-byte Folded Reload
++; CHECK-NEXT:    vcmpgtph {{[-0-9]+}}(%r{{[sb]}}p), %ymm0, %k0 {%k1} # 32-byte Folded Reload
+ ; CHECK-NEXT:    vpmovm2b %k0, %xmm0
+ ; CHECK-NEXT:    addq $56, %rsp
+ ; CHECK-NEXT:    vzeroupper
+@@ -100,7 +100,7 @@ define <32 x i1> @test_cmp_v32half_oge(<32 x half> %rhs, <32 x i1> %mask) nounwi
+ ; CHECK-NEXT:    kmovd %k1, {{[-0-9]+}}(%r{{[sb]}}p) # 4-byte Spill
+ ; CHECK-NEXT:    callq test_call_32@PLT
+ ; CHECK-NEXT:    kmovd {{[-0-9]+}}(%r{{[sb]}}p), %k1 # 4-byte Reload
+-; CHECK-NEXT:    vcmpleph {{[-0-9]+}}(%r{{[sb]}}p), %zmm0, %k0 {%k1} # 64-byte Folded Reload
++; CHECK-NEXT:    vcmpgeph {{[-0-9]+}}(%r{{[sb]}}p), %zmm0, %k0 {%k1} # 64-byte Folded Reload
+ ; CHECK-NEXT:    vpmovm2b %k0, %ymm0
+ ; CHECK-NEXT:    addq $88, %rsp
+ ; CHECK-NEXT:    retq
