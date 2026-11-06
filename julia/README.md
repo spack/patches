@@ -6,6 +6,10 @@
 https://github.com/JuliaLang/llvm-project/compare/fed41342a82f5a3a9201819a82bf7a48313e296b...980d2f60a8524c5546397db9e8bbb7d6ea56c1b7.patch
 ```
 
+### 182a02d35396db706f3d9e4691f0d9aefcee763f6ac30aad96bff7754f0bf22e.patch
+
+https://github.com/JuliaLang/llvm-project/compare/87f0227cb60147a26a1eeb4fb06e3b505e9c7261...24bdfdd813f4117f0464fd0dac5b4bce43ed1388.patch
+
 ### 25cdc0271e7722d4a7cc6f72abcb17bfe205fc741bbe3716a21759c3eee7d32c.patch
 
 ```
